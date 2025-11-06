@@ -1,157 +1,151 @@
-﻿// File: Licensing/LicenseGate.cs
-using Microsoft.Win32;
+﻿using Microsoft.Win32;
 using System;
 using System.Windows.Forms;
-using Licensing;
 
-namespace SW2025RibbonAddin
+namespace SW2025RibbonAddin.Licensing
 {
-    internal static class LicenseGate
+    public static class LicenseGate
     {
-        // Must match the "prd" claim you issue from Key Ring
-        private const string ExpectedProduct = "SW2025RibbonAddin";
-
-        // Paste one JWK or a JWKS {"keys":[...]} exported from Key Ring (PUBLIC KEYS ONLY)
-        private const string JwkOrJwksJson = @"
-        {
-          ""kty"": ""EC"",
-          ""crv"": ""P-256"",
-          ""alg"": ""ES256"",
-          ""x"": ""<PASTE X FROM KEY RING>"",
-          ""y"": ""<PASTE Y FROM KEY RING>"",
-          ""use"": ""sig"",
-          ""kid"": ""<PASTE KID FROM KEY RING>""
-        }";
-
-        private static Es256LicenseVerifier _verifier;
-
-        private static Es256LicenseVerifier Verifier
+        public static string MachineId
         {
             get
             {
-                if (_verifier != null) return _verifier;
-
-                var trust = LicenseTrustStore.FromJson(JwkOrJwksJson);
-                _verifier = new Es256LicenseVerifier(
-                    trust,
-                    ExpectedProduct,
-                    GetMachineId,
-                    TimeSpan.FromMinutes(5));
-                return _verifier;
+                try
+                {
+                    using (var key = Registry.LocalMachine.OpenSubKey(@"SOFTWARE\Microsoft\Cryptography"))
+                    {
+                        var v = key != null ? key.GetValue("MachineGuid") as string : null;
+                        if (!string.IsNullOrWhiteSpace(v)) return v.Trim();
+                    }
+                }
+                catch { }
+                return (Environment.MachineName ?? "UNKNOWN").ToUpperInvariant();
             }
         }
 
-        internal static bool EnsureLicensed(IWin32Window parent = null)
+        public static bool IsLicensed
         {
-            var token = LoadToken();
-            var checkedSaved = false;
+            get { VerifiedLicense lic; string why; return IsActivated(out lic, out why); }
+        }
 
-            if (!string.IsNullOrWhiteSpace(token))
+        public static bool IsActivated(out VerifiedLicense license, out string reason)
+        {
+            license = null; reason = null;
+
+            string vfErr; LicenseVerifier verifier;
+            if (!TryBuildVerifier(out verifier, out vfErr))
             {
-                var res = Verifier.Verify(token);
-                if (res.Success) return true;
-
-                checkedSaved = true;
-                MessageBox.Show(parent, "Saved license is not valid:\r\n" + res.Error,
-                    "License", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                reason = vfErr; return false;
             }
 
-            var pasted = PromptForToken(parent);
-            if (string.IsNullOrWhiteSpace(pasted))
-                return false;
-
-            var res2 = Verifier.Verify(pasted.Trim());
-            if (!res2.Success)
+            var token = CleanToken(LoadToken());
+            if (string.IsNullOrWhiteSpace(token))
             {
-                MessageBox.Show(parent, "License is invalid:\r\n" + res2.Error,
-                    "License", MessageBoxButtons.OK, MessageBoxIcon.Error);
-                return false;
+                reason = "No token stored."; return false;
             }
 
-            SaveToken(pasted.Trim());
-            if (checkedSaved) MessageBox.Show(parent, "License activated successfully.",
-                "License", MessageBoxButtons.OK, MessageBoxIcon.Information);
-
+            string err;
+            if (!verifier.TryVerify(token, out license, out err))
+            {
+                reason = err ?? "Verification failed."; return false;
+            }
             return true;
         }
 
-        private const string RegPath = @"Software\Mehdi\SW2025RibbonAddin";
-        private const string RegName = "LicenseToken";
+        public static bool Activate(string userName, string token, out string error)
+        {
+            error = null;
+
+            string vfErr; LicenseVerifier verifier;
+            if (!TryBuildVerifier(out verifier, out vfErr))
+            {
+                error = vfErr; return false;
+            }
+
+            token = CleanToken(token);
+
+            VerifiedLicense lic;
+            if (!verifier.TryVerify(token, out lic, out error))
+                return false;
+
+            Save(LicenseSettings.RegistryValueUser, (userName ?? "").Trim());
+            Save(LicenseSettings.RegistryValueToken, token);
+            return true;
+        }
+
+        public static void Deactivate()
+        {
+            try
+            {
+                using (var key = Registry.CurrentUser.CreateSubKey(LicenseSettings.RegistryPath, true))
+                {
+                    if (key != null) key.DeleteValue(LicenseSettings.RegistryValueToken, false);
+                }
+            }
+            catch { }
+        }
+
+        public static string LoadStoredUserName()
+        {
+            using (var key = Registry.CurrentUser.OpenSubKey(LicenseSettings.RegistryPath))
+                return key != null ? (key.GetValue(LicenseSettings.RegistryValueUser) as string ?? "") : "";
+        }
+
+        // shims if older code calls these
+        public static bool TryLoadSavedLicense() { VerifiedLicense lic; string why; return IsActivated(out lic, out why); }
+        public static bool TryLoadSavedLicense(out VerifiedLicense license) { string why; return IsActivated(out license, out why); }
+        public static bool TryLoadSavedLicense(out string reason) { VerifiedLicense lic; return IsActivated(out lic, out reason); }
+        public static void ShowRegistrationDialog() { LicensingUI.ShowRegistrationDialog(null); }
+        public static void ShowRegistrationDialog(IWin32Window owner) { LicensingUI.ShowRegistrationDialog(owner); }
+
+        // internals
+        private static bool TryBuildVerifier(out LicenseVerifier verifier, out string error)
+        {
+            verifier = null; error = null;
+
+            var json = LicenseSettings.TrustedKeysJson ?? "";
+            if (string.IsNullOrWhiteSpace(json))
+            {
+                error = "Trusted public key is not configured.";
+                return false;
+            }
+
+            try
+            {
+                verifier = new LicenseVerifier(
+                    LicenseSettings.TrustedKeysJson,
+                    LicenseSettings.Product,
+                    MachineId,
+                    LicenseSettings.AllowedClockSkew,
+                    LicenseSettings.ExpiryGrace);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                error = ex.Message; return false;
+            }
+        }
+
+        private static string CleanToken(string token)
+        {
+            if (string.IsNullOrEmpty(token)) return "";
+            token = token.Trim().Replace(" ", "").Replace("\r", "").Replace("\n", "");
+            while (token.StartsWith(".")) token = token.Substring(1);
+            while (token.EndsWith(".")) token = token.Substring(0, token.Length - 1);
+            return token;
+        }
 
         private static string LoadToken()
         {
-            try
-            {
-                using (var k = Registry.CurrentUser.OpenSubKey(RegPath))
-                    return (string)k.GetValue(RegName, "");
-            }
-            catch { return ""; }
+            using (var key = Registry.CurrentUser.OpenSubKey(LicenseSettings.RegistryPath))
+                return key != null ? (key.GetValue(LicenseSettings.RegistryValueToken) as string ?? "") : "";
         }
 
-        private static void SaveToken(string token)
+        private static void Save(string name, string value)
         {
-            try
+            using (var key = Registry.CurrentUser.CreateSubKey(LicenseSettings.RegistryPath, true))
             {
-                using (var k = Registry.CurrentUser.CreateSubKey(RegPath))
-                {
-                    if (k != null) k.SetValue(RegName, token, RegistryValueKind.String);
-                }
-            }
-            catch { }
-        }
-
-        public static string GetMachineId()
-        {
-            try
-            {
-                using (var k = Registry.LocalMachine.OpenSubKey(@"SOFTWARE\Microsoft\Cryptography"))
-                {
-                    var v = (string)k.GetValue("MachineGuid");
-                    if (!string.IsNullOrWhiteSpace(v)) return v.Trim().ToUpperInvariant();
-                }
-            }
-            catch { }
-            return Environment.MachineName.ToUpperInvariant();
-        }
-
-        private static string PromptForToken(IWin32Window parent)
-        {
-            using (var dlg = new Form
-            {
-                Text = "Activate License",
-                StartPosition = FormStartPosition.CenterParent,
-                Width = 640,
-                Height = 200,
-                MinimizeBox = false,
-                MaximizeBox = false,
-                ShowInTaskbar = false,
-                TopMost = true
-            })
-            {
-                var lbl = new Label
-                {
-                    Left = 12,
-                    Top = 12,
-                    Width = 600,
-                    Text = "Paste your license token (compact JWS):"
-                };
-                var box = new TextBox
-                {
-                    Left = 12,
-                    Top = 36,
-                    Width = 600,
-                    Height = 70,
-                    Multiline = true,
-                    ScrollBars = ScrollBars.Vertical,
-                    AcceptsReturn = true
-                };
-                var ok = new Button { Text = "Activate", DialogResult = DialogResult.OK, Left = 412, Width = 90, Top = 120 };
-                var cancel = new Button { Text = "Cancel", DialogResult = DialogResult.Cancel, Left = 522, Width = 90, Top = 120 };
-
-                dlg.Controls.AddRange(new Control[] { lbl, box, ok, cancel });
-                dlg.AcceptButton = ok; dlg.CancelButton = cancel;
-
-                return dlg.ShowDialog(parent) == DialogResult.OK ? box.Text : null;
+                if (key != null) key.SetValue(name, value, RegistryValueKind.String);
             }
         }
     }
