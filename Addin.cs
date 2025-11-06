@@ -25,6 +25,7 @@ namespace SW2025RibbonAddin
     public class Addin : ISwAddin
     {
         private const string AddinTitle = "SW2025RibbonAddin";
+        private const string AddinDescription = "SW2025 Ribbon Add-in";
 
         private SldWorks _swApp;
         private int _cookie;
@@ -39,7 +40,7 @@ namespace SW2025RibbonAddin
         private int _farsiCmdIndex = -1;
         private int _editSelNoteCmdIndex = -1;
         private int _updateAllNotesCmdIndex = -1;
-        private int _registerCmdIndex = -1;   // NEW
+        private int _registerCmdIndex = -1;
 
         // Command group / UI constants
         private const int MAIN_CMD_GROUP_ID = 1;
@@ -63,9 +64,9 @@ namespace SW2025RibbonAddin
         private const string UPDATE_ALL_NOTES_CMD_TOOLTIP = "Re-shape and fix all Farsi notes across all sheets";
         private const string UPDATE_ALL_NOTES_CMD_HINT = "Update Farsi Notes";
 
-        private const string REGISTER_CMD_NAME = "Register";                 // NEW
-        private const string REGISTER_CMD_TOOLTIP = "Activate this add-in";  // NEW
-        private const string REGISTER_CMD_HINT = "Register";                 // NEW
+        private const string REGISTER_CMD_NAME = "Register";
+        private const string REGISTER_CMD_TOOLTIP = "Activate this add-in";
+        private const string REGISTER_CMD_HINT = "Register";
 
         // Tag our notes so the editor hotkey can detect them
         internal const string FARSI_NOTE_TAG_PREFIX = "MEHDI_FARSI_NOTE";
@@ -79,6 +80,37 @@ namespace SW2025RibbonAddin
 
         // Active placement session
         private FarsiNotePlacementSession _activePlacement;
+
+        // Mark the active document as needing save (works across PIAs)
+        internal static void MarkDirty(IModelDoc2 model)
+        {
+            if (model == null) return;
+
+            // Path 1: most PIAs expose SetSaveFlag on IModelDoc2
+            try { model.SetSaveFlag(); return; }
+            catch { /* fall through */ }
+
+            // Path 2: some PIAs expose SetSaveFlag on ModelDocExtension only.
+            // Use late binding so we don't require that method at compile time.
+            try
+            {
+                object ext = model.Extension;
+                if (ext != null)
+                {
+                    var t = ext.GetType(); // COM IDispatch wrapper
+                    t.InvokeMember("SetSaveFlag",
+                        System.Reflection.BindingFlags.InvokeMethod |
+                        System.Reflection.BindingFlags.Public |
+                        System.Reflection.BindingFlags.Instance,
+                        binder: null, target: ext, args: null);
+                }
+            }
+            catch
+            {
+                // Ignore: not available on this PIA; graphics redraws & text changes still persist,
+                // but you may not see the '*' until the next standard edit.
+            }
+        }
 
         #region ISwAddin
         public bool ConnectToSW(object ThisSW, int cookie)
@@ -185,7 +217,7 @@ namespace SW2025RibbonAddin
                 UPDATE_ALL_NOTES_CMD_NAME, -1, UPDATE_ALL_NOTES_CMD_TOOLTIP, UPDATE_ALL_NOTES_CMD_HINT,
                 3, nameof(OnUpdateFarsiNotes), nameof(OnUpdateFarsiNotesEnable), 4, itemOpts);
 
-            // 5) Register (NEW)
+            // 5) Register
             _registerCmdIndex = _cmdGroup.AddCommandItem2(
                 REGISTER_CMD_NAME, -1, REGISTER_CMD_TOOLTIP, REGISTER_CMD_HINT,
                 4, nameof(OnRegister), nameof(OnRegisterEnable), 5, itemOpts);
@@ -194,7 +226,7 @@ namespace SW2025RibbonAddin
             _cmdGroup.HasMenu = true;
             _cmdGroup.Activate();
 
-            // Command Tab (DRAWING) – same as your file, plus Register button
+            // Command Tab (DRAWING)
             try
             {
                 int docType = (int)swDocumentTypes_e.swDocDRAWING;
@@ -217,7 +249,7 @@ namespace SW2025RibbonAddin
                         _cmdGroup.get_CommandID(_farsiCmdIndex),
                         _cmdGroup.get_CommandID(_editSelNoteCmdIndex),
                         _cmdGroup.get_CommandID(_updateAllNotesCmdIndex),
-                        _cmdGroup.get_CommandID(_registerCmdIndex)    // NEW
+                        _cmdGroup.get_CommandID(_registerCmdIndex)
                     };
 
                     var textTypes = new int[]
@@ -263,7 +295,6 @@ namespace SW2025RibbonAddin
         }
         public int OnHelloEnable() => SW_ENABLE;
 
-        /// <summary>Gate that asks the user to activate when needed (no destructive changes).</summary>
         private bool RequireLicense()
         {
             VerifiedLicense lic; string why;
@@ -279,13 +310,10 @@ namespace SW2025RibbonAddin
             return false;
         }
 
-        /// <summary>
-        /// Show the Farsi editor, then start an interactive placement session.
-        /// Left-click places the note at the clicked sheet coords; right-click cancels.
-        /// </summary>
+        /// <summary>Show the Farsi editor, then start an interactive placement session.</summary>
         public void OnAddFarsiNote()
         {
-            if (!RequireLicense()) return;  // NEW
+            if (!RequireLicense()) return;
 
             try
             {
@@ -328,7 +356,7 @@ namespace SW2025RibbonAddin
         // Edit the currently selected note with our Farsi editor
         public void OnEditSelectedNoteFarsi()
         {
-            if (!RequireLicense()) return;  // NEW
+            if (!RequireLicense()) return;
 
             try
             {
@@ -384,7 +412,7 @@ namespace SW2025RibbonAddin
         // === Update all Farsi notes across all sheets ===
         public void OnUpdateFarsiNotes()
         {
-            if (!RequireLicense()) return;  // NEW
+            if (!RequireLicense()) return;
 
             try
             {
@@ -396,6 +424,10 @@ namespace SW2025RibbonAddin
                 }
 
                 var stats = UpdateAllFarsiNotes(model);
+
+                // Mark dirty only if something changed
+                if (stats.Updated > 0)
+                    MarkDirty(model);
 
                 MessageBox.Show(
                     $"Sheets scanned: {stats.Sheets}\r\n" +
@@ -422,7 +454,7 @@ namespace SW2025RibbonAddin
             catch { return SW_DISABLE; }
         }
 
-        // NEW: Register command
+        // Register
         public void OnRegister()
         {
             try
@@ -479,8 +511,7 @@ namespace SW2025RibbonAddin
 
                 if (!ours) return 0;
 
-                // Launch our editor instead of the default one
-                if (!RequireLicense()) return 1;   // consume default, but do nothing if user cancels registration
+                if (!RequireLicense()) return 1;   // consume default if user declines
                 EditNoteWithFarsiEditor(note, model);
                 return 1; // consume the default command
             }
@@ -491,7 +522,7 @@ namespace SW2025RibbonAddin
         }
         #endregion
 
-        #region Helpers  (unchanged from your file)
+        #region Helpers
         private void StartFarsiNotePlacement(IModelDoc2 model, string preparedText, string fontName, double fontSizePts)
         {
             try
@@ -547,6 +578,11 @@ namespace SW2025RibbonAddin
 
                 string shaped = ArabicTextUtils.PrepareForSolidWorks(newRaw, dlg.UseRtlMarkers, dlg.InsertJoiners);
 
+                // Track changes so we only mark dirty when needed
+                bool changed = !string.Equals(shaped, currentText, StringComparison.Ordinal)
+                               || !string.Equals(fontName, dlg.SelectedFontName, StringComparison.Ordinal)
+                               || (int)Math.Round(dlg.FontSizePoints) != (int)Math.Round(sizePts);
+
                 try { note.SetText(shaped); } catch { return; }
 
                 try
@@ -561,6 +597,9 @@ namespace SW2025RibbonAddin
 
                 try { note.SetTextJustification((int)swTextJustification_e.swTextJustificationRight); } catch { }
                 try { model.GraphicsRedraw2(); } catch { }
+
+                if (changed)
+                    MarkDirty(model);
             }
         }
 
@@ -679,17 +718,18 @@ namespace SW2025RibbonAddin
         }
         #endregion
 
-        #region COM Registration (unchanged)
+        #region COM Registration
         [ComRegisterFunction]
         public static void RegisterFunction(Type t)
         {
             try
             {
-                var key = Registry.LocalMachine.CreateSubKey($@"Software\SolidWorks\Addins\{{{t.GUID}}}");
-                key.SetValue(null, 1);
-                key.SetValue("Title", AddinTitle);
-                key.SetValue("Description", "Sample ribbon add-in with Farsi note support");
-                key.Close();
+                using (var key = Registry.LocalMachine.CreateSubKey($@"Software\SolidWorks\Addins\{{{t.GUID}}}"))
+                {
+                    key.SetValue(null, 1);
+                    key.SetValue("Title", AddinTitle);
+                    key.SetValue("Description", AddinDescription);
+                }
             }
             catch (Exception ex)
             {
@@ -698,9 +738,10 @@ namespace SW2025RibbonAddin
 
             try
             {
-                var keyCU = Registry.CurrentUser.CreateSubKey($@"Software\SolidWorks\AddinsStartup\{{{t.GUID}}}");
-                keyCU.SetValue(null, 1);
-                keyCU.Close();
+                using (var keyCU = Registry.CurrentUser.CreateSubKey($@"Software\SolidWorks\AddinsStartup\{{{t.GUID}}}"))
+                {
+                    keyCU.SetValue(null, 1);
+                }
             }
             catch { }
         }
@@ -713,7 +754,7 @@ namespace SW2025RibbonAddin
         }
         #endregion
 
-        #region Placement Session (unchanged)
+        #region Placement Session
         private sealed class FarsiNotePlacementSession : IDisposable
         {
             private readonly Addin _owner;
@@ -800,6 +841,9 @@ namespace SW2025RibbonAddin
 
                     ann?.SetPosition2(x, y, 0.0);
                     _model.GraphicsRedraw2();
+
+                    // mark document modified
+                    Addin.MarkDirty(_model);
                 }
                 catch (Exception ex)
                 {
