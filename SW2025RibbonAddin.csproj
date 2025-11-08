@@ -79,12 +79,18 @@
     <Compile Include="Properties\AssemblyInfo.cs" />
   </ItemGroup>
   <ItemGroup>
-    <EmbeddedResource Include="Resources\icon_20.png" />
-    <EmbeddedResource Include="Resources\icon_32.png" />
-    <EmbeddedResource Include="Resources\icon_96.png" />
-  </ItemGroup>
-  <ItemGroup>
     <WCFMetadata Include="Connected Services\" />
+  </ItemGroup>
+  <ItemGroup />
+  <ItemGroup>
+    <EmbeddedResource Include="Resources\edit_20.png" />
+    <EmbeddedResource Include="Resources\edit_32.png" />
+    <EmbeddedResource Include="Resources\farsi_20.png" />
+    <EmbeddedResource Include="Resources\farsi_32.png" />
+    <EmbeddedResource Include="Resources\hello_20.png" />
+    <EmbeddedResource Include="Resources\hello_32.png" />
+    <EmbeddedResource Include="Resources\update_20.png" />
+    <EmbeddedResource Include="Resources\update_32.png" />
   </ItemGroup>
   <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets" />
   <PropertyGroup>

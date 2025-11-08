@@ -372,3 +372,9 @@ FodyWeavers.xsd
 /Resources/icon_96.png
 /Resources/update_20.png
 /Resources/update_32.png
+/Resources/large_strip.bmp
+/Resources/large_strip.png
+/Resources/small_strip.bmp
+/Resources/small_strip.png
+/installer/payload/SW2025RibbonAddin.dll
+/installer/SW2025RibbonAddin-Setup.exe
