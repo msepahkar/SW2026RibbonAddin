@@ -2,7 +2,7 @@
 using System.Drawing;
 using System.Windows.Forms;
 
-namespace SW2025RibbonAddin.Forms
+namespace SW2026RibbonAddin.Forms
 {
     /// <summary>
     /// A lightweight, click-through overlay that follows the mouse and draws

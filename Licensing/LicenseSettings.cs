@@ -1,12 +1,12 @@
 ﻿using System;
 
-namespace SW2025RibbonAddin.Licensing
+namespace SW2026RibbonAddin.Licensing
 {
     /// <summary>Developer-supplied settings (single source of truth).</summary>
     public static class LicenseSettings
     {
         /// <summary>Product code that must match the "prd" claim.</summary>
-        public const string Product = "SW2025RibbonAddin";
+        public const string Product = "SW2026RibbonAddin";
 
         /// <summary>
         /// Trusted public key(s) in JWK or JWKS JSON. Your current P-256 public key:
@@ -32,7 +32,7 @@ namespace SW2025RibbonAddin.Licensing
         public static readonly TimeSpan ExpiryGrace = TimeSpan.Zero;
 
         /// <summary>Registry location (HKCU) where token and user name are stored.</summary>
-        public const string RegistryPath = @"Software\Mehdi\SW2025RibbonAddin";
+        public const string RegistryPath = @"Software\Mehdi\SW2026RibbonAddin";
         public const string RegistryValueToken = "LicenseToken";
         public const string RegistryValueUser = "LicenseUser";
     }

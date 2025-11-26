@@ -12,8 +12,8 @@
     <ProjectGuid>{15418BA5-11C5-40A1-9B77-EB232681C59D}</ProjectGuid>
     <OutputType>Library</OutputType>
     <AppDesignerFolder>Properties</AppDesignerFolder>
-    <RootNamespace>SW2025RibbonAddin</RootNamespace>
-    <AssemblyName>SW2025RibbonAddin</AssemblyName>
+    <RootNamespace>SW2026RibbonAddin</RootNamespace>
+    <AssemblyName>SW2026RibbonAddin</AssemblyName>
     <TargetFrameworkVersion>v4.8</TargetFrameworkVersion>
     <FileAlignment>512</FileAlignment>
     <RegisterForComInterop>true</RegisterForComInterop>

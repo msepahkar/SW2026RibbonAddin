@@ -2,7 +2,7 @@
 using System.Collections.Generic;
 using System.Text;
 
-namespace SW2025RibbonAddin
+namespace SW2026RibbonAddin
 {
     /// <summary>
     /// Utilities to prepare/restore mixed Persian/Arabic (RTL) + English (LTR) text

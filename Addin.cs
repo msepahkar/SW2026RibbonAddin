@@ -12,11 +12,11 @@ using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Windows.Forms;
 
-namespace SW2025RibbonAddin
+namespace SW2026RibbonAddin
 {
     [ComVisible(true)]
     [Guid("B67E2D5A-8C73-4A3E-93B6-1761C1A8C0C5")]
-    [ProgId("SW2025RibbonAddin.Addin")]
+    [ProgId("SW2026RibbonAddin.Addin")]
     public class Addin : ISwAddin
     {
         private SldWorks _swApp;
@@ -326,12 +326,12 @@ namespace SW2025RibbonAddin
             catch { }
         }
 
-        // Build PNG strips at %LOCALAPPDATA%\SW2025RibbonAddin\icons\ from embedded or output files
+        // Build PNG strips at %LOCALAPPDATA%\SW2026RibbonAddin\icons\ from embedded or output files
         private (string small, string large) EnsurePngStrips()
         {
             string outDir = Path.Combine(
                 System.Environment.GetFolderPath(System.Environment.SpecialFolder.LocalApplicationData),
-                "SW2025RibbonAddin", "icons");
+                "SW2026RibbonAddin", "icons");
             Directory.CreateDirectory(outDir);
 
             string small = Path.Combine(outDir, "small_strip.png");
@@ -413,7 +413,7 @@ namespace SW2025RibbonAddin
         #region Commands (same behavior as before)
         public void OnHello()
         {
-            try { MessageBox.Show("Hello from Mehdi Tools ✨", "SW2025RibbonAddin"); }
+            try { MessageBox.Show("Hello from Mehdi Tools ✨", "SW2026RibbonAddin"); }
             catch (Exception ex) { Debug.WriteLine(ex); }
         }
         public int OnHelloEnable() => SW_ENABLE;
@@ -772,13 +772,13 @@ namespace SW2025RibbonAddin
             {
                 var key = Registry.LocalMachine.CreateSubKey($@"Software\SolidWorks\Addins\{{{t.GUID}}}");
                 key.SetValue(null, 1);
-                key.SetValue("Title", "SW2025RibbonAddin");
+                key.SetValue("Title", "SW2026RibbonAddin");
                 key.SetValue("Description", "Sample ribbon add-in with Farsi note support");
                 key.Close();
             }
             catch (Exception ex)
             {
-                MessageBox.Show($"COM registration failed: {ex.Message}\r\nTry running Visual Studio as administrator.", "SW2025RibbonAddin");
+                MessageBox.Show($"COM registration failed: {ex.Message}\r\nTry running Visual Studio as administrator.", "SW2026RibbonAddin");
             }
 
             try

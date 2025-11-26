@@ -2,7 +2,7 @@
 using System;
 using System.Windows.Forms;
 
-namespace SW2025RibbonAddin.Licensing
+namespace SW2026RibbonAddin.Licensing
 {
     public static class LicenseGate
     {

@@ -2,9 +2,9 @@
 using System.Drawing;
 using System.Linq;
 using System.Windows.Forms;
-using SW2025RibbonAddin; // for ArabicTextUtils
+using SW2026RibbonAddin; // for ArabicTextUtils
 
-namespace SW2025RibbonAddin.Forms
+namespace SW2026RibbonAddin.Forms
 {
     // partial to allow a Designer partial if you have one
     public partial class FarsiNoteForm : Form

@@ -7,7 +7,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Web.Script.Serialization;
 
-namespace SW2025RibbonAddin.Licensing
+namespace SW2026RibbonAddin.Licensing
 {
     public sealed class VerifiedLicense
     {

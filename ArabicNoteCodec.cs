@@ -2,7 +2,7 @@
 using System.Linq;
 using System.Text;
 
-namespace SW2025RibbonAddin
+namespace SW2026RibbonAddin
 {
     /// <summary>
     /// Convert text stored in a SW note (may contain bidi marks / presentation forms)
