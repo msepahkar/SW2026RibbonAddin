@@ -2,11 +2,11 @@ using System.Reflection;
 using System.Runtime.InteropServices;
 
 [assembly: AssemblyTitle("SolidworksMehdiAddin")]
-[assembly: AssemblyDescription("Mehdi SolidWorks 2025 C# add-in that adds a ribbon tab for special commands.")]
+[assembly: AssemblyDescription("Mehdi SolidWorks 2026 C# add-in that adds a ribbon tab for special commands.")]
 [assembly: AssemblyConfiguration("")]
 [assembly: AssemblyCompany("Example")]
 [assembly: AssemblyProduct("SolidworksMehdiAddin")] 
-[assembly: AssemblyCopyright("Copyright © 2025")]
+[assembly: AssemblyCopyright("Copyright © 2026")]
 [assembly: AssemblyTrademark("")]
 [assembly: AssemblyCulture("")]
 [assembly: ComVisible(true)]
