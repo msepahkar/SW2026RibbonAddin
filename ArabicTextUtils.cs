@@ -391,26 +391,98 @@ namespace SW2026RibbonAddin
             return outSb.ToString();
         }
 
-        // Prepare direction for SolidWorks (wrap with markers or pre-compensate)
+        // Direction enum is assumed to already exist in your file:
+        //
+        // internal enum Dir
+        // {
+        //     Neutral = 0,
+        //     LTR     = 1,
+        //     RTL     = 2
+        // }
+        //
+        // And you already have:
+        // - TokenizeWithNeutrals(string line) -> List<Run>
+        // - ResolveNeutralsInPlace(List<Run> runs)
+        // - MergeAdjacentSameDir(List<Run> runs)
+        // - AddBidiMarkers(List<Run> runs)         // wraps RTL runs with RLE/PDF when user ticks the checkbox
+        // - ReverseRtlRunSequence(List<Run> runs)  // your existing pre-compensation logic
+        //
+        // A Run is typically something like:
+        // internal sealed class Run
+        // {
+        //     public Dir Dir;
+        //     public string Text;
+        // }
+
+        // ArabicTextUtils.cs
         private static string ReorderLineForLtrHost(string line, bool useRtlMarkers)
         {
+            // 1) Break the line into directional runs.
+            var runs = TokenizeWithNeutrals(line);
+            ResolveNeutralsInPlace(runs);
+            runs = MergeAdjacentSameDir(runs);
+
+            // 2) Count LTR / RTL runs.
+            int ltrCount = 0;
+            int rtlCount = 0;
+
+            foreach (var run in runs)
+            {
+                if (run.Dir == Dir.LTR)
+                    ltrCount++;
+                else if (run.Dir == Dir.RTL)
+                    rtlCount++;
+            }
+
+            // 3) Explicit "Use RTL markers" path – same idea as before.
             if (useRtlMarkers)
             {
-                // Wrap only RTL runs with RLE…PDF
-                var runs = TokenizeWithNeutrals(line);
-                ResolveNeutralsInPlace(runs);
-                runs = MergeAdjacentSameDir(runs);
+                const char RLE = '\u202B'; // Right‑to‑Left Embedding
+                const char PDF = '\u202C'; // Pop Directional Formatting
 
-                var sb = new StringBuilder(line?.Length ?? 0 + 8);
-                foreach (var r in runs)
+                var sbMarkers = new System.Text.StringBuilder(line.Length + runs.Count * 2);
+                foreach (var run in runs)
                 {
-                    if (r.Dir == Dir.RTL) sb.Append(RLE).Append(r.Text).Append(PDF);
-                    else sb.Append(r.Text);
+                    if (run.Dir == Dir.RTL)
+                    {
+                        sbMarkers.Append(RLE);
+                        sbMarkers.Append(run.Text);
+                        sbMarkers.Append(PDF);
+                    }
+                    else
+                    {
+                        sbMarkers.Append(run.Text);
+                    }
+                }
+
+                return sbMarkers.ToString();
+            }
+
+            // 4) Complex mixed case: more than one LTR run and at least one RTL run.
+            //
+            //    In this scenario SolidWorks effectively flips the order of the
+            //    directional runs for display. To compensate, we pre‑reverse the
+            //    *run sequence* (without touching the characters inside each run).
+            //
+            //    Example logical runs:
+            //      [RTL1][LTR1][RTL2][LTR2][RTL3]
+            //
+            //    We send to SW:
+            //      [RTL3][LTR2][RTL2][LTR1][RTL1]
+            //
+            //    so that SW’s internal reordering yields the intended visual order.
+            if (ltrCount > 1 && rtlCount > 0)
+            {
+                var sb = new System.Text.StringBuilder(line.Length);
+                for (int i = runs.Count - 1; i >= 0; i--)
+                {
+                    sb.Append(runs[i].Text);
                 }
                 return sb.ToString();
             }
 
-            // Visual pre-compensation (no control characters)
+            // 5) Simple case (0 or 1 LTR run) – keep previous behaviour:
+            //    use your existing pre‑compensation helper.
             return ReverseRtlRunSequence(line);
         }
 
