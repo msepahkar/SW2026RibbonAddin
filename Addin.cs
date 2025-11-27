@@ -85,9 +85,13 @@ namespace SW2026RibbonAddin
 
         public bool DisconnectFromSW()
         {
-            try { if (_swApp != null) _swApp.CommandOpenPreNotify -= OnCommandOpenPreNotify; } catch { }
-            try { if (_cmdMgr != null && _cmdGroup != null) _cmdMgr.RemoveCommandGroup(MAIN_CMD_GROUP_ID); } catch { }
-            _cmdGroup = null; _cmdMgr = null; _swApp = null;
+            try { if (_swApp != null) _swApp.CommandOpenPreNotify -= OnCommandOpenPreNotify; }
+            catch { }
+            try { if (_cmdMgr != null && _cmdGroup != null) _cmdMgr.RemoveCommandGroup(MAIN_CMD_GROUP_ID); }
+            catch { }
+            _cmdGroup = null;
+            _cmdMgr = null;
+            _swApp = null;
             return true;
         }
         #endregion
@@ -122,7 +126,10 @@ namespace SW2026RibbonAddin
                     TrySetProperty(_cmdGroup, "SmallIconList", smallStrip);
                     TrySetProperty(_cmdGroup, "LargeIconList", largeStrip);
                 }
-                catch (Exception ex) { Debug.WriteLine("Assigning PNG strips failed: " + ex.Message); }
+                catch (Exception ex)
+                {
+                    Debug.WriteLine("Assigning PNG strips failed: " + ex.Message);
+                }
             }
 
             int itemOpts = (int)(swCommandItemType_e.swMenuItem | swCommandItemType_e.swToolbarItem);
@@ -204,18 +211,23 @@ namespace SW2026RibbonAddin
                 foreach (int dt in docTypes)
                 {
                     object tab = null;
-                    try { tab = _cmdMgr.GetCommandTab(dt, title); } catch { }
+                    try { tab = _cmdMgr.GetCommandTab(dt, title); }
+                    catch { }
+
                     if (tab != null)
                     {
                         if (!TryRemoveCommandTab(tab))
                         {
-                            // As a fallback, try to clear pre‑existing boxes instead of adding new ones
+                            // Fallback: clear pre‑existing boxes
                             TryClearTabBoxes(tab);
                         }
                     }
                 }
             }
-            catch (Exception ex) { Debug.WriteLine("RemoveAllTabsNamed: " + ex.Message); }
+            catch (Exception ex)
+            {
+                Debug.WriteLine("RemoveAllTabsNamed: " + ex.Message);
+            }
         }
 
         /// <summary>
@@ -237,7 +249,7 @@ namespace SW2026RibbonAddin
                     return true;
                 }
                 catch (MissingMethodException) { }
-                catch (TargetInvocationException) { /* keep trying */ }
+                catch (TargetInvocationException) { }
                 catch { }
             }
 
@@ -246,7 +258,6 @@ namespace SW2026RibbonAddin
             {
                 try
                 {
-                    // Guess docType via tab.Title; if we can’t get docType reliably, try all three common types
                     int[] docTypes =
                     {
                         (int)swDocumentTypes_e.swDocDRAWING,
@@ -263,10 +274,11 @@ namespace SW2026RibbonAddin
                             BindingFlags.InvokeMethod | BindingFlags.Instance | BindingFlags.Public,
                             null, _cmdMgr, new object[] { dt, title });
                     }
+
                     return true;
                 }
                 catch (MissingMethodException) { }
-                catch (TargetInvocationException) { /* try next */ }
+                catch (TargetInvocationException) { }
                 catch { }
             }
 
@@ -280,15 +292,12 @@ namespace SW2026RibbonAddin
         {
             try
             {
-                // Most PIAs: tab.GetCommandTabBox(int i)
                 var getBox = tab.GetType().GetMethod("GetCommandTabBox",
                     BindingFlags.Instance | BindingFlags.Public);
 
-                // Some PIAs: tab.GetCommandTabBoxCount()
                 var getCount = tab.GetType().GetMethod("GetCommandTabBoxCount",
                     BindingFlags.Instance | BindingFlags.Public);
 
-                // Or Array property: CommandTabBoxes
                 var boxesProp = tab.GetType().GetProperty("CommandTabBoxes",
                     BindingFlags.Instance | BindingFlags.Public);
 
@@ -311,12 +320,16 @@ namespace SW2026RibbonAddin
                     }
                 }
             }
-            catch (Exception ex) { Debug.WriteLine("TryClearTabBoxes: " + ex.Message); }
+            catch (Exception ex)
+            {
+                Debug.WriteLine("TryClearTabBoxes: " + ex.Message);
+            }
         }
 
         private void TryRemoveTabBox(object tab, object box)
         {
             if (box == null) return;
+
             try
             {
                 var m = tab.GetType().GetMethod("RemoveCommandTabBox",
@@ -361,13 +374,11 @@ namespace SW2026RibbonAddin
 
             Stream ResolveOne(string fname)
             {
-                // try embedded by suffix (robust to namespace changes)
                 string hit = allNames.FirstOrDefault(n =>
                     n.EndsWith(".Resources." + fname, StringComparison.OrdinalIgnoreCase));
 
                 if (hit != null) return asm.GetManifestResourceStream(hit);
 
-                // try physical file next to the DLL
                 string asmDir = Path.GetDirectoryName(asm.Location) ?? ".";
                 string candidate = Path.Combine(asmDir, "Resources", fname);
                 if (File.Exists(candidate)) return File.OpenRead(candidate);
@@ -386,6 +397,7 @@ namespace SW2026RibbonAddin
             {
                 g.Clear(Color.Transparent);
                 int x = 0;
+
                 foreach (var s in images)
                 {
                     using (s)
@@ -395,6 +407,7 @@ namespace SW2026RibbonAddin
                         x += size;
                     }
                 }
+
                 strip.Save(outPng, ImageFormat.Png);
             }
         }
@@ -410,12 +423,19 @@ namespace SW2026RibbonAddin
         }
         #endregion
 
-        #region Commands (same behavior as before)
+        #region Commands
         public void OnHello()
         {
-            try { MessageBox.Show("Hello from Mehdi Tools ✨", "SW2026RibbonAddin"); }
-            catch (Exception ex) { Debug.WriteLine(ex); }
+            try
+            {
+                MessageBox.Show("Hello from Mehdi Tools ✨", "SW2026RibbonAddin");
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine(ex);
+            }
         }
+
         public int OnHelloEnable() => SW_ENABLE;
 
         public void OnAddFarsiNote()
@@ -429,7 +449,8 @@ namespace SW2026RibbonAddin
                     return;
                 }
 
-                using (var dlg = new Forms.FarsiNoteForm())
+                // New-note mode: full formatting (font, size, alignment)
+                using (var dlg = new Forms.FarsiNoteForm(true))
                 {
                     if (dlg.ShowDialog() != DialogResult.OK) return;
 
@@ -437,23 +458,37 @@ namespace SW2026RibbonAddin
                     if (string.IsNullOrWhiteSpace(text)) return;
 
                     text = ArabicTextUtils.PrepareForSolidWorks(text, dlg.UseRtlMarkers, dlg.InsertJoiners);
-                    StartFarsiNotePlacement(model, text, dlg.SelectedFontName, dlg.FontSizePoints);
+
+                    StartFarsiNotePlacement(
+                        model,
+                        text,
+                        dlg.SelectedFontName,
+                        dlg.FontSizePoints,
+                        dlg.Alignment);
                 }
             }
             catch (Exception ex)
             {
                 Debug.WriteLine(ex);
-                MessageBox.Show("Unexpected error while preparing note placement.\r\n" + ex.Message, "Farsi Note");
+                MessageBox.Show(
+                    "Unexpected error while preparing note placement.\r\n" + ex.Message,
+                    "Farsi Note");
             }
         }
+
         public int OnAddFarsiNoteEnable()
         {
             try
             {
                 var model = _swApp?.IActiveDoc2 as IModelDoc2;
-                return (model != null && model.GetType() == (int)swDocumentTypes_e.swDocDRAWING) ? SW_ENABLE : SW_DISABLE;
+                return (model != null && model.GetType() == (int)swDocumentTypes_e.swDocDRAWING)
+                    ? SW_ENABLE
+                    : SW_DISABLE;
             }
-            catch { return SW_DISABLE; }
+            catch
+            {
+                return SW_DISABLE;
+            }
         }
 
         public void OnEditSelectedNoteFarsi()
@@ -477,7 +512,8 @@ namespace SW2026RibbonAddin
                 object selObj = selMgr.GetSelectedObject6(1, -1);
                 INote note = null;
 
-                if (selObj is INote n1) note = n1;
+                if (selObj is INote n1)
+                    note = n1;
                 else if (selObj is IAnnotation ann)
                 {
                     try { note = (INote)ann.GetSpecificAnnotation(); } catch { }
@@ -497,14 +533,20 @@ namespace SW2026RibbonAddin
                 Debug.WriteLine("OnEditSelectedNoteFarsi error: " + ex);
             }
         }
+
         public int OnEditSelectedNoteFarsiEnable()
         {
             try
             {
                 var model = _swApp?.IActiveDoc2 as IModelDoc2;
-                return (model != null && model.GetType() == (int)swDocumentTypes_e.swDocDRAWING) ? SW_ENABLE : SW_DISABLE;
+                return (model != null && model.GetType() == (int)swDocumentTypes_e.swDocDRAWING)
+                    ? SW_ENABLE
+                    : SW_DISABLE;
             }
-            catch { return SW_DISABLE; }
+            catch
+            {
+                return SW_DISABLE;
+            }
         }
 
         public void OnUpdateFarsiNotes()
@@ -533,14 +575,20 @@ namespace SW2026RibbonAddin
                 Debug.WriteLine("OnUpdateFarsiNotes error: " + ex);
             }
         }
+
         public int OnUpdateFarsiNotesEnable()
         {
             try
             {
                 var model = _swApp?.IActiveDoc2 as IModelDoc2;
-                return (model != null && model.GetType() == (int)swDocumentTypes_e.swDocDRAWING) ? SW_ENABLE : SW_DISABLE;
+                return (model != null && model.GetType() == (int)swDocumentTypes_e.swDocDRAWING)
+                    ? SW_ENABLE
+                    : SW_DISABLE;
             }
-            catch { return SW_DISABLE; }
+            catch
+            {
+                return SW_DISABLE;
+            }
         }
         #endregion
 
@@ -552,27 +600,32 @@ namespace SW2026RibbonAddin
                 if (command != CMD_EDIT_TEXT) return 0;
 
                 var model = _swApp?.IActiveDoc2 as IModelDoc2;
-                if (model == null || model.GetType() != (int)swDocumentTypes_e.swDocDRAWING) return 0;
+                if (model == null || model.GetType() != (int)swDocumentTypes_e.swDocDRAWING)
+                    return 0;
 
                 var selMgr = (ISelectionMgr)model.SelectionManager;
-                if (selMgr == null || selMgr.GetSelectedObjectCount2(-1) < 1) return 0;
+                if (selMgr == null || selMgr.GetSelectedObjectCount2(-1) < 1)
+                    return 0;
 
                 object selObj = selMgr.GetSelectedObject6(1, -1);
                 INote note = null;
 
-                if (selObj is INote n1) note = n1;
+                if (selObj is INote n1)
+                    note = n1;
                 else if (selObj is IAnnotation ann)
                 {
                     try { note = (INote)ann.GetSpecificAnnotation(); } catch { }
                 }
 
-                if (note == null) return 0;
+                if (note == null)
+                    return 0;
 
                 bool ours = false;
                 try
                 {
                     string tag = note.TagName;
-                    ours = !string.IsNullOrEmpty(tag) && tag.StartsWith(FARSI_NOTE_TAG_PREFIX, StringComparison.Ordinal);
+                    ours = !string.IsNullOrEmpty(tag) &&
+                        tag.StartsWith(FARSI_NOTE_TAG_PREFIX, StringComparison.Ordinal);
                 }
                 catch { }
 
@@ -581,12 +634,20 @@ namespace SW2026RibbonAddin
                 EditNoteWithFarsiEditor(note, model);
                 return 1; // consume default command
             }
-            catch { return 0; }
+            catch
+            {
+                return 0;
+            }
         }
         #endregion
 
         #region Helpers (placement + editor + batch update)
-        private void StartFarsiNotePlacement(IModelDoc2 model, string preparedText, string fontName, double fontSizePts)
+        private void StartFarsiNotePlacement(
+            IModelDoc2 model,
+            string preparedText,
+            string fontName,
+            double fontSizePts,
+            HorizontalAlignment alignment)
         {
             try
             {
@@ -597,8 +658,13 @@ namespace SW2026RibbonAddin
                     return;
                 }
 
+                int justification = MapAlignmentToSwJustification(alignment);
+
                 _activePlacement?.Dispose();
-                _activePlacement = new FarsiNotePlacementSession(this, model, view, preparedText, fontName, fontSizePts);
+                _activePlacement = new FarsiNotePlacementSession(
+                    this, model, view,
+                    preparedText, fontName, fontSizePts,
+                    justification);
                 _activePlacement.Start();
             }
             catch (Exception ex)
@@ -608,28 +674,32 @@ namespace SW2026RibbonAddin
             }
         }
 
+        private static int MapAlignmentToSwJustification(HorizontalAlignment alignment)
+        {
+            switch (alignment)
+            {
+                case HorizontalAlignment.Left:
+                    return (int)swTextJustification_e.swTextJustificationLeft;
+                case HorizontalAlignment.Center:
+                    return (int)swTextJustification_e.swTextJustificationCenter;
+                case HorizontalAlignment.Right:
+                default:
+                    return (int)swTextJustification_e.swTextJustificationRight;
+            }
+        }
+
         private void EditNoteWithFarsiEditor(INote note, IModelDoc2 model)
         {
             string currentText = "";
-            try { currentText = note.GetText(); } catch { currentText = ""; }
+            try { currentText = note.GetText(); }
+            catch { currentText = ""; }
 
             string editable = ArabicNoteCodec.DecodeFromNote(currentText);
 
-            IAnnotation ann = null;
-            try { ann = (IAnnotation)note.GetAnnotation(); } catch { }
-
-            ITextFormat tf = null;
-            try { tf = ann != null ? (ITextFormat)ann.GetTextFormat(0) : null; } catch { }
-
-            string fontName = tf?.TypeFaceName ?? "Tahoma";
-            double sizePts = 12.0;
-            try { sizePts = tf != null ? tf.CharHeightInPts : 12.0; } catch { }
-
-            using (var dlg = new Forms.FarsiNoteForm())
+            // Edit-mode: text only (no formatting changes)
+            using (var dlg = new Forms.FarsiNoteForm(false))
             {
                 dlg.NoteText = editable;
-                dlg.SelectedFontName = fontName;
-                dlg.FontSizePoints = sizePts;
                 dlg.InsertJoiners = true;
                 dlg.UseRtlMarkers = false;
 
@@ -638,26 +708,24 @@ namespace SW2026RibbonAddin
                 string newRaw = dlg.NoteText ?? string.Empty;
                 if (string.IsNullOrWhiteSpace(newRaw)) return;
 
-                string shaped = ArabicTextUtils.PrepareForSolidWorks(newRaw, dlg.UseRtlMarkers, dlg.InsertJoiners);
+                string shaped = ArabicTextUtils.PrepareForSolidWorks(
+                    newRaw, dlg.UseRtlMarkers, dlg.InsertJoiners);
 
-                try { note.SetText(shaped); } catch { return; }
+                try { note.SetText(shaped); }
+                catch { return; }
 
-                try
-                {
-                    ann = (IAnnotation)note.GetAnnotation();
-                    tf = (ITextFormat)ann.GetTextFormat(0);
-                    tf.TypeFaceName = dlg.SelectedFontName;
-                    tf.CharHeightInPts = (int)Math.Round(dlg.FontSizePoints);
-                    ann.SetTextFormat(0, false, tf);
-                }
-                catch { /* ignore */ }
-
-                try { note.SetTextJustification((int)swTextJustification_e.swTextJustificationRight); } catch { }
-                try { model.GraphicsRedraw2(); } catch { }
+                try { model.GraphicsRedraw2(); }
+                catch { }
             }
         }
 
-        private struct UpdateStats { public int Sheets, Inspected, Updated, Skipped; }
+        private struct UpdateStats
+        {
+            public int Sheets;
+            public int Inspected;
+            public int Updated;
+            public int Skipped;
+        }
 
         private UpdateStats UpdateAllFarsiNotes(IModelDoc2 model)
         {
@@ -667,14 +735,21 @@ namespace SW2026RibbonAddin
             if (drw == null) return stats;
 
             string originalSheetName = null;
-            try { var cur = (Sheet)drw.GetCurrentSheet(); if (cur != null) originalSheetName = cur.GetName(); } catch { }
+            try
+            {
+                var cur = (Sheet)drw.GetCurrentSheet();
+                if (cur != null) originalSheetName = cur.GetName();
+            }
+            catch { }
 
             string[] sheetNames = GetSheetNamesSafe(drw);
             if (sheetNames == null || sheetNames.Length == 0) return stats;
 
             foreach (var sheetName in sheetNames)
             {
-                try { drw.ActivateSheet(sheetName); } catch { }
+                try { drw.ActivateSheet(sheetName); }
+                catch { }
+
                 stats.Sheets++;
 
                 IView v = drw.GetFirstView() as IView;
@@ -688,7 +763,8 @@ namespace SW2026RibbonAddin
                             stats.Inspected++;
 
                             string text = "";
-                            try { text = note.GetText(); } catch { }
+                            try { text = note.GetText(); }
+                            catch { }
 
                             if (!string.IsNullOrEmpty(text) && LooksArabicOrPresentationForms(text))
                             {
@@ -696,10 +772,11 @@ namespace SW2026RibbonAddin
                                 string reshaped = ArabicTextUtils.PrepareForSolidWorks(decoded, false, true);
 
                                 bool changed = !string.Equals(reshaped, text, StringComparison.Ordinal);
-                                try { note.SetText(reshaped); } catch { }
-                                try { note.SetTextJustification((int)swTextJustification_e.swTextJustificationRight); } catch { }
+                                try { note.SetText(reshaped); }
+                                catch { }
 
-                                if (changed) stats.Updated++; else stats.Skipped++;
+                                if (changed) stats.Updated++;
+                                else stats.Skipped++;
                             }
                             else
                             {
@@ -707,23 +784,32 @@ namespace SW2026RibbonAddin
                             }
 
                             object nextNoteObj = null;
-                            try { nextNoteObj = note.GetNext(); } catch { }
+                            try { nextNoteObj = note.GetNext(); }
+                            catch { }
+
                             note = nextNoteObj as INote;
                         }
                     }
-                    catch { /* continue */ }
+                    catch
+                    {
+                        // continue
+                    }
 
                     object nextViewObj = null;
-                    try { nextViewObj = v.GetNextView(); } catch { }
+                    try { nextViewObj = v.GetNextView(); }
+                    catch { }
+
                     v = nextViewObj as IView;
                 }
 
-                try { model.GraphicsRedraw2(); } catch { }
+                try { model.GraphicsRedraw2(); }
+                catch { }
             }
 
             if (!string.IsNullOrEmpty(originalSheetName))
             {
-                try { drw.ActivateSheet(originalSheetName); } catch { }
+                try { drw.ActivateSheet(originalSheetName); }
+                catch { }
             }
 
             return stats;
@@ -735,14 +821,17 @@ namespace SW2026RibbonAddin
             {
                 var obj = drw.GetSheetNames();
                 if (obj is string[] sarr) return sarr;
+
                 if (obj is object[] oarr)
                 {
                     var res = new string[oarr.Length];
-                    for (int i = 0; i < oarr.Length; i++) res[i] = Convert.ToString(oarr[i]);
+                    for (int i = 0; i < oarr.Length; i++)
+                        res[i] = Convert.ToString(oarr[i]);
                     return res;
                 }
             }
             catch { }
+
             return null;
         }
 
@@ -778,7 +867,9 @@ namespace SW2026RibbonAddin
             }
             catch (Exception ex)
             {
-                MessageBox.Show($"COM registration failed: {ex.Message}\r\nTry running Visual Studio as administrator.", "SW2026RibbonAddin");
+                MessageBox.Show(
+                    $"COM registration failed: {ex.Message}\r\nTry running Visual Studio as administrator.",
+                    "SW2026RibbonAddin");
             }
 
             try
@@ -793,8 +884,19 @@ namespace SW2026RibbonAddin
         [ComUnregisterFunction]
         public static void UnregisterFunction(Type t)
         {
-            try { Registry.LocalMachine.DeleteSubKeyTree($@"Software\SolidWorks\Addins\{{{t.GUID}}}", false); } catch { }
-            try { Registry.CurrentUser.DeleteSubKeyTree($@"Software\SolidWorks\AddinsStartup\{{{t.GUID}}}", false); } catch { }
+            try
+            {
+                Registry.LocalMachine.DeleteSubKeyTree(
+                    $@"Software\SolidWorks\Addins\{{{t.GUID}}}", false);
+            }
+            catch { }
+
+            try
+            {
+                Registry.CurrentUser.DeleteSubKeyTree(
+                    $@"Software\SolidWorks\AddinsStartup\{{{t.GUID}}}", false);
+            }
+            catch { }
         }
         #endregion
 
@@ -807,13 +909,20 @@ namespace SW2026RibbonAddin
             private readonly string _text;
             private readonly string _fontName;
             private readonly double _fontSizePts;
+            private readonly int _justification;
 
             private SolidWorks.Interop.sldworks.Mouse _mouse;
             private Forms.MouseGhostForm _ghost;
             private bool _active;
 
-            public FarsiNotePlacementSession(Addin owner, IModelDoc2 model, ModelView view,
-                string text, string fontName, double fontSizePts)
+            public FarsiNotePlacementSession(
+                Addin owner,
+                IModelDoc2 model,
+                ModelView view,
+                string text,
+                string fontName,
+                double fontSizePts,
+                int justification)
             {
                 _owner = owner;
                 _model = model;
@@ -821,6 +930,7 @@ namespace SW2026RibbonAddin
                 _text = text;
                 _fontName = string.IsNullOrWhiteSpace(fontName) ? "Tahoma" : fontName;
                 _fontSizePts = fontSizePts <= 0 ? 12.0 : fontSizePts;
+                _justification = justification;
             }
 
             public void Start()
@@ -848,7 +958,11 @@ namespace SW2026RibbonAddin
 
             private int OnMouseMoveNotify(int x, int y, int WParam) => 0;
             private int OnMouseLBtnDownNotify(int x, int y, int WParam) => 0;
-            private int OnMouseRBtnDownNotify(int x, int y, int WParam) { Cleanup(); return 1; }
+            private int OnMouseRBtnDownNotify(int x, int y, int WParam)
+            {
+                Cleanup();
+                return 1;
+            }
 
             private int OnMouseSelectNotify(int Ix, int Iy, double x, double y, double z)
             {
@@ -865,7 +979,11 @@ namespace SW2026RibbonAddin
                     var note = (INote)noteObj;
                     var ann = (IAnnotation)note.GetAnnotation();
 
-                    try { note.TagName = $"{FARSI_NOTE_TAG_PREFIX}:{Guid.NewGuid():N}"; } catch { }
+                    try
+                    {
+                        note.TagName = $"{FARSI_NOTE_TAG_PREFIX}:{Guid.NewGuid():N}";
+                    }
+                    catch { }
 
                     try
                     {
@@ -876,7 +994,12 @@ namespace SW2026RibbonAddin
                     }
                     catch { }
 
-                    try { note.SetTextJustification((int)swTextJustification_e.swTextJustificationRight); } catch { }
+                    try
+                    {
+                        note.SetTextJustification(_justification);
+                    }
+                    catch { }
+
                     ann?.SetPosition2(x, y, 0.0);
                     _model.GraphicsRedraw2();
                 }
@@ -912,7 +1035,13 @@ namespace SW2026RibbonAddin
                 }
                 catch { }
 
-                try { _ghost?.Close(); _ghost?.Dispose(); } catch { }
+                try
+                {
+                    _ghost?.Close();
+                    _ghost?.Dispose();
+                }
+                catch { }
+
                 _ghost = null;
                 _mouse = null;
             }
