@@ -14,10 +14,15 @@ namespace SW2026RibbonAddin
     /// Modes:
     ///  - useRtlMarkers = true:
     ///      wrap RTL runs with classic RLE…PDF embedding marks (normally invisible in SW).
-    ///  - useRtlMarkers = false:
-    ///      do a "visual pre-compensation" that tries to match what SW will do to the line.
+    ///  - useRtlMarkers = false (default-safe):
+    ///      produce a "visual pre-compensation": keep characters within each RTL run intact,
+    ///      but reverse the sequence of RTL runs across the line so final display matches
+    ///      the logical order when rendered in an LTR paragraph.
+    ///
+    /// Optional: Arabic shaping (joins/ligatures) to avoid disconnected letters in hosts
+    /// that don't shape Arabic properly.
     /// </summary>
-    internal static class ArabicTextUtils
+    public static class ArabicTextUtils
     {
         private const char ZWJ = '\u200D';  // Zero Width Joiner
         private const char ZWNJ = '\u200C'; // Zero Width Non-Joiner
@@ -64,27 +69,17 @@ namespace SW2026RibbonAddin
         {
             public Dir Dir;
             public string Text;
-            public Run(Dir d, string t) { Dir = d; Text = t ?? string.Empty; }
+            public Run(Dir d, string t) { Dir = d; Text = t; }
         }
 
         [Flags]
-        private enum Join
-        {
-            None = 0,
-            Prev = 1,
-            Next = 2
-        }
+        private enum Join { None = 0, Prev = 1, Next = 2 }
 
         private struct Forms
         {
-            public char Iso;
-            public char Fin;
-            public char Ini;
-            public char Med;
+            public char Iso, Fin, Ini, Med;
             public Forms(char iso, char fin, char ini, char med)
-            {
-                Iso = iso; Fin = fin; Ini = ini; Med = med;
-            }
+            { Iso = iso; Fin = fin; Ini = ini; Med = med; }
         }
 
         // Presentation form map (subset sufficient for Persian)
@@ -103,6 +98,7 @@ namespace SW2026RibbonAddin
             ['\u062C'] = new Forms('\uFE9D', '\uFE9E', '\uFE9F', '\uFEA0'),
             ['\u062D'] = new Forms('\uFEA1', '\uFEA2', '\uFEA3', '\uFEA4'),
             ['\u062E'] = new Forms('\uFEA5', '\uFEA6', '\uFEA7', '\uFEA8'),
+
             ['\u062F'] = new Forms('\uFEA9', '\uFEAA', '\uFEA9', '\uFEAA'),
             ['\u0630'] = new Forms('\uFEAB', '\uFEAC', '\uFEAB', '\uFEAC'),
             ['\u0631'] = new Forms('\uFEAD', '\uFEAE', '\uFEAD', '\uFEAE'),
@@ -141,20 +137,35 @@ namespace SW2026RibbonAddin
 
         private static readonly Dictionary<char, Join> JoinType = new Dictionary<char, Join>
         {
+            ['\u0621'] = Join.None,
+
+            ['\u0622'] = Join.Prev,
+            ['\u0623'] = Join.Prev,
+            ['\u0625'] = Join.Prev,
+            ['\u0627'] = Join.Prev,
+
             ['\u0628'] = Join.Prev | Join.Next,
             ['\u062A'] = Join.Prev | Join.Next,
             ['\u062B'] = Join.Prev | Join.Next,
             ['\u062C'] = Join.Prev | Join.Next,
             ['\u062D'] = Join.Prev | Join.Next,
             ['\u062E'] = Join.Prev | Join.Next,
+
+            ['\u062F'] = Join.Prev,
+            ['\u0630'] = Join.Prev,
+            ['\u0631'] = Join.Prev,
+            ['\u0632'] = Join.Prev,
+
             ['\u0633'] = Join.Prev | Join.Next,
             ['\u0634'] = Join.Prev | Join.Next,
             ['\u0635'] = Join.Prev | Join.Next,
             ['\u0636'] = Join.Prev | Join.Next,
             ['\u0637'] = Join.Prev | Join.Next,
             ['\u0638'] = Join.Prev | Join.Next,
+
             ['\u0639'] = Join.Prev | Join.Next,
             ['\u063A'] = Join.Prev | Join.Next,
+
             ['\u0641'] = Join.Prev | Join.Next,
             ['\u0642'] = Join.Prev | Join.Next,
             ['\u0643'] = Join.Prev | Join.Next,
@@ -162,6 +173,9 @@ namespace SW2026RibbonAddin
             ['\u0645'] = Join.Prev | Join.Next,
             ['\u0646'] = Join.Prev | Join.Next,
             ['\u0647'] = Join.Prev | Join.Next,
+
+            ['\u0648'] = Join.Prev,
+            ['\u0629'] = Join.Prev,
             ['\u064A'] = Join.Prev | Join.Next,
 
             // Persian
@@ -180,13 +194,27 @@ namespace SW2026RibbonAddin
             var d = new Dictionary<char, char>();
             foreach (var kv in Map)
             {
-                d[kv.Value.Iso] = kv.Key;
-                d[kv.Value.Fin] = kv.Key;
-                d[kv.Value.Ini] = kv.Key;
-                d[kv.Value.Med] = kv.Key;
+                var baseCh = kv.Key; var f = kv.Value;
+                if (f.Iso != '\u0000') d[f.Iso] = baseCh;
+                if (f.Fin != '\u0000') d[f.Fin] = baseCh;
+                if (f.Ini != '\u0000') d[f.Ini] = baseCh;
+                if (f.Med != '\u0000') d[f.Med] = baseCh;
             }
             return d;
         }
+
+        // Lam-Alef ligature reverse map
+        private static readonly Dictionary<char, string> LigToBaseSeq = new Dictionary<char, string>
+        {
+            ['\uFEFB'] = "\u0644\u0627",
+            ['\uFEFC'] = "\u0644\u0627",
+            ['\uFEF5'] = "\u0644\u0622",
+            ['\uFEF6'] = "\u0644\u0622",
+            ['\uFEF7'] = "\u0644\u0623",
+            ['\uFEF8'] = "\u0644\u0623",
+            ['\uFEF9'] = "\u0644\u0625",
+            ['\uFEFA'] = "\u0644\u0625",
+        };
 
         private static bool IsArabicBaseLetter(char ch) => Map.ContainsKey(ch);
         private static bool IsArabicPresentationForm(char ch)
@@ -245,11 +273,11 @@ namespace SW2026RibbonAddin
 
                 if (!hadMarkers)
                 {
-                    // Need to undo whatever visual pre-compensation we applied in
-                    // ReorderLineForLtrHost when sending text to SolidWorks.
-                    // For simple lines (0 or 1 LTR run) that was ReverseRtlRunSequence;
+                    // We need to undo whatever visual pre-compensation we did
+                    // in ReorderLineForLtrHost when sending text to SolidWorks.
+                    // For simple lines (0 or 1 LTR run), that was ReverseRtlRunSequence;
                     // for complex mixed lines (multiple LTR runs + at least one RTL run),
-                    // we reversed the run sequence instead.
+                    // we reversed the *run sequence* instead.
 
                     var runs = TokenizeWithNeutrals(ln);
                     ResolveNeutralsInPlace(runs);
@@ -273,7 +301,7 @@ namespace SW2026RibbonAddin
                     }
                     else
                     {
-                        // Simple case: undo classic visual pre-compensation.
+                        // Simple case: undo visual pre-compensation using the original helper.
                         ln = ReverseRtlRunSequence(ln);
                     }
                 }
@@ -364,9 +392,7 @@ namespace SW2026RibbonAddin
             return merged;
         }
 
-        /// <summary>
-        /// Reverse the sequence of RTL runs (visual pre-comp). This helper is its own inverse.
-        /// </summary>
+        // Swap sequence of RTL runs (used by both Prepare and From paths)
         private static string ReverseRtlRunSequence(string line)
         {
             var runs = TokenizeWithNeutrals(line);
@@ -396,44 +422,49 @@ namespace SW2026RibbonAddin
         // Prepare direction for SolidWorks (wrap with markers or pre-compensate)
         private static string ReorderLineForLtrHost(string line, bool useRtlMarkers)
         {
-            // Tokenize into directional runs so we can distinguish between
-            // simple and complex mixed lines.
-            var runs = TokenizeWithNeutrals(line);
-            ResolveNeutralsInPlace(runs);
-            runs = MergeAdjacentSameDir(runs);
+            if (useRtlMarkers)
+            {
+                // Wrap only RTL runs with RLE…PDF
+                var runsWithMarkers = TokenizeWithNeutrals(line);
+                ResolveNeutralsInPlace(runsWithMarkers);
+                runsWithMarkers = MergeAdjacentSameDir(runsWithMarkers);
+
+                var sbMarkers = new StringBuilder(line?.Length ?? 0 + 8);
+                foreach (var r in runsWithMarkers)
+                {
+                    if (r.Dir == Dir.RTL) sbMarkers.Append(RLE).Append(r.Text).Append(PDF);
+                    else sbMarkers.Append(r.Text);
+                }
+                return sbMarkers.ToString();
+            }
+
+            // Marker-free path.
+            // We classify the line into directional runs and decide whether to
+            // use the classic RTL-run swap or the run-sequence reversal used
+            // for complex mixed lines (multiple LTR runs + at least one RTL run).
+            var runs2 = TokenizeWithNeutrals(line);
+            ResolveNeutralsInPlace(runs2);
+            runs2 = MergeAdjacentSameDir(runs2);
 
             int ltrCount = 0;
             int rtlCount = 0;
-            foreach (var r in runs)
+            foreach (var r in runs2)
             {
                 if (r.Dir == Dir.LTR) ltrCount++;
                 else if (r.Dir == Dir.RTL) rtlCount++;
             }
 
-            if (useRtlMarkers)
-            {
-                // Wrap only RTL runs with RLE…PDF; keep logical order.
-                var sb = new StringBuilder(line?.Length ?? 0 + 8);
-                foreach (var r in runs)
-                {
-                    if (r.Dir == Dir.RTL) sb.Append(RLE).Append(r.Text).Append(PDF);
-                    else sb.Append(r.Text);
-                }
-                return sb.ToString();
-            }
-
-            // Marker-free path.
-            // Complex mixed line: more than one LTR run and at least one RTL run.
             if (ltrCount > 1 && rtlCount > 0)
             {
-                // Pre-compensate at run level by reversing the run sequence.
+                // Complex mixed line: pre-compensate by reversing the entire
+                // run sequence (but NOT the characters inside each run).
                 var sb = new StringBuilder(line.Length);
-                for (int i = runs.Count - 1; i >= 0; i--)
-                    sb.Append(runs[i].Text);
+                for (int i = runs2.Count - 1; i >= 0; i--)
+                    sb.Append(runs2[i].Text);
                 return sb.ToString();
             }
 
-            // Simple case (0 or 1 LTR run): use the existing visual pre-compensation.
+            // Simple case (0 or 1 LTR run): use the original RTL-run swap helper.
             return ReverseRtlRunSequence(line);
         }
 
@@ -445,10 +476,18 @@ namespace SW2026RibbonAddin
             var sb = new StringBuilder(line.Length);
             foreach (var ch in line)
             {
-                if (PresentToBase.TryGetValue(ch, out var baseCh))
+                if (LigToBaseSeq.TryGetValue(ch, out var seq))
+                {
+                    sb.Append(seq);
+                }
+                else if (PresentToBase.TryGetValue(ch, out var baseCh))
+                {
                     sb.Append(baseCh);
+                }
                 else
+                {
                     sb.Append(ch);
+                }
             }
             return sb.ToString();
         }
@@ -470,14 +509,65 @@ namespace SW2026RibbonAddin
             return sb.ToString();
         }
 
+        private static char? LamAlefLigature(char alef, bool joinPrev)
+        {
+            switch (alef)
+            {
+                case '\u0627': return joinPrev ? '\uFEFC' : '\uFEFB';
+                case '\u0622': return joinPrev ? '\uFEF6' : '\uFEF5';
+                case '\u0623': return joinPrev ? '\uFEF8' : '\uFEF7';
+                case '\u0625': return joinPrev ? '\uFEFA' : '\uFEF9';
+                default: return null;
+            }
+        }
+
+        private static int FindPrevArabicIndex(string s, int start)
+        {
+            for (int p = start - 1; p >= 0; p--)
+            {
+                char ch = s[p];
+                if (ch == ZWJ) continue;
+                if (ch == ZWNJ) return -1;
+                if (IsArabicCombining(ch)) continue;
+                if (IsArabicBaseLetter(ch)) return p;
+                return -1; // barrier
+            }
+            return -1;
+        }
+
+        private static int FindNextArabicIndex(string s, int start)
+        {
+            for (int n = start + 1; n < s.Length; n++)
+            {
+                char ch = s[n];
+                if (ch == ZWJ) continue;
+                if (ch == ZWNJ) return -1;
+                if (IsArabicCombining(ch)) continue;
+                if (IsArabicBaseLetter(ch)) return n;
+                return -1; // barrier
+            }
+            return -1;
+        }
+
+        private static bool CanJoinPrevHere(string s, int index)
+        {
+            int prevIndex = FindPrevArabicIndex(s, index);
+            return prevIndex >= 0 && CanJoinNext(s[prevIndex]) && CanJoinPrev(s[index]);
+        }
+
+        private static bool CanJoinNextHere(string s, int index)
+        {
+            int nextIndex = FindNextArabicIndex(s, index);
+            return nextIndex >= 0 && CanJoinNext(s[index]) && CanJoinPrev(s[nextIndex]);
+        }
+
         private static string ShapeLine(string line)
         {
             if (string.IsNullOrEmpty(line)) return line;
 
             var sb = new StringBuilder(line.Length * 2);
-            int len = line.Length;
-
-            for (int i = 0; i < len;)
+            int i = 0;
+            while (i < line.Length)
             {
                 char cur = line[i];
 
@@ -488,41 +578,14 @@ namespace SW2026RibbonAddin
                     continue;
                 }
 
-                // Peek previous/next base letters (skip combining marks)
-                char? prev = null;
-                int prevIndex = i - 1;
-                while (prevIndex >= 0)
-                {
-                    var c = line[prevIndex];
-                    if (IsArabicCombining(c))
-                    {
-                        prevIndex--;
-                        continue;
-                    }
-                    prev = c;
-                    break;
-                }
+                bool joinPrev = CanJoinPrevHere(line, i);
+                bool joinNext = CanJoinNextHere(line, i);
 
-                char? next = null;
-                int nextIndex = i + 1;
-                while (nextIndex < len)
+                // Lam-Alef ligatures
+                int nextIndex = FindNextArabicIndex(line, i);
+                if (cur == '\u0644' && nextIndex == i + 1)
                 {
-                    var c = line[nextIndex];
-                    if (IsArabicCombining(c))
-                    {
-                        nextIndex++;
-                        continue;
-                    }
-                    next = c;
-                    break;
-                }
-
-                bool joinPrev = prev.HasValue && CanJoinPrev(cur) && CanJoinNext(prev.Value);
-                bool joinNext = next.HasValue && CanJoinNext(cur) && CanJoinPrev(next.Value);
-
-                // Special lam-aleph ligature
-                if (cur == '\u0644' && next.HasValue)
-                {
+                    char next = line[nextIndex];
                     if (next == '\u0627' || next == '\u0622' || next == '\u0623' || next == '\u0625')
                     {
                         var lig = LamAlefLigature(next, joinPrev);
@@ -546,26 +609,6 @@ namespace SW2026RibbonAddin
                 i++;
             }
             return sb.ToString();
-        }
-
-        private static char? LamAlefLigature(char? alef, bool connectToPrev)
-        {
-            if (!alef.HasValue) return null;
-
-            // Lam-Alef ligatures for Arabic forms
-            switch (alef.Value)
-            {
-                case '\u0627': // ALEF
-                    return connectToPrev ? '\uFEFC' : '\uFEFB';
-                case '\u0622': // ALEF WITH MADDA
-                    return connectToPrev ? '\uFEF6' : '\uFEF5';
-                case '\u0623': // ALEF WITH HAMZA ABOVE
-                    return connectToPrev ? '\uFEF8' : '\uFEF7';
-                case '\u0625': // ALEF WITH HAMZA BELOW
-                    return connectToPrev ? '\uFEFA' : '\uFEF9';
-                default:
-                    return null;
-            }
         }
     }
 }
