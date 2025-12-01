@@ -378,3 +378,9 @@ FodyWeavers.xsd
 /Resources/small_strip.png
 /installer/payload/SW2025RibbonAddin.dll
 /installer/SW2025RibbonAddin-Setup.exe
+/installer/payload/SolidWorks.Interop.sldworks.dll
+/installer/payload/SolidWorks.Interop.swconst.dll
+/installer/payload/SolidWorks.Interop.swpublished.dll
+/installer/payload/SW2026RibbonAddin.dll
+/installer/payload/System.Text.Json.dll
+*.exe
