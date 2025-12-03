@@ -51,10 +51,11 @@ namespace SW2026RibbonAddin.Commands
 
         public int GetEnableState(AddinContext context)
         {
+            // Enabled whenever a document is open.
+            // On click, OnUpdateFarsiNotes() will check that it's a drawing.
             try
             {
-                var model = context.ActiveModel;
-                return (model != null && model.GetType() == (int)swDocumentTypes_e.swDocDRAWING)
+                return context.ActiveModel != null
                     ? AddinContext.Enable
                     : AddinContext.Disable;
             }
