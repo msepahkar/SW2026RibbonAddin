@@ -108,32 +108,16 @@ namespace SW2026RibbonAddin.Commands
 
         public int GetEnableState(AddinContext context)
         {
+            // New strategy:
+            // - As long as there is some active document, keep the DWG button enabled.
+            // - We no longer try to inspect the part/assembly here.
+            // - When the user clicks, Execute() will check document type and
+            //   presence of sheet-metal and show a message if nothing can be done.
+
             try
             {
                 var model = context.ActiveModel;
-                if (model == null)
-                    return AddinContext.Disable;
-
-                int docType = model.GetType();
-
-                if (docType == (int)swDocumentTypes_e.swDocPART)
-                {
-                    return TryGetSheetMetalThickness(model, out _)
-                        ? AddinContext.Enable
-                        : AddinContext.Disable;
-                }
-
-                if (docType == (int)swDocumentTypes_e.swDocASSEMBLY)
-                {
-                    var asm = model as IAssemblyDoc;
-                    if (asm == null) return AddinContext.Disable;
-
-                    return AssemblyContainsSheetMetal(asm)
-                        ? AddinContext.Enable
-                        : AddinContext.Disable;
-                }
-
-                return AddinContext.Disable;
+                return model != null ? AddinContext.Enable : AddinContext.Disable;
             }
             catch
             {
