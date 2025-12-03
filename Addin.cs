@@ -3,6 +3,7 @@ using SolidWorks.Interop.sldworks;
 using SolidWorks.Interop.swconst;
 using SolidWorks.Interop.swpublished;
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Imaging;
@@ -11,6 +12,9 @@ using System.Linq;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Windows.Forms;
+using SW2026RibbonAddin.Commands;
+using SW2026RibbonAddin.Licensing;
+using Forms = SW2026RibbonAddin.Forms;
 
 namespace SW2026RibbonAddin
 {
@@ -24,19 +28,27 @@ namespace SW2026RibbonAddin
         private ICommandManager _cmdMgr;
         private ICommandGroup _cmdGroup;
 
-        // Command item indexes
+        // Button infrastructure
+        private const int MAX_CMD_SLOTS = 16;
+        private readonly List<IMehdiRibbonButton> _buttons = new List<IMehdiRibbonButton>();
+        private readonly IMehdiRibbonButton[] _slotButtons = new IMehdiRibbonButton[MAX_CMD_SLOTS];
+        private readonly int[] _slotCommandIndices = new int[MAX_CMD_SLOTS];
+
+        private LicenseState _licenseState = LicenseState.TrialActive;
+
+        // Legacy indices (no longer used, but kept for compatibility)
         private int _helloCmdIndex = -1;
         private int _farsiCmdIndex = -1;
         private int _editSelNoteCmdIndex = -1;
         private int _updateAllNotesCmdIndex = -1;
 
-        // Bump once if icons are cached and won’t refresh
+        // Command group + tab constants
         private const int MAIN_CMD_GROUP_ID = 20258;
-
         private const string TAB_NAME = "Mehdi";
         private const string MAIN_CMD_GROUP_TITLE = "Mehdi Tools";
         private const string MAIN_CMD_GROUP_TOOLTIP = "Custom tools";
 
+        // Farsi note command strings (legacy text)
         private const string HELLO_CMD_NAME = "Hello";
         private const string HELLO_CMD_TOOLTIP = "Show a hello message";
         private const string HELLO_CMD_HINT = "Hello";
@@ -50,72 +62,167 @@ namespace SW2026RibbonAddin
         private const string EDIT_SEL_NOTE_CMD_HINT = "Edit Note (Farsi)";
 
         private const string UPDATE_ALL_NOTES_CMD_NAME = "Update Farsi Notes";
-        private const string UPDATE_ALL_NOTES_CMD_TOOLTIP = "Re‑shape and fix all Farsi notes across all sheets";
+        private const string UPDATE_ALL_NOTES_CMD_TOOLTIP = "Re-shape and fix all Farsi notes across all sheets";
         private const string UPDATE_ALL_NOTES_CMD_HINT = "Update Farsi Notes";
 
         internal const string FARSI_NOTE_TAG_PREFIX = "MEHDI_FARSI_NOTE";
 
         private const int SW_ENABLE = 1;
         private const int SW_DISABLE = 0;
+
+        // SolidWorks command ID for "Edit Text" on a note
         private const int CMD_EDIT_TEXT = 1811;
 
         private FarsiNotePlacementSession _activePlacement;
 
         #region ISwAddin
+
         public bool ConnectToSW(object ThisSW, int cookie)
         {
             try
             {
                 _swApp = (SldWorks)ThisSW;
                 _cookie = cookie;
+
                 _swApp.SetAddinCallbackInfo2(0, this, _cookie);
                 _cmdMgr = _swApp.GetCommandManager(_cookie);
 
+                InitializeLicenseState();
+                InitializeButtons();
                 CreateUI();
 
                 _swApp.CommandOpenPreNotify += OnCommandOpenPreNotify;
+
                 return true;
             }
             catch (Exception ex)
             {
-                Debug.WriteLine(ex);
+                Debug.WriteLine("ConnectToSW failed: " + ex);
                 return false;
             }
         }
 
         public bool DisconnectFromSW()
         {
-            try { if (_swApp != null) _swApp.CommandOpenPreNotify -= OnCommandOpenPreNotify; }
+            try
+            {
+                if (_swApp != null)
+                    _swApp.CommandOpenPreNotify -= OnCommandOpenPreNotify;
+            }
             catch { }
-            try { if (_cmdMgr != null && _cmdGroup != null) _cmdMgr.RemoveCommandGroup(MAIN_CMD_GROUP_ID); }
+
+            try
+            {
+                if (_cmdMgr != null && _cmdGroup != null)
+                    _cmdMgr.RemoveCommandGroup(MAIN_CMD_GROUP_ID);
+            }
             catch { }
+
             _cmdGroup = null;
             _cmdMgr = null;
             _swApp = null;
+
             return true;
         }
+
         #endregion
 
-        #region UI (Command group + icons + tab without duplicates)
+        #region Licensing + button discovery
+
+        private void InitializeLicenseState()
+        {
+            try
+            {
+                if (LicenseGate.IsLicensed)
+                    _licenseState = LicenseState.Licensed;
+                else
+                    _licenseState = LicenseState.TrialActive;
+            }
+            catch
+            {
+                _licenseState = LicenseState.TrialActive;
+            }
+        }
+
+        private void InitializeButtons()
+        {
+            _buttons.Clear();
+
+            try
+            {
+                var buttonType = typeof(IMehdiRibbonButton);
+                var asm = Assembly.GetExecutingAssembly();
+
+                var types = asm.GetTypes()
+                    .Where(t =>
+                        !t.IsAbstract &&
+                        buttonType.IsAssignableFrom(t) &&
+                        t.GetConstructor(Type.EmptyTypes) != null);
+
+                foreach (var t in types)
+                {
+                    if (Activator.CreateInstance(t) is IMehdiRibbonButton button)
+                        _buttons.Add(button);
+                }
+
+                // Fallback if reflection fails
+                if (_buttons.Count == 0)
+                {
+                    _buttons.Add(new HelloButton());
+                    _buttons.Add(new AddFarsiNoteButton());
+                    _buttons.Add(new EditSelectedFarsiNoteButton());
+                    _buttons.Add(new UpdateFarsiNotesButton());
+                    _buttons.Add(new DwgButton());
+                }
+
+                // Sort by section, then section order, then display name
+                _buttons.Sort((a, b) =>
+                {
+                    int sectionCompare = a.Section.CompareTo(b.Section);
+                    if (sectionCompare != 0) return sectionCompare;
+
+                    int orderCompare = a.SectionOrder.CompareTo(b.SectionOrder);
+                    if (orderCompare != 0) return orderCompare;
+
+                    return string.Compare(a.DisplayName, b.DisplayName,
+                        StringComparison.CurrentCultureIgnoreCase);
+                });
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine("InitializeButtons failed: " + ex);
+            }
+        }
+
+        #endregion
+
+        #region UI creation (command group + tabs)
+
         private void CreateUI()
         {
             int errors = 0;
 
-            // Remove any cached CommandGroup with same ID (avoids stale icons)
+            // Remove previous command group with same ID (avoid stale icons)
             try
             {
                 var existing = _cmdMgr.GetCommandGroup(MAIN_CMD_GROUP_ID);
-                if (existing != null) _cmdMgr.RemoveCommandGroup(MAIN_CMD_GROUP_ID);
+                if (existing != null)
+                    _cmdMgr.RemoveCommandGroup(MAIN_CMD_GROUP_ID);
             }
             catch { }
 
             const bool ignorePrevious = true;
-            _cmdGroup = _cmdMgr.CreateCommandGroup2(
-                MAIN_CMD_GROUP_ID, MAIN_CMD_GROUP_TITLE,
-                MAIN_CMD_GROUP_TOOLTIP, "", -1,
-                ignorePrevious, ref errors);
 
-            // ---- Assign transparent PNG strips (alpha) ----
+            _cmdGroup = _cmdMgr.CreateCommandGroup2(
+                MAIN_CMD_GROUP_ID,
+                MAIN_CMD_GROUP_TITLE,
+                MAIN_CMD_GROUP_TOOLTIP,
+                "",
+                -1,
+                ignorePrevious,
+                ref errors);
+
+            // Icon strips
             var (smallStrip, largeStrip) = EnsurePngStrips();
             if (File.Exists(smallStrip) && File.Exists(largeStrip))
             {
@@ -123,6 +230,7 @@ namespace SW2026RibbonAddin
                 {
                     _cmdGroup.IconList = smallStrip;
                     _cmdGroup.MainIconList = largeStrip;
+
                     TrySetProperty(_cmdGroup, "SmallIconList", smallStrip);
                     TrySetProperty(_cmdGroup, "LargeIconList", largeStrip);
                 }
@@ -134,217 +242,127 @@ namespace SW2026RibbonAddin
 
             int itemOpts = (int)(swCommandItemType_e.swMenuItem | swCommandItemType_e.swToolbarItem);
 
-            _helloCmdIndex = _cmdGroup.AddCommandItem2(
-                HELLO_CMD_NAME, -1, HELLO_CMD_TOOLTIP, HELLO_CMD_HINT,
-                0, nameof(OnHello), nameof(OnHelloEnable), 1, itemOpts);
+            Array.Clear(_slotButtons, 0, _slotButtons.Length);
+            Array.Clear(_slotCommandIndices, 0, _slotCommandIndices.Length);
 
-            _farsiCmdIndex = _cmdGroup.AddCommandItem2(
-                FARSI_CMD_NAME, -1, FARSI_CMD_TOOLTIP, FARSI_CMD_HINT,
-                1, nameof(OnAddFarsiNote), nameof(OnAddFarsiNoteEnable), 2, itemOpts);
+            int slot = 0;
 
-            _editSelNoteCmdIndex = _cmdGroup.AddCommandItem2(
-                EDIT_SEL_NOTE_CMD_NAME, -1, EDIT_SEL_NOTE_CMD_TOOLTIP, EDIT_SEL_NOTE_CMD_HINT,
-                2, nameof(OnEditSelectedNoteFarsi), nameof(OnEditSelectedNoteFarsiEnable), 3, itemOpts);
+            foreach (var button in _buttons)
+            {
+                if (slot >= MAX_CMD_SLOTS)
+                {
+                    Debug.WriteLine("Max command slots exceeded; ignoring " + button.Id);
+                    break;
+                }
 
-            _updateAllNotesCmdIndex = _cmdGroup.AddCommandItem2(
-                UPDATE_ALL_NOTES_CMD_NAME, -1, UPDATE_ALL_NOTES_CMD_TOOLTIP, UPDATE_ALL_NOTES_CMD_HINT,
-                3, nameof(OnUpdateFarsiNotes), nameof(OnUpdateFarsiNotesEnable), 4, itemOpts);
+                string callback = $"OnCmd{slot}";
+                string enable = $"OnCmd{slot}Enable";
+
+                int cmdIndex = _cmdGroup.AddCommandItem2(
+                    button.DisplayName,
+                    -1,
+                    button.Tooltip,
+                    button.Hint,
+                    slot,
+                    callback,
+                    enable,
+                    slot + 1,
+                    itemOpts);
+
+                _slotButtons[slot] = button;
+                _slotCommandIndices[slot] = cmdIndex;
+
+                slot++;
+            }
 
             _cmdGroup.HasToolbar = true;
             _cmdGroup.HasMenu = true;
             _cmdGroup.Activate();
 
-            // ---- Command Tab (DRAWING) — remove/clear before creating to avoid duplicates ----
+            // ----- Command tabs for PART / ASSEMBLY / DRAWING -----
             try
             {
-                int docType = (int)swDocumentTypes_e.swDocDRAWING;
-
-                // Remove all existing tabs named "Mehdi" (prevents accumulation across reloads)
+                // Remove all existing "Mehdi" tabs first
                 RemoveAllTabsNamed(TAB_NAME);
 
-                // Create a fresh tab
-                var tab = _cmdMgr.AddCommandTab(docType, TAB_NAME);
-                if (tab != null)
-                {
-                    var box = tab.AddCommandTabBox();
-
-                    var ids = new int[]
-                    {
-                        _cmdGroup.get_CommandID(_helloCmdIndex),
-                        _cmdGroup.get_CommandID(_farsiCmdIndex),
-                        _cmdGroup.get_CommandID(_editSelNoteCmdIndex),
-                        _cmdGroup.get_CommandID(_updateAllNotesCmdIndex)
-                    };
-
-                    var textTypes = new int[]
-                    {
-                        (int)swCommandTabButtonTextDisplay_e.swCommandTabButton_TextBelow,
-                        (int)swCommandTabButtonTextDisplay_e.swCommandTabButton_TextBelow,
-                        (int)swCommandTabButtonTextDisplay_e.swCommandTabButton_TextBelow,
-                        (int)swCommandTabButtonTextDisplay_e.swCommandTabButton_TextBelow
-                    };
-
-                    box.AddCommands(ids, textTypes);
-                }
-            }
-            catch (Exception ex)
-            {
-                Debug.WriteLine("Create tab failed: " + ex.Message);
-            }
-        }
-
-        /// <summary>
-        /// Removes any existing command tabs that have the specified title.
-        /// Works across PIA variants (ICommandTab vs CommandTab) using reflection.
-        /// </summary>
-        private void RemoveAllTabsNamed(string title)
-        {
-            try
-            {
                 int[] docTypes =
                 {
-                    (int)swDocumentTypes_e.swDocDRAWING,
                     (int)swDocumentTypes_e.swDocPART,
-                    (int)swDocumentTypes_e.swDocASSEMBLY
+                    (int)swDocumentTypes_e.swDocASSEMBLY,
+                    (int)swDocumentTypes_e.swDocDRAWING
                 };
 
-                foreach (int dt in docTypes)
+                foreach (int docType in docTypes)
                 {
-                    object tab = null;
-                    try { tab = _cmdMgr.GetCommandTab(dt, title); }
-                    catch { }
+                    var tab = _cmdMgr.AddCommandTab(docType, TAB_NAME);
+                    if (tab == null) continue;
 
-                    if (tab != null)
+                    var groupsBySection = _buttons
+                        .GroupBy(b => b.Section)
+                        .OrderBy(g => g.Key);
+
+                    foreach (var group in groupsBySection)
                     {
-                        if (!TryRemoveCommandTab(tab))
-                        {
-                            // Fallback: clear pre‑existing boxes
-                            TryClearTabBoxes(tab);
-                        }
+                        var box = tab.AddCommandTabBox();
+
+                        var ids = group
+                            .Select(b =>
+                            {
+                                int s = Array.IndexOf(_slotButtons, b);
+                                if (s < 0) return -1;
+                                int cidx = _slotCommandIndices[s];
+                                return _cmdGroup.get_CommandID(cidx);
+                            })
+                            .Where(id => id != -1)
+                            .ToArray();
+
+                        if (ids.Length == 0) continue;
+
+                        var textTypes = new int[ids.Length];
+                        for (int i = 0; i < textTypes.Length; i++)
+                            textTypes[i] = (int)swCommandTabButtonTextDisplay_e.swCommandTabButton_TextBelow;
+
+                        box.AddCommands(ids, textTypes);
                     }
                 }
             }
             catch (Exception ex)
             {
-                Debug.WriteLine("RemoveAllTabsNamed: " + ex.Message);
+                Debug.WriteLine("CreateUI - tab creation failed: " + ex.Message);
             }
         }
 
-        /// <summary>
-        /// Attempts several RemoveCommandTab signatures by reflection.
-        /// Returns true if a remove call succeeded.
-        /// </summary>
-        private bool TryRemoveCommandTab(object tab)
-        {
-            var cmType = _cmdMgr.GetType();
-
-            // Common signature: RemoveCommandTab(CommandTab)
-            foreach (var name in new[] { "RemoveCommandTab", "RemoveCommandTab2", "RemoveCommandTab3" })
-            {
-                try
-                {
-                    cmType.InvokeMember(name,
-                        BindingFlags.InvokeMethod | BindingFlags.Instance | BindingFlags.Public,
-                        null, _cmdMgr, new object[] { tab });
-                    return true;
-                }
-                catch (MissingMethodException) { }
-                catch (TargetInvocationException) { }
-                catch { }
-            }
-
-            // Some older PIAs have overloads RemoveCommandTab(int docType, string title)
-            foreach (var name in new[] { "RemoveCommandTab", "RemoveCommandTab2", "RemoveCommandTab3" })
-            {
-                try
-                {
-                    int[] docTypes =
-                    {
-                        (int)swDocumentTypes_e.swDocDRAWING,
-                        (int)swDocumentTypes_e.swDocPART,
-                        (int)swDocumentTypes_e.swDocASSEMBLY
-                    };
-
-                    var titleProp = tab.GetType().GetProperty("Title", BindingFlags.Instance | BindingFlags.Public);
-                    string title = titleProp != null ? Convert.ToString(titleProp.GetValue(tab)) : "Mehdi";
-
-                    foreach (var dt in docTypes)
-                    {
-                        cmType.InvokeMember(name,
-                            BindingFlags.InvokeMethod | BindingFlags.Instance | BindingFlags.Public,
-                            null, _cmdMgr, new object[] { dt, title });
-                    }
-
-                    return true;
-                }
-                catch (MissingMethodException) { }
-                catch (TargetInvocationException) { }
-                catch { }
-            }
-
-            return false;
-        }
-
-        /// <summary>
-        /// If we cannot remove the tab, clear all existing boxes so we do not duplicate them.
-        /// </summary>
-        private void TryClearTabBoxes(object tab)
+        private void TrySetProperty(object target, string propertyName, object value)
         {
             try
             {
-                var getBox = tab.GetType().GetMethod("GetCommandTabBox",
-                    BindingFlags.Instance | BindingFlags.Public);
-
-                var getCount = tab.GetType().GetMethod("GetCommandTabBoxCount",
-                    BindingFlags.Instance | BindingFlags.Public);
-
-                var boxesProp = tab.GetType().GetProperty("CommandTabBoxes",
-                    BindingFlags.Instance | BindingFlags.Public);
-
-                if (getCount != null && getBox != null)
+                var type = target.GetType();
+                var prop = type.GetProperty(propertyName, BindingFlags.Instance | BindingFlags.Public);
+                if (prop != null && prop.CanWrite)
                 {
-                    int count = Convert.ToInt32(getCount.Invoke(tab, null));
-                    for (int i = count - 1; i >= 0; i--)
-                    {
-                        var box = getBox.Invoke(tab, new object[] { i });
-                        TryRemoveTabBox(tab, box);
-                    }
-                }
-                else if (boxesProp != null)
-                {
-                    var boxes = boxesProp.GetValue(tab) as System.Collections.IEnumerable;
-                    if (boxes != null)
-                    {
-                        foreach (var box in boxes)
-                            TryRemoveTabBox(tab, box);
-                    }
+                    prop.SetValue(target, value, null);
+                    return;
                 }
             }
-            catch (Exception ex)
-            {
-                Debug.WriteLine("TryClearTabBoxes: " + ex.Message);
-            }
-        }
-
-        private void TryRemoveTabBox(object tab, object box)
-        {
-            if (box == null) return;
+            catch { }
 
             try
             {
-                var m = tab.GetType().GetMethod("RemoveCommandTabBox",
-                    BindingFlags.Instance | BindingFlags.Public);
-                if (m != null) m.Invoke(tab, new object[] { box });
+                var mi = target.GetType().GetMethod(propertyName,
+                    BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                if (mi != null)
+                    mi.Invoke(target, new object[] { value });
             }
             catch { }
         }
 
-        // Build PNG strips at %LOCALAPPDATA%\SW2026RibbonAddin\icons\ from embedded or output files
         private (string small, string large) EnsurePngStrips()
         {
             string outDir = Path.Combine(
                 System.Environment.GetFolderPath(System.Environment.SpecialFolder.LocalApplicationData),
-                "SW2026RibbonAddin", "icons");
+                "SW2026RibbonAddin",
+                "icons");
+
             Directory.CreateDirectory(outDir);
 
             string small = Path.Combine(outDir, "small_strip.png");
@@ -352,11 +370,14 @@ namespace SW2026RibbonAddin
 
             try
             {
-                string[] smallFiles = { "hello_20.png", "farsi_20.png", "edit_20.png", "update_20.png" };
-                string[] largeFiles = { "hello_32.png", "farsi_32.png", "edit_32.png", "update_32.png" };
+                if (_buttons != null && _buttons.Count > 0)
+                {
+                    string[] smallFiles = _buttons.Select(b => b.SmallIconFile).ToArray();
+                    string[] largeFiles = _buttons.Select(b => b.LargeIconFile).ToArray();
 
-                BuildStrip(ResolveImages(smallFiles), 20, small);
-                BuildStrip(ResolveImages(largeFiles), 32, large);
+                    BuildStrip(ResolveImages(smallFiles), 20, small);
+                    BuildStrip(ResolveImages(largeFiles), 32, large);
+                }
             }
             catch (Exception ex)
             {
@@ -366,73 +387,267 @@ namespace SW2026RibbonAddin
             return (small, large);
         }
 
-        // Tries: (1) embedded resource, (2) Resources folder next to the DLL
         private Stream[] ResolveImages(string[] fileNames)
         {
             var asm = Assembly.GetExecutingAssembly();
-            var allNames = asm.GetManifestResourceNames();
+            var resources = asm.GetManifestResourceNames();
 
             Stream ResolveOne(string fname)
             {
-                string hit = allNames.FirstOrDefault(n =>
+                string hit = resources.FirstOrDefault(n =>
                     n.EndsWith(".Resources." + fname, StringComparison.OrdinalIgnoreCase));
 
-                if (hit != null) return asm.GetManifestResourceStream(hit);
+                if (hit != null)
+                    return asm.GetManifestResourceStream(hit);
 
-                string asmDir = Path.GetDirectoryName(asm.Location) ?? ".";
-                string candidate = Path.Combine(asmDir, "Resources", fname);
-                if (File.Exists(candidate)) return File.OpenRead(candidate);
+                string dir = Path.Combine(
+                    Path.GetDirectoryName(asm.Location) ?? "",
+                    "Resources");
 
-                throw new FileNotFoundException("Icon not found: " + fname);
+                string path = Path.Combine(dir, fname);
+                if (File.Exists(path))
+                    return File.OpenRead(path);
+
+                return null;
             }
 
             return fileNames.Select(ResolveOne).ToArray();
         }
 
-        private void BuildStrip(Stream[] images, int size, string outPng)
+        private void BuildStrip(Stream[] images, int iconSize, string outFile)
         {
-            int W = size * images.Length;
-            using (var strip = new Bitmap(W, size, PixelFormat.Format32bppArgb))
-            using (var g = Graphics.FromImage(strip))
-            {
-                g.Clear(Color.Transparent);
-                int x = 0;
+            if (images == null || images.Length == 0)
+                return;
 
-                foreach (var s in images)
+            try
+            {
+                using (var first = images[0])
                 {
-                    using (s)
-                    using (var img = Image.FromStream(s))
+                    if (first == null) return;
+
+                    using (var bmpFirst = new Bitmap(first))
                     {
-                        g.DrawImage(img, new Rectangle(x, 0, size, size));
-                        x += size;
+                        int width = images.Length * iconSize;
+                        int height = iconSize;
+
+                        using (var strip = new Bitmap(width, height, PixelFormat.Format32bppArgb))
+                        using (var g = Graphics.FromImage(strip))
+                        {
+                            g.Clear(Color.Transparent);
+
+                            for (int i = 0; i < images.Length; i++)
+                            {
+                                var s = images[i];
+                                if (s == null) continue;
+
+                                using (var bmp = new Bitmap(s))
+                                {
+                                    g.DrawImage(
+                                        bmp,
+                                        new Rectangle(i * iconSize, 0, iconSize, iconSize),
+                                        new Rectangle(0, 0, bmp.Width, bmp.Height),
+                                        GraphicsUnit.Pixel);
+                                }
+                            }
+
+                            strip.Save(outFile, ImageFormat.Png);
+                        }
                     }
                 }
-
-                strip.Save(outPng, ImageFormat.Png);
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine("BuildStrip failed: " + ex.Message);
+            }
+            finally
+            {
+                if (images != null)
+                {
+                    foreach (var s in images)
+                    {
+                        try { s?.Dispose(); } catch { }
+                    }
+                }
             }
         }
 
-        private static void TrySetProperty(object obj, string prop, object value)
+        /// <summary>
+        /// Remove all existing tabs named <paramref name="title"/> for Part, Assembly, and Drawing.
+        /// Prevents multiple "Mehdi" tabs from accumulating.
+        /// </summary>
+        private void RemoveAllTabsNamed(string title)
+        {
+            if (_cmdMgr == null)
+                return;
+
+            try
+            {
+                int[] docTypes =
+                {
+                    (int)swDocumentTypes_e.swDocPART,
+                    (int)swDocumentTypes_e.swDocASSEMBLY,
+                    (int)swDocumentTypes_e.swDocDRAWING
+                };
+
+                foreach (int dt in docTypes)
+                {
+                    while (true)
+                    {
+                        CommandTab tab = null;
+
+                        try
+                        {
+                            tab = _cmdMgr.GetCommandTab(dt, title);
+                        }
+                        catch
+                        {
+                            tab = null;
+                        }
+
+                        if (tab == null)
+                            break;
+
+                        try
+                        {
+                            _cmdMgr.RemoveCommandTab(tab);
+                        }
+                        catch
+                        {
+                            break;
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine("RemoveAllTabsNamed failed: " + ex.Message);
+            }
+        }
+
+        #endregion
+
+        #region Command slot dispatch
+
+        private void RunButtonSlot(int slotIndex)
         {
             try
             {
-                var pi = obj.GetType().GetProperty(prop, BindingFlags.Instance | BindingFlags.Public);
-                if (pi != null && pi.CanWrite) pi.SetValue(obj, value);
+                if (slotIndex < 0 || slotIndex >= _slotButtons.Length)
+                    return;
+
+                var button = _slotButtons[slotIndex];
+                if (button == null)
+                    return;
+
+                var context = new AddinContext(this, _swApp);
+
+                if (button.IsFreeFeature)
+                {
+                    button.Execute(context);
+                    return;
+                }
+
+                switch (_licenseState)
+                {
+                    case LicenseState.Licensed:
+                    case LicenseState.TrialActive:
+                        button.Execute(context);
+                        break;
+
+                    case LicenseState.TrialExpired:
+                    case LicenseState.Unlicensed:
+                        // For now we still run; hook trial-expired UI here later if needed
+                        button.Execute(context);
+                        break;
+                }
             }
-            catch { }
+            catch (Exception ex)
+            {
+                Debug.WriteLine("RunButtonSlot error: " + ex);
+            }
         }
+
+        private int GetButtonEnableSlot(int slotIndex)
+        {
+            try
+            {
+                if (slotIndex < 0 || slotIndex >= _slotButtons.Length)
+                    return SW_DISABLE;
+
+                var button = _slotButtons[slotIndex];
+                if (button == null)
+                    return SW_DISABLE;
+
+                var context = new AddinContext(this, _swApp);
+                return button.GetEnableState(context);
+            }
+            catch
+            {
+                return SW_DISABLE;
+            }
+        }
+
+        public void OnCmd0() => RunButtonSlot(0);
+        public int OnCmd0Enable() => GetButtonEnableSlot(0);
+
+        public void OnCmd1() => RunButtonSlot(1);
+        public int OnCmd1Enable() => GetButtonEnableSlot(1);
+
+        public void OnCmd2() => RunButtonSlot(2);
+        public int OnCmd2Enable() => GetButtonEnableSlot(2);
+
+        public void OnCmd3() => RunButtonSlot(3);
+        public int OnCmd3Enable() => GetButtonEnableSlot(3);
+
+        public void OnCmd4() => RunButtonSlot(4);
+        public int OnCmd4Enable() => GetButtonEnableSlot(4);
+
+        public void OnCmd5() => RunButtonSlot(5);
+        public int OnCmd5Enable() => GetButtonEnableSlot(5);
+
+        public void OnCmd6() => RunButtonSlot(6);
+        public int OnCmd6Enable() => GetButtonEnableSlot(6);
+
+        public void OnCmd7() => RunButtonSlot(7);
+        public int OnCmd7Enable() => GetButtonEnableSlot(7);
+
+        public void OnCmd8() => RunButtonSlot(8);
+        public int OnCmd8Enable() => GetButtonEnableSlot(8);
+
+        public void OnCmd9() => RunButtonSlot(9);
+        public int OnCmd9Enable() => GetButtonEnableSlot(9);
+
+        public void OnCmd10() => RunButtonSlot(10);
+        public int OnCmd10Enable() => GetButtonEnableSlot(10);
+
+        public void OnCmd11() => RunButtonSlot(11);
+        public int OnCmd11Enable() => GetButtonEnableSlot(11);
+
+        public void OnCmd12() => RunButtonSlot(12);
+        public int OnCmd12Enable() => GetButtonEnableSlot(12);
+
+        public void OnCmd13() => RunButtonSlot(13);
+        public int OnCmd13Enable() => GetButtonEnableSlot(13);
+
+        public void OnCmd14() => RunButtonSlot(14);
+        public int OnCmd14Enable() => GetButtonEnableSlot(14);
+
+        public void OnCmd15() => RunButtonSlot(15);
+        public int OnCmd15Enable() => GetButtonEnableSlot(15);
+
         #endregion
 
-        #region Commands
+        #region Legacy handlers (Farsi tools / Hello)
+
         public void OnHello()
         {
             try
             {
-                MessageBox.Show("Hello from Mehdi Tools ✨", "SW2026RibbonAddin");
+                MessageBox.Show("Hello from Mehdi Tools", "SW2026RibbonAddin");
             }
             catch (Exception ex)
             {
-                Debug.WriteLine(ex);
+                Debug.WriteLine("OnHello error: " + ex);
             }
         }
 
@@ -449,15 +664,19 @@ namespace SW2026RibbonAddin
                     return;
                 }
 
-                // New-note mode: full formatting (font, size, alignment)
                 using (var dlg = new Forms.FarsiNoteForm(true))
                 {
-                    if (dlg.ShowDialog() != DialogResult.OK) return;
+                    if (dlg.ShowDialog() != DialogResult.OK)
+                        return;
 
                     string text = dlg.NoteText ?? string.Empty;
-                    if (string.IsNullOrWhiteSpace(text)) return;
+                    if (string.IsNullOrWhiteSpace(text))
+                        return;
 
-                    text = ArabicTextUtils.PrepareForSolidWorks(text, dlg.UseRtlMarkers, dlg.InsertJoiners);
+                    text = ArabicTextUtils.PrepareForSolidWorks(
+                        text,
+                        dlg.UseRtlMarkers,
+                        dlg.InsertJoiners);
 
                     StartFarsiNotePlacement(
                         model,
@@ -469,7 +688,7 @@ namespace SW2026RibbonAddin
             }
             catch (Exception ex)
             {
-                Debug.WriteLine(ex);
+                Debug.WriteLine("OnAddFarsiNote error: " + ex);
                 MessageBox.Show(
                     "Unexpected error while preparing note placement.\r\n" + ex.Message,
                     "Farsi Note");
@@ -566,7 +785,7 @@ namespace SW2026RibbonAddin
                     $"Sheets scanned: {stats.Sheets}\r\n" +
                     $"Notes inspected: {stats.Inspected}\r\n" +
                     $"Farsi notes reshaped: {stats.Updated}\r\n" +
-                    $"Skipped (non‑Farsi/no change): {stats.Skipped}",
+                    $"Skipped (non-Farsi/no change): {stats.Skipped}",
                     "Update Farsi Notes");
             }
             catch (Exception ex)
@@ -590,14 +809,17 @@ namespace SW2026RibbonAddin
                 return SW_DISABLE;
             }
         }
+
         #endregion
 
-        #region Intercept default Edit Text for our tagged notes
+        #region Intercept default Edit Text for tagged notes
+
         private int OnCommandOpenPreNotify(int command, int userCommand)
         {
             try
             {
-                if (command != CMD_EDIT_TEXT) return 0;
+                if (command != CMD_EDIT_TEXT)
+                    return 0;
 
                 var model = _swApp?.IActiveDoc2 as IModelDoc2;
                 if (model == null || model.GetType() != (int)swDocumentTypes_e.swDocDRAWING)
@@ -625,24 +847,27 @@ namespace SW2026RibbonAddin
                 {
                     string tag = note.TagName;
                     ours = !string.IsNullOrEmpty(tag) &&
-                        tag.StartsWith(FARSI_NOTE_TAG_PREFIX, StringComparison.Ordinal);
+                           tag.StartsWith(FARSI_NOTE_TAG_PREFIX, StringComparison.Ordinal);
                 }
                 catch { }
 
-                if (!ours) return 0;
+                if (!ours)
+                    return 0;
 
                 EditNoteWithFarsiEditor(note, model);
-                return 1; // consume default command
+                return 1;   // consume default command
             }
             catch
             {
                 return 0;
             }
         }
+
         #endregion
 
-        #region Helpers (placement + editor + batch update)
-        private void StartFarsiNotePlacement(
+        #region Farsi note helpers
+
+        internal void StartFarsiNotePlacement(
             IModelDoc2 model,
             string preparedText,
             string fontName,
@@ -658,13 +883,18 @@ namespace SW2026RibbonAddin
                     return;
                 }
 
-                int justification = MapAlignmentToSwJustification(alignment);
+                int just = MapAlignmentToSwJustification(alignment);
 
                 _activePlacement?.Dispose();
                 _activePlacement = new FarsiNotePlacementSession(
-                    this, model, view,
-                    preparedText, fontName, fontSizePts,
-                    justification);
+                    this,
+                    model,
+                    view,
+                    preparedText,
+                    fontName,
+                    fontSizePts,
+                    just);
+
                 _activePlacement.Start();
             }
             catch (Exception ex)
@@ -688,28 +918,31 @@ namespace SW2026RibbonAddin
             }
         }
 
-        private void EditNoteWithFarsiEditor(INote note, IModelDoc2 model)
+        internal void EditNoteWithFarsiEditor(INote note, IModelDoc2 model)
         {
             string currentText = "";
             try { currentText = note.GetText(); }
-            catch { currentText = ""; }
+            catch { }
 
             string editable = ArabicNoteCodec.DecodeFromNote(currentText);
 
-            // Edit-mode: text only (no formatting changes)
             using (var dlg = new Forms.FarsiNoteForm(false))
             {
                 dlg.NoteText = editable;
                 dlg.InsertJoiners = true;
                 dlg.UseRtlMarkers = false;
 
-                if (dlg.ShowDialog() != DialogResult.OK) return;
+                if (dlg.ShowDialog() != DialogResult.OK)
+                    return;
 
                 string newRaw = dlg.NoteText ?? string.Empty;
-                if (string.IsNullOrWhiteSpace(newRaw)) return;
+                if (string.IsNullOrWhiteSpace(newRaw))
+                    return;
 
                 string shaped = ArabicTextUtils.PrepareForSolidWorks(
-                    newRaw, dlg.UseRtlMarkers, dlg.InsertJoiners);
+                    newRaw,
+                    dlg.UseRtlMarkers,
+                    dlg.InsertJoiners);
 
                 try { note.SetText(shaped); }
                 catch { return; }
@@ -719,7 +952,7 @@ namespace SW2026RibbonAddin
             }
         }
 
-        private struct UpdateStats
+        internal struct UpdateStats
         {
             public int Sheets;
             public int Inspected;
@@ -727,12 +960,13 @@ namespace SW2026RibbonAddin
             public int Skipped;
         }
 
-        private UpdateStats UpdateAllFarsiNotes(IModelDoc2 model)
+        internal UpdateStats UpdateAllFarsiNotes(IModelDoc2 model)
         {
             var stats = new UpdateStats();
 
             IDrawingDoc drw = model as IDrawingDoc;
-            if (drw == null) return stats;
+            if (drw == null)
+                return stats;
 
             string originalSheetName = null;
             try
@@ -743,7 +977,8 @@ namespace SW2026RibbonAddin
             catch { }
 
             string[] sheetNames = GetSheetNamesSafe(drw);
-            if (sheetNames == null || sheetNames.Length == 0) return stats;
+            if (sheetNames == null || sheetNames.Length == 0)
+                return stats;
 
             foreach (var sheetName in sheetNames)
             {
@@ -769,7 +1004,10 @@ namespace SW2026RibbonAddin
                             if (!string.IsNullOrEmpty(text) && LooksArabicOrPresentationForms(text))
                             {
                                 string decoded = ArabicNoteCodec.DecodeFromNote(text);
-                                string reshaped = ArabicTextUtils.PrepareForSolidWorks(decoded, false, true);
+                                string reshaped = ArabicTextUtils.PrepareForSolidWorks(
+                                    decoded,
+                                    false,
+                                    true);
 
                                 bool changed = !string.Equals(reshaped, text, StringComparison.Ordinal);
                                 try { note.SetText(reshaped); }
@@ -784,21 +1022,14 @@ namespace SW2026RibbonAddin
                             }
 
                             object nextNoteObj = null;
-                            try { nextNoteObj = note.GetNext(); }
-                            catch { }
-
+                            try { nextNoteObj = note.GetNext(); } catch { }
                             note = nextNoteObj as INote;
                         }
                     }
-                    catch
-                    {
-                        // continue
-                    }
-
-                    object nextViewObj = null;
-                    try { nextViewObj = v.GetNextView(); }
                     catch { }
 
+                    object nextViewObj = null;
+                    try { nextViewObj = v.GetNextView(); } catch { }
                     v = nextViewObj as IView;
                 }
 
@@ -842,39 +1073,47 @@ namespace SW2026RibbonAddin
             foreach (char ch in s)
             {
                 int code = ch;
-                if ((code >= 0x0600 && code <= 0x06FF) ||
-                    (code >= 0x0750 && code <= 0x077F) ||
-                    (code >= 0x08A0 && code <= 0x08FF) ||
-                    (code >= 0xFB50 && code <= 0xFDFF) ||
-                    (code >= 0xFE70 && code <= 0xFEFF))
+                if ((code >= 0x0600 && code <= 0x06FF) ||  // Arabic
+                    (code >= 0x0750 && code <= 0x077F) ||  // Arabic Supplement
+                    (code >= 0x08A0 && code <= 0x08FF) ||  // Arabic Extended-A
+                    (code >= 0xFB50 && code <= 0xFDFF) ||  // Presentation Forms-A
+                    (code >= 0xFE70 && code <= 0xFEFF))    // Presentation Forms-B
                     return true;
             }
+
             return false;
         }
+
         #endregion
 
-        #region COM Registration
+        #region COM registration
+
         [ComRegisterFunction]
         public static void RegisterFunction(Type t)
         {
             try
             {
-                var key = Registry.LocalMachine.CreateSubKey($@"Software\SolidWorks\Addins\{{{t.GUID}}}");
+                var key = Registry.LocalMachine.CreateSubKey(
+                    $@"Software\SolidWorks\Addins\{{{t.GUID}}}");
+
                 key.SetValue(null, 1);
                 key.SetValue("Title", "SW2026RibbonAddin");
-                key.SetValue("Description", "Sample ribbon add-in with Farsi note support");
+                key.SetValue("Description", "Sample ribbon add-in with Farsi note and DWG tools");
                 key.Close();
             }
             catch (Exception ex)
             {
                 MessageBox.Show(
-                    $"COM registration failed: {ex.Message}\r\nTry running Visual Studio as administrator.",
+                    $"COM registration failed: {ex.Message}\r\n" +
+                    "Try running Visual Studio as administrator.",
                     "SW2026RibbonAddin");
             }
 
             try
             {
-                var keyCU = Registry.CurrentUser.CreateSubKey($@"Software\SolidWorks\AddinsStartup\{{{t.GUID}}}");
+                var keyCU = Registry.CurrentUser.CreateSubKey(
+                    $@"Software\SolidWorks\AddinsStartup\{{{t.GUID}}}");
+
                 keyCU.SetValue(null, 1);
                 keyCU.Close();
             }
@@ -898,9 +1137,11 @@ namespace SW2026RibbonAddin
             }
             catch { }
         }
+
         #endregion
 
-        #region Placement Session (mouse + overlay)
+        #region Placement session (mouse + overlay)
+
         private sealed class FarsiNotePlacementSession : IDisposable
         {
             private readonly Addin _owner;
@@ -947,6 +1188,7 @@ namespace SW2026RibbonAddin
                     _ghost = new Forms.MouseGhostForm();
                     _ghost.InitializeForText(_text, _fontName, (float)_fontSizePts);
                     _ghost.StartFollowing();
+
                     _active = true;
                 }
                 catch (Exception ex)
@@ -958,6 +1200,7 @@ namespace SW2026RibbonAddin
 
             private int OnMouseMoveNotify(int x, int y, int WParam) => 0;
             private int OnMouseLBtnDownNotify(int x, int y, int WParam) => 0;
+
             private int OnMouseRBtnDownNotify(int x, int y, int WParam)
             {
                 Cleanup();
@@ -1000,8 +1243,17 @@ namespace SW2026RibbonAddin
                     }
                     catch { }
 
-                    ann?.SetPosition2(x, y, 0.0);
-                    _model.GraphicsRedraw2();
+                    try
+                    {
+                        ann?.SetPosition2(x, y, 0.0);
+                    }
+                    catch { }
+
+                    try
+                    {
+                        _model.GraphicsRedraw2();
+                    }
+                    catch { }
                 }
                 catch (Exception ex)
                 {
@@ -1046,6 +1298,7 @@ namespace SW2026RibbonAddin
                 _mouse = null;
             }
         }
+
         #endregion
     }
 }

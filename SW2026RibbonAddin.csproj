@@ -37,15 +37,30 @@
     <WarningLevel>4</WarningLevel>
   </PropertyGroup>
   <ItemGroup>
+    <Reference Include="ACadSharp, Version=3.3.7.0, Culture=neutral, PublicKeyToken=835670d357149d36, processorArchitecture=MSIL">
+      <HintPath>packages\ACadSharp.3.3.7\lib\net48\ACadSharp.dll</HintPath>
+    </Reference>
     <Reference Include="SolidWorks.Interop.swcommands">
       <HintPath>..\..\..\..\..\..\..\..\..\..\..\..\Program Files\SOLIDWORKS Corp\SOLIDWORKS\api\redist\SolidWorks.Interop.swcommands.dll</HintPath>
       <EmbedInteropTypes>True</EmbedInteropTypes>
     </Reference>
     <Reference Include="System" />
+    <Reference Include="System.Buffers, Version=4.0.5.0, Culture=neutral, PublicKeyToken=cc7b13ffcd2ddd51, processorArchitecture=MSIL">
+      <HintPath>packages\System.Buffers.4.6.1\lib\net462\System.Buffers.dll</HintPath>
+    </Reference>
     <Reference Include="System.Core" />
     <Reference Include="System.Data" />
     <Reference Include="System.Drawing" />
+    <Reference Include="System.Memory, Version=4.0.5.0, Culture=neutral, PublicKeyToken=cc7b13ffcd2ddd51, processorArchitecture=MSIL">
+      <HintPath>packages\System.Memory.4.6.3\lib\net462\System.Memory.dll</HintPath>
+    </Reference>
     <Reference Include="System.Numerics" />
+    <Reference Include="System.Numerics.Vectors, Version=4.1.6.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a, processorArchitecture=MSIL">
+      <HintPath>packages\System.Numerics.Vectors.4.6.1\lib\net462\System.Numerics.Vectors.dll</HintPath>
+    </Reference>
+    <Reference Include="System.Runtime.CompilerServices.Unsafe, Version=6.0.3.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a, processorArchitecture=MSIL">
+      <HintPath>packages\System.Runtime.CompilerServices.Unsafe.6.1.2\lib\net462\System.Runtime.CompilerServices.Unsafe.dll</HintPath>
+    </Reference>
     <Reference Include="System.Text.Json, Version=9.0.0.0, Culture=neutral, PublicKeyToken=cc7b13ffcd2ddd51, processorArchitecture=MSIL" />
     <Reference Include="System.Web.Extensions" />
     <Reference Include="System.Windows.Forms" />
@@ -66,6 +81,16 @@
     <Compile Include="Addin.cs" />
     <Compile Include="ArabicNoteCodec.cs" />
     <Compile Include="ArabicTextUtils.cs" />
+    <Compile Include="Commands\AddFarsiNoteButton.cs" />
+    <Compile Include="Commands\AddinContext.cs" />
+    <Compile Include="Commands\DwgButton.cs" />
+    <Compile Include="Commands\DwgPostProcessor.cs" />
+    <Compile Include="Commands\EditSelectedFarsiNoteButton.cs" />
+    <Compile Include="Commands\HelloButton.cs" />
+    <Compile Include="Commands\IMehdiRibbonButton.cs" />
+    <Compile Include="Commands\RibbonSection.cs" />
+    <Compile Include="Commands\SheetMetalAssemblyHelper.cs" />
+    <Compile Include="Commands\UpdateFarsiNotesButton.cs" />
     <Compile Include="Forms\FarsiNoteForm.cs">
       <SubType>Form</SubType>
     </Compile>
@@ -74,6 +99,7 @@
     </Compile>
     <Compile Include="Licensing\LicenseGate.cs" />
     <Compile Include="Licensing\LicenseSettings.cs" />
+    <Compile Include="Licensing\LicenseState.cs" />
     <Compile Include="Licensing\LicenseVerifier.cs" />
     <Compile Include="Licensing\LicensingUI.cs" />
     <Compile Include="Properties\AssemblyInfo.cs" />
@@ -81,7 +107,10 @@
   <ItemGroup>
     <WCFMetadata Include="Connected Services\" />
   </ItemGroup>
-  <ItemGroup />
+  <ItemGroup>
+    <EmbeddedResource Include="Resources\dwg_20.png" />
+    <EmbeddedResource Include="Resources\dwg_32.png" />
+  </ItemGroup>
   <ItemGroup>
     <EmbeddedResource Include="Resources\edit_20.png" />
     <EmbeddedResource Include="Resources\edit_32.png" />
@@ -91,6 +120,10 @@
     <EmbeddedResource Include="Resources\hello_32.png" />
     <EmbeddedResource Include="Resources\update_20.png" />
     <EmbeddedResource Include="Resources\update_32.png" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="app.config" />
+    <None Include="packages.config" />
   </ItemGroup>
   <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets" />
   <PropertyGroup>
