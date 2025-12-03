@@ -6,17 +6,19 @@ using System.IO;
 using System.Windows.Forms;
 using SolidWorks.Interop.sldworks;
 using SolidWorks.Interop.swconst;
-using SW2026RibbonAddin;
 
 namespace SW2026RibbonAddin.Commands
 {
     /// <summary>
     /// DWG export button:
-    /// - For a sheet-metal part: exports one DWG (geometry-only) into a new folder.
-    /// - For an assembly: exports one DWG per unique sheet-metal part (recursively).
-    /// - Uses a Windows "Open" style dialog to pick a MAIN folder, then creates a
-    ///   subfolder named after the part/assembly (must NOT already exist).
-    /// - Writes a CSV inside that subfolder with: FileName,PlateThickness_mm,Quantity.
+    /// - For a sheet-metal part (single-body or multi-body): exports one DWG per flat pattern
+    ///   (per sheet-metal body) into a new folder.
+    /// - For an assembly: exports one DWG per flat pattern for each unique sheet-metal part
+    ///   (recursively through sub-assemblies).
+    /// - Uses FolderBrowserDialog to pick a MAIN folder, then creates a subfolder named
+    ///   after the active document (must NOT already exist).
+    /// - Writes a CSV inside that subfolder with columns:
+    ///   FileName,PlateThickness_mm,Quantity.
     /// </summary>
     internal sealed class DwgButton : IMehdiRibbonButton
     {
@@ -55,12 +57,12 @@ namespace SW2026RibbonAddin.Commands
                 return;
             }
 
-            // 2) Let user pick the MAIN folder (standard file-style dialog)
+            // Let user pick the MAIN folder (standard folder dialog)
             string mainFolder = SelectMainFolder(model);
             if (string.IsNullOrEmpty(mainFolder))
                 return; // user cancelled
 
-            // 3) Create subfolder named after the active document
+            // Create subfolder named after the active document
             string baseName = GetDocumentBaseName(model);
             string jobFolder = Path.Combine(mainFolder, baseName);
 
@@ -108,16 +110,12 @@ namespace SW2026RibbonAddin.Commands
 
         public int GetEnableState(AddinContext context)
         {
-            // New strategy:
-            // - As long as there is some active document, keep the DWG button enabled.
-            // - We no longer try to inspect the part/assembly here.
-            // - When the user clicks, Execute() will check document type and
-            //   presence of sheet-metal and show a message if nothing can be done.
-
+            // New strategy: keep DWG button enabled whenever some document is active.
             try
             {
-                var model = context.ActiveModel;
-                return model != null ? AddinContext.Enable : AddinContext.Disable;
+                return context.ActiveModel != null
+                    ? AddinContext.Enable
+                    : AddinContext.Disable;
             }
             catch
             {
@@ -151,27 +149,26 @@ namespace SW2026RibbonAddin.Commands
                 "FileName,PlateThickness_mm,Quantity"
             };
 
-            int exported = 0;
-            int failed = 0;
+            var dwgFileNames = new List<string>();
+            int failures = ExportFlatPatternsForPart(model, modelPath, jobFolder, dwgFileNames);
 
-            // Part is already active, no need to re-activate
-            if (ExportSinglePartToDwg(model, modelPath, jobFolder, out string dwgFileName))
+            int exported = dwgFileNames.Count;
+            int totalBodies = exported + failures;
+            int failed = failures;
+
+            double thicknessMm = thicknessMeters * 1000.0;
+
+            foreach (string dwgName in dwgFileNames)
             {
-                exported++;
-                double thicknessMm = thicknessMeters * 1000.0;
                 csvLines.Add(
-                    $"{dwgFileName},{thicknessMm.ToString("0.###", CultureInfo.InvariantCulture)},1");
-            }
-            else
-            {
-                failed++;
+                    $"{dwgName},{thicknessMm.ToString("0.###", CultureInfo.InvariantCulture)},1");
             }
 
             string csvPath = Path.Combine(jobFolder, "parts.csv");
             TryWriteCsv(csvPath, csvLines);
 
             MessageBox.Show(
-                $"Sheet-metal parts found: 1\r\n" +
+                $"Sheet-metal bodies found: {totalBodies}\r\n" +
                 $"DWG files saved: {exported}\r\n" +
                 $"Failed: {failed}\r\n" +
                 $"Folder:\r\n{jobFolder}",
@@ -190,7 +187,6 @@ namespace SW2026RibbonAddin.Commands
                 return;
             }
 
-            // Try to resolve lightweight components
             try
             {
                 asm.ResolveAllLightWeightComponents(true);
@@ -211,6 +207,7 @@ namespace SW2026RibbonAddin.Commands
 
             int exported = 0;
             int failed = 0;
+            int totalBodies = 0;
 
             foreach (var kvp in usage)
             {
@@ -234,25 +231,32 @@ namespace SW2026RibbonAddin.Commands
                         continue;
                     }
 
-                    if (!ExportSinglePartToDwg(partModel, partPath, jobFolder, out string dwgFileName))
-                    {
-                        failed++;
-                        continue;
-                    }
+                    var dwgFileNames = new List<string>();
+                    int failuresForPart = ExportFlatPatternsForPart(partModel, partPath, jobFolder, dwgFileNames);
 
-                    exported++;
+                    int exportedForPart = dwgFileNames.Count;
+                    int totalForPart = exportedForPart + failuresForPart;
+
+                    totalBodies += totalForPart;
+                    exported += exportedForPart;
+                    failed += failuresForPart;
 
                     double thicknessMm = info.ThicknessMeters * 1000.0;
-                    csvLines.Add(
-                        $"{dwgFileName},{thicknessMm.ToString("0.###", CultureInfo.InvariantCulture)},{info.Quantity}");
-                    // NEW: close the sheet-metal part we just used, without saving it
+
+                    foreach (string dwgName in dwgFileNames)
+                    {
+                        csvLines.Add(
+                            $"{dwgName},{thicknessMm.ToString("0.###", CultureInfo.InvariantCulture)},{info.Quantity}");
+                    }
+
+                    // Close the part we opened for export (without saving)
                     try
                     {
-                        swApp.CloseDoc(partPath); // closes the part document, no save
+                        swApp.CloseDoc(partPath);
                     }
                     catch
                     {
-                        // ignore any close errors; the assembly stays open
+                        // ignore close errors
                     }
                 }
                 catch (Exception ex)
@@ -267,6 +271,7 @@ namespace SW2026RibbonAddin.Commands
 
             MessageBox.Show(
                 $"Unique sheet-metal parts found: {usage.Count}\r\n" +
+                $"Total sheet-metal bodies (plates): {totalBodies}\r\n" +
                 $"DWG files saved: {exported}\r\n" +
                 $"Failed: {failed}\r\n" +
                 $"Folder:\r\n{jobFolder}",
@@ -274,41 +279,108 @@ namespace SW2026RibbonAddin.Commands
         }
 
         // ------------------------------------------------------------------
-        //  Actual DWG export (no post-processing)
+        //  Actual DWG export (handles multi-body via flat patterns)
         // ------------------------------------------------------------------
 
         /// <summary>
-        /// Exports one sheet-metal part to DWG using ExportToDWG2.
-        /// DWG is geometry-only (no bend lines, no sketches).
+        /// Exports all flat patterns (sheet-metal bodies) in the given part to DWG files.
+        /// For single-body sheet-metal, this produces one DWG (same as before).
+        /// For multi-body sheet-metal, this produces one DWG per flat pattern.
+        /// Returns the number of failed bodies; successful DWG file names are added
+        /// to <paramref name="dwgFileNames"/>.
         /// </summary>
-        private static bool ExportSinglePartToDwg(
+        private static int ExportFlatPatternsForPart(
             IModelDoc2 partModel,
             string modelPath,
             string folder,
-            out string dwgFileName)
+            List<string> dwgFileNames)
         {
-            dwgFileName = null;
-
-            if (partModel == null || string.IsNullOrEmpty(modelPath) || string.IsNullOrEmpty(folder))
-                return false;
-
-            string baseName = Path.GetFileNameWithoutExtension(modelPath);
-            if (string.IsNullOrEmpty(baseName))
-                baseName = "SheetMetal";
-
-            dwgFileName = baseName + ".dwg";
-            string outFile = Path.Combine(folder, dwgFileName);
+            if (partModel == null)
+                return 1;
 
             var partDoc = partModel as IPartDoc;
             if (partDoc == null)
-                return false;
+                return 1;
 
+            if (string.IsNullOrEmpty(modelPath))
+                return 1;
+
+            var flatPatterns = GetFlatPatternFeatures(partModel);
+
+            // If no flat patterns found, fall back to a single export
+            if (flatPatterns.Count == 0)
+            {
+                string baseName = Path.GetFileNameWithoutExtension(modelPath);
+                if (string.IsNullOrEmpty(baseName))
+                    baseName = "SheetMetal";
+
+                string dwgName = baseName + ".dwg";
+                string outPath = Path.Combine(folder, dwgName);
+
+                if (ExportFlatPatternWithoutSelection(partDoc, modelPath, outPath))
+                {
+                    dwgFileNames.Add(dwgName);
+                    return 0;
+                }
+
+                return 1;
+            }
+
+            string partBaseName = Path.GetFileNameWithoutExtension(modelPath);
+            if (string.IsNullOrEmpty(partBaseName))
+                partBaseName = "SheetMetal";
+
+            int failures = 0;
+            int idx = 1;
+            var usedNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (Feature flatFeat in flatPatterns)
+            {
+                if (flatFeat == null)
+                    continue;
+
+                string suffix = null;
+                try { suffix = flatFeat.Name; }
+                catch { }
+
+                if (string.IsNullOrWhiteSpace(suffix))
+                    suffix = idx.ToString(CultureInfo.InvariantCulture);
+
+                suffix = MakeSafeFilePart(suffix);
+
+                string candidate = $"{partBaseName}_{suffix}.dwg";
+                string finalName = candidate;
+                int n = 1;
+                while (!usedNames.Add(finalName))
+                {
+                    finalName = $"{partBaseName}_{suffix}_{n}.dwg";
+                    n++;
+                }
+
+                string outPath = Path.Combine(folder, finalName);
+
+                bool ok = ExportFlatPatternSelected(partDoc, modelPath, flatFeat, outPath);
+                if (ok)
+                {
+                    dwgFileNames.Add(finalName);
+                }
+                else
+                {
+                    failures++;
+                }
+
+                idx++;
+            }
+
+            return failures;
+        }
+
+        private static bool ExportFlatPatternWithoutSelection(IPartDoc partDoc, string modelPath, string outFile)
+        {
             try
             {
                 const int action = (int)swExportToDWG_e.swExportToDWG_ExportSheetMetal;
-
-                // Geometry only – no bend lines, no sketches (laser-cut profile)
-                const int sheetMetalOptions = 1;
+                const int sheetMetalOptions = 1; // geometry only – no bend lines, no sketches
 
                 bool ok = partDoc.ExportToDWG2(
                     outFile,
@@ -325,9 +397,113 @@ namespace SW2026RibbonAddin.Commands
             }
             catch (Exception ex)
             {
-                Debug.WriteLine($"ExportToDWG2 failed for {modelPath}: {ex}");
+                Debug.WriteLine("ExportFlatPatternWithoutSelection failed: " + ex);
                 return false;
             }
+        }
+
+        private static bool ExportFlatPatternSelected(IPartDoc partDoc, string modelPath, Feature flatPatternFeat, string outFile)
+        {
+            try
+            {
+                if (flatPatternFeat == null)
+                    return false;
+
+                bool selOk = flatPatternFeat.Select2(false, -1);
+                if (!selOk)
+                    return false;
+
+                const int action = (int)swExportToDWG_e.swExportToDWG_ExportSheetMetal;
+                const int sheetMetalOptions = 1; // geometry only
+
+                bool ok = partDoc.ExportToDWG2(
+                    outFile,
+                    modelPath,
+                    action,
+                    true,       // single file
+                    null,       // alignment
+                    false,      // flip X
+                    false,      // flip Y
+                    sheetMetalOptions,
+                    null);      // views
+
+                return ok;
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine("ExportFlatPatternSelected failed: " + ex);
+                return false;
+            }
+        }
+
+        private static List<Feature> GetFlatPatternFeatures(IModelDoc2 model)
+        {
+            var result = new List<Feature>();
+            if (model == null)
+                return result;
+
+            Feature feat = null;
+            try { feat = model.FirstFeature() as Feature; }
+            catch { }
+
+            while (feat != null)
+            {
+                CollectFlatPatternsRecursive(feat, result);
+
+                Feature next = null;
+                try { next = feat.GetNextFeature() as Feature; }
+                catch { }
+                feat = next;
+            }
+
+            return result;
+        }
+
+        private static void CollectFlatPatternsRecursive(Feature feat, List<Feature> result)
+        {
+            if (feat == null)
+                return;
+
+            try
+            {
+                string typeName = feat.GetTypeName2();
+                if (string.Equals(typeName, "FlatPattern", StringComparison.OrdinalIgnoreCase))
+                {
+                    result.Add(feat);
+                }
+            }
+            catch { }
+
+            Feature sub = null;
+            try { sub = feat.GetFirstSubFeature() as Feature; }
+            catch { }
+
+            while (sub != null)
+            {
+                CollectFlatPatternsRecursive(sub, result);
+
+                Feature next = null;
+                try { next = sub.GetNextSubFeature() as Feature; }
+                catch { }
+                sub = next;
+            }
+        }
+
+        private static string MakeSafeFilePart(string name)
+        {
+            if (string.IsNullOrWhiteSpace(name))
+                return "Body";
+
+            char[] invalid = Path.GetInvalidFileNameChars();
+            char[] chars = name.ToCharArray();
+
+            for (int i = 0; i < chars.Length; i++)
+            {
+                if (Array.IndexOf(invalid, chars[i]) >= 0)
+                    chars[i] = '_';
+            }
+
+            return new string(chars);
         }
 
         // ------------------------------------------------------------------
@@ -349,7 +525,8 @@ namespace SW2026RibbonAddin.Commands
             while (feat != null)
             {
                 string typeName = "";
-                try { typeName = feat.GetTypeName2(); } catch { }
+                try { typeName = feat.GetTypeName2(); }
+                catch { }
 
                 if (!string.IsNullOrEmpty(typeName) &&
                     typeName.IndexOf("SheetMetal", StringComparison.OrdinalIgnoreCase) >= 0)
@@ -364,79 +541,12 @@ namespace SW2026RibbonAddin.Commands
                 }
 
                 object nextObj = null;
-                try { nextObj = feat.GetNextFeature(); } catch { }
+                try { nextObj = feat.GetNextFeature(); }
+                catch { }
                 feat = nextObj as Feature;
             }
 
             return 0.0;
-        }
-
-        private static bool AssemblyContainsSheetMetal(IAssemblyDoc asm)
-        {
-            if (asm == null) return false;
-
-            try
-            {
-                // Make sure lightweight components are resolved so GetModelDoc2 works
-                asm.ResolveAllLightWeightComponents(true);
-            }
-            catch { }
-
-            var model = asm as IModelDoc2;
-            if (model == null) return false;
-
-            Configuration conf = null;
-            try { conf = (Configuration)model.GetActiveConfiguration(); } catch { }
-            if (conf == null) return false;
-
-            IComponent2 root = null;
-            try { root = (IComponent2)conf.GetRootComponent3(true); } catch { }
-            if (root == null) return false;
-
-            var visited = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            return TraverseContainsSheetMetal(root, visited);
-        }
-
-        private static bool TraverseContainsSheetMetal(IComponent2 comp, HashSet<string> visited)
-        {
-            if (comp == null || comp.IsSuppressed())
-                return false;
-
-            IModelDoc2 model = null;
-            try { model = comp.GetModelDoc2() as IModelDoc2; } catch { }
-
-            if (model != null && model.GetType() == (int)swDocumentTypes_e.swDocPART)
-            {
-                string path = null;
-                try { path = model.GetPathName(); } catch { }
-
-                if (!string.IsNullOrEmpty(path))
-                {
-                    if (!visited.Add(path))
-                    {
-                        // already processed this file; continue to other components
-                    }
-                }
-
-                if (TryGetSheetMetalThickness(model, out _))
-                    return true;
-            }
-
-            object childrenObj = null;
-            try { childrenObj = comp.GetChildren(); } catch { }
-            var children = childrenObj as object[];
-            if (children == null) return false;
-
-            foreach (object childObj in children)
-            {
-                var child = childObj as IComponent2;
-                if (child == null) continue;
-
-                if (TraverseContainsSheetMetal(child, visited))
-                    return true;
-            }
-
-            return false;
         }
 
         private sealed class SheetMetalUsageInfo
@@ -446,76 +556,57 @@ namespace SW2026RibbonAddin.Commands
         }
 
         /// <summary>
-        /// Builds: part path -> usage info (thickness, quantity).
-        /// Only sheet-metal parts are included.
+        /// Builds: part path -> usage info (thickness, quantity of that part in assembly).
+        /// Only parts that contain sheet-metal features are included.
         /// </summary>
         private static Dictionary<string, SheetMetalUsageInfo> CollectSheetMetalUsage(IAssemblyDoc asm)
         {
             var result = new Dictionary<string, SheetMetalUsageInfo>(StringComparer.OrdinalIgnoreCase);
             if (asm == null) return result;
 
-            try
-            {
-                asm.ResolveAllLightWeightComponents(true);
-            }
+            object compsObj = null;
+            try { compsObj = asm.GetComponents(false); } // all levels
             catch { }
 
-            var model = asm as IModelDoc2;
-            if (model == null) return result;
+            var comps = compsObj as object[];
+            if (comps == null) return result;
 
-            Configuration conf = null;
-            try { conf = (Configuration)model.GetActiveConfiguration(); } catch { }
-            if (conf == null) return result;
-
-            IComponent2 root = null;
-            try { root = (IComponent2)conf.GetRootComponent3(true); } catch { }
-            if (root == null) return result;
-
-            TraverseUsage(root, result);
-            return result;
-        }
-
-        private static void TraverseUsage(IComponent2 comp, Dictionary<string, SheetMetalUsageInfo> result)
-        {
-            if (comp == null || comp.IsSuppressed())
-                return;
-
-            IModelDoc2 model = null;
-            try { model = comp.GetModelDoc2() as IModelDoc2; } catch { }
-
-            if (model != null && model.GetType() == (int)swDocumentTypes_e.swDocPART)
+            foreach (object o in comps)
             {
+                var comp = o as IComponent2;
+                if (comp == null || comp.IsSuppressed()) continue;
+
+                IModelDoc2 refModel = null;
+                try { refModel = comp.GetModelDoc2() as IModelDoc2; }
+                catch { }
+
+                if (refModel == null || refModel.GetType() != (int)swDocumentTypes_e.swDocPART)
+                    continue;
+
                 string path = null;
-                try { path = model.GetPathName(); } catch { }
+                try { path = refModel.GetPathName(); }
+                catch { }
 
-                if (!string.IsNullOrWhiteSpace(path) &&
-                    TryGetSheetMetalThickness(model, out double thicknessMeters))
+                if (string.IsNullOrWhiteSpace(path))
+                    continue;
+
+                if (!TryGetSheetMetalThickness(refModel, out double thicknessMeters))
+                    continue;
+
+                if (!result.TryGetValue(path, out var info))
                 {
-                    if (!result.TryGetValue(path, out var info))
+                    info = new SheetMetalUsageInfo
                     {
-                        info = new SheetMetalUsageInfo
-                        {
-                            ThicknessMeters = thicknessMeters,
-                            Quantity = 0
-                        };
-                        result.Add(path, info);
-                    }
-
-                    info.Quantity++;
+                        ThicknessMeters = thicknessMeters,
+                        Quantity = 0
+                    };
+                    result[path] = info;
                 }
+
+                info.Quantity++;
             }
 
-            object childrenObj = null;
-            try { childrenObj = comp.GetChildren(); } catch { }
-            var children = childrenObj as object[];
-            if (children == null) return;
-
-            foreach (object childObj in children)
-            {
-                var child = childObj as IComponent2;
-                if (child == null) continue;
-                TraverseUsage(child, result);
-            }
+            return result;
         }
 
         // ------------------------------------------------------------------
