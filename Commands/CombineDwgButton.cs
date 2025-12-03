@@ -8,7 +8,7 @@ using ACadSharp;
 using ACadSharp.Entities;
 using ACadSharp.IO;
 using ACadSharp.Tables;
-using CSMath;   // this is the math namespace (XYZ, etc.)
+using CSMath; // XYZ, BoundingBox, etc.
 
 namespace SW2026RibbonAddin.Commands
 {
@@ -20,7 +20,7 @@ namespace SW2026RibbonAddin.Commands
         public string Tooltip => "Combine DWG exports from multiple jobs into per-thickness DWGs and a summary CSV.";
         public string Hint => "Combine DWG exports";
 
-        public string SmallIconFile => "dwg_20.png";  // reuse DWG icon
+        public string SmallIconFile => "dwg_20.png";   // reuse DWG icon
         public string LargeIconFile => "dwg_32.png";
 
         public RibbonSection Section => RibbonSection.General;
@@ -30,7 +30,7 @@ namespace SW2026RibbonAddin.Commands
 
         public void Execute(AddinContext context)
         {
-            string mainFolder = SelectMainFolderWithFileDialog();
+            string mainFolder = SelectMainFolder();
             if (string.IsNullOrEmpty(mainFolder))
                 return;
 
@@ -50,24 +50,21 @@ namespace SW2026RibbonAddin.Commands
 
         public int GetEnableState(AddinContext context)
         {
-            // This command does not depend on the active SW document
+            // Independent of active SW document
             return AddinContext.Enable;
         }
 
-        private static string SelectMainFolderWithFileDialog()
+        private static string SelectMainFolder()
         {
-            using (var dialog = new OpenFileDialog())
+            using (var dlg = new FolderBrowserDialog())
             {
-                dialog.Title = "Select the MAIN folder that contains job subfolders";
-                dialog.Filter = "Folders|*.this_is_a_folder_selector";
-                dialog.CheckFileExists = false;
-                dialog.FileName = "SelectFolder";
+                dlg.Description = "Select the MAIN folder that contains job subfolders (each with parts.csv + DWGs)";
+                dlg.ShowNewFolderButton = false;
 
-                if (dialog.ShowDialog() != DialogResult.OK)
+                if (dlg.ShowDialog() != DialogResult.OK)
                     return null;
 
-                string path = Path.GetDirectoryName(dialog.FileName);
-                return path;
+                return dlg.SelectedPath;
             }
         }
     }
@@ -117,7 +114,7 @@ namespace SW2026RibbonAddin.Commands
 
             var combined = new Dictionary<string, CombinedPart>(StringComparer.OrdinalIgnoreCase);
 
-            // ---- read all parts.csv and merge rows ----
+            // --- read all parts.csv and merge rows ---
             foreach (string sub in subFolders)
             {
                 string csvPath = Path.Combine(sub, "parts.csv");
@@ -195,7 +192,7 @@ namespace SW2026RibbonAddin.Commands
                 return string.Compare(a.FileName, b.FileName, StringComparison.OrdinalIgnoreCase);
             });
 
-            // ---- write all_parts.csv in MAIN folder ----
+            // --- write all_parts.csv in MAIN folder ---
             string allCsvPath = Path.Combine(mainFolder, "all_parts.csv");
             var outLines = new List<string>
             {
@@ -215,7 +212,7 @@ namespace SW2026RibbonAddin.Commands
 
             File.WriteAllLines(allCsvPath, outLines);
 
-            // ---- create per-thickness DWG files ----
+            // --- create per-thickness DWG files ---
             CreatePerThicknessDwgs(mainFolder, list);
 
             MessageBox.Show(
@@ -233,6 +230,13 @@ namespace SW2026RibbonAddin.Commands
                    thicknessMm.ToString("0.###", CultureInfo.InvariantCulture);
         }
 
+        /// <summary>
+        /// For each thickness, create thickness_XXX.dwg with all plates of that thickness
+        /// laid out side-by-side:
+        /// - bottoms aligned on Y = 0
+        /// - two text lines beneath each plate (thickness + quantity)
+        /// - horizontal spacing based on plate width + margin
+        /// </summary>
         private static void CreatePerThicknessDwgs(string mainFolder, List<CombinedPart> parts)
         {
             var groups = parts
@@ -247,11 +251,11 @@ namespace SW2026RibbonAddin.Commands
 
                 string outPath = Path.Combine(mainFolder, $"thickness_{fileSafeThickness}.dwg");
 
-                var doc = new CadDocument(ACadVersion.AC1024);
+                var doc = new CadDocument();
                 BlockRecord modelSpace = doc.BlockRecords["*Model_Space"];
 
-                double offsetX = 0.0;
-                const double spacingX = 1000.0;
+                double cursorX = 0.0;
+                const double marginX = 50.0;  // margin between plates (smaller than before)
 
                 foreach (var part in g)
                 {
@@ -281,7 +285,7 @@ namespace SW2026RibbonAddin.Commands
                         continue;
                     }
 
-                    // create a block and copy all entities into it
+                    // Create a block for this plate and copy all model space entities into it
                     string blockName = "P_" + Guid.NewGuid().ToString("N");
                     var block = new BlockRecord(blockName);
                     doc.BlockRecords.Add(block);
@@ -298,10 +302,51 @@ namespace SW2026RibbonAddin.Commands
                         block.Entities.Add(cloned);
                     }
 
-                    // insert the block
+                    if (block.Entities.Count == 0)
+                        continue;
+
+                    // ---- get bounding box of block geometry (local coords) ----
+                    double minX = double.MaxValue;
+                    double maxX = double.MinValue;
+                    double minY = double.MaxValue;
+
+                    foreach (var ent in block.Entities)
+                    {
+                        try
+                        {
+                            var bb = ent.GetBoundingBox();   // BoundingBox is a struct, never null
+                            XYZ bbMin = bb.Min;
+                            XYZ bbMax = bb.Max;
+
+                            if (bbMin.X < minX) minX = bbMin.X;
+                            if (bbMax.X > maxX) maxX = bbMax.X;
+                            if (bbMin.Y < minY) minY = bbMin.Y;
+                        }
+                        catch
+                        {
+                            // ignore entities that do not support bounding box
+                        }
+                    }
+
+                    if (minX == double.MaxValue || maxX == double.MinValue)
+                    {
+                        // fallback if we could not compute a bbox
+                        minX = 0.0;
+                        maxX = 0.0;
+                        minY = 0.0;
+                    }
+
+                    double width = maxX - minX;
+                    if (width <= 0.0)
+                        width = 1.0; // avoid zero-width issues
+
+                    // Align bottom to Y=0, left edge at cursorX
+                    double insertX = cursorX - minX;
+                    double insertY = -minY;
+
                     var insert = new Insert(block)
                     {
-                        InsertPoint = new XYZ(offsetX, 0, 0),
+                        InsertPoint = new XYZ(insertX, insertY, 0.0),
                         XScale = 1.0,
                         YScale = 1.0,
                         ZScale = 1.0
@@ -309,9 +354,15 @@ namespace SW2026RibbonAddin.Commands
 
                     doc.Entities.Add(insert);
 
-                    // add text: Plate & Qty under the block
+                    // ---- text under plate ----
                     double textHeight = 20.0;
                     double gap = 5.0;
+
+                    double baselineY = 0.0;
+                    double textY1 = baselineY - textHeight - gap;
+                    double textY2 = baselineY - 2 * textHeight - 2 * gap;
+
+                    double plateCenterX = cursorX + width / 2.0;
 
                     string label1 = $"Plate: {thicknessText} mm";
                     string label2 = $"Qty: {part.Quantity}";
@@ -319,21 +370,22 @@ namespace SW2026RibbonAddin.Commands
                     var text1 = new MText
                     {
                         Value = label1,
-                        InsertPoint = new XYZ(offsetX, -textHeight - gap, 0),
+                        InsertPoint = new XYZ(plateCenterX, textY1, 0.0),
                         Height = textHeight
                     };
 
                     var text2 = new MText
                     {
                         Value = label2,
-                        InsertPoint = new XYZ(offsetX, -2 * textHeight - 2 * gap, 0),
+                        InsertPoint = new XYZ(plateCenterX, textY2, 0.0),
                         Height = textHeight
                     };
 
                     doc.Entities.Add(text1);
                     doc.Entities.Add(text2);
 
-                    offsetX += spacingX;
+                    // Move cursor to the right of this plate, with a small margin
+                    cursorX += width + marginX;
                 }
 
                 using (var writer = new DwgWriter(outPath, doc))
