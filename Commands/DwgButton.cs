@@ -6,6 +6,7 @@ using System.IO;
 using System.Windows.Forms;
 using SolidWorks.Interop.sldworks;
 using SolidWorks.Interop.swconst;
+using SW2026RibbonAddin.Forms;
 
 namespace SW2026RibbonAddin.Commands
 {
@@ -22,6 +23,9 @@ namespace SW2026RibbonAddin.Commands
     /// </summary>
     internal sealed class DwgButton : IMehdiRibbonButton
     {
+        // Number of assemblies in the job; all quantities in parts.csv are multiplied by this.
+        private const int AssemblyQuantity = 5;
+
         public string Id => "DWG";
 
         public string DisplayName => "DWG";
@@ -161,7 +165,7 @@ namespace SW2026RibbonAddin.Commands
             foreach (string dwgName in dwgFileNames)
             {
                 csvLines.Add(
-                    $"{dwgName},{thicknessMm.ToString("0.###", CultureInfo.InvariantCulture)},1");
+                    $"{dwgName},{thicknessMm.ToString("0.###", CultureInfo.InvariantCulture)},{AssemblyQuantity}");
             }
 
             string csvPath = Path.Combine(jobFolder, "parts.csv");
@@ -246,7 +250,7 @@ namespace SW2026RibbonAddin.Commands
                     foreach (string dwgName in dwgFileNames)
                     {
                         csvLines.Add(
-                            $"{dwgName},{thicknessMm.ToString("0.###", CultureInfo.InvariantCulture)},{info.Quantity}");
+                            $"{dwgName},{thicknessMm.ToString("0.###", CultureInfo.InvariantCulture)},{info.Quantity*AssemblyQuantity}");
                     }
 
                     // Close the part we opened for export (without saving)
