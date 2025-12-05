@@ -38,8 +38,8 @@ namespace SW2026RibbonAddin.Commands
         public string SmallIconFile => "dwg_20.png";
         public string LargeIconFile => "dwg_32.png";
 
-        public RibbonSection Section => RibbonSection.General;
-        public int SectionOrder => 10;
+        public RibbonSection Section => RibbonSection.DWG;
+        public int SectionOrder => 1;
 
         public bool IsFreeFeature => false;
 

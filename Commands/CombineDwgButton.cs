@@ -20,10 +20,10 @@ namespace SW2026RibbonAddin.Commands
         public string Tooltip => "Combine DWG exports from multiple jobs into per-thickness DWGs and a summary CSV.";
         public string Hint => "Combine DWG exports";
 
-        public string SmallIconFile => "dwg_20.png";   // reuse DWG icon
-        public string LargeIconFile => "dwg_32.png";
+        public string SmallIconFile => "combine_dwg_20.png";   
+        public string LargeIconFile => "combine_dwg_32.png";
 
-        public RibbonSection Section => RibbonSection.General;
+        public RibbonSection Section => RibbonSection.DWG;
         public int SectionOrder => 2;
 
         public bool IsFreeFeature => false;
