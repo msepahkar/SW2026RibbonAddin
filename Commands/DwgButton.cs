@@ -23,8 +23,11 @@ namespace SW2026RibbonAddin.Commands
     /// </summary>
     internal sealed class DwgButton : IMehdiRibbonButton
     {
-        // Number of assemblies in the job; all quantities in parts.csv are multiplied by this.
-        private const int AssemblyQuantity = 5;
+        // Default number of assemblies if user just clicks OK without changes
+        private const int DefaultAssemblyQuantity = 1;
+
+        // Filled from the dialog every time the DWG command runs
+        private int _assemblyQuantity = DefaultAssemblyQuantity;
 
         public string Id => "DWG";
 
@@ -59,6 +62,16 @@ namespace SW2026RibbonAddin.Commands
             {
                 MessageBox.Show("DWG export is only available for parts and assemblies.", "DWG Export");
                 return;
+            }
+
+
+            // Ask for number of assemblies (used to scale CSV quantities)
+            using (var dlg = new AssemblyQuantityForm(_assemblyQuantity))
+            {
+                if (dlg.ShowDialog() != DialogResult.OK)
+                    return; // user cancelled
+
+                _assemblyQuantity = dlg.AssemblyQuantity;
             }
 
             // Let user pick the MAIN folder (standard folder dialog)
@@ -165,7 +178,7 @@ namespace SW2026RibbonAddin.Commands
             foreach (string dwgName in dwgFileNames)
             {
                 csvLines.Add(
-                    $"{dwgName},{thicknessMm.ToString("0.###", CultureInfo.InvariantCulture)},{AssemblyQuantity}");
+                    $"{dwgName},{thicknessMm.ToString("0.###", CultureInfo.InvariantCulture)},{_assemblyQuantity}");
             }
 
             string csvPath = Path.Combine(jobFolder, "parts.csv");
@@ -250,7 +263,7 @@ namespace SW2026RibbonAddin.Commands
                     foreach (string dwgName in dwgFileNames)
                     {
                         csvLines.Add(
-                            $"{dwgName},{thicknessMm.ToString("0.###", CultureInfo.InvariantCulture)},{info.Quantity*AssemblyQuantity}");
+                            $"{dwgName},{thicknessMm.ToString("0.###", CultureInfo.InvariantCulture)},{info.Quantity*_assemblyQuantity}");
                     }
 
                     // Close the part we opened for export (without saving)

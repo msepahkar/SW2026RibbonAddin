@@ -92,6 +92,9 @@
     <Compile Include="Commands\RibbonSection.cs" />
     <Compile Include="Commands\SheetMetalAssemblyHelper.cs" />
     <Compile Include="Commands\UpdateFarsiNotesButton.cs" />
+    <Compile Include="Forms\AssemblyQuantityForm.cs">
+      <SubType>Form</SubType>
+    </Compile>
     <Compile Include="Forms\FarsiNoteForm.cs">
       <SubType>Form</SubType>
     </Compile>
