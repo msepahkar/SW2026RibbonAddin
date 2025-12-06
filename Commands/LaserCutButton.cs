@@ -17,7 +17,7 @@ namespace SW2026RibbonAddin.Commands
         public string Id => "LaserCut";
 
         public string DisplayName => "Laser\nCut";
-        public string Tooltip => "Nest a combined DWG into laser sheets.";
+        public string Tooltip => "Nest a combined DWG into laser sheets (optimized rectangle-based nesting).";
         public string Hint => "Laser cut nesting";
 
         public string SmallIconFile => "laser_cut_20.png";
@@ -118,7 +118,7 @@ namespace SW2026RibbonAddin.Commands
 
         /// <summary>
         /// Reads a combined DWG (one produced by CombineDwg) and nests all plate blocks
-        /// P_*_Q{qty} onto as many sheets as required using the optimized algorithm.
+        /// P_*_Q{qty} onto as many sheets as required using an optimized rectangle-based algorithm.
         /// </summary>
         public static void Nest(string sourceDwgPath, double sheetWidth, double sheetHeight)
         {
@@ -163,7 +163,7 @@ namespace SW2026RibbonAddin.Commands
             const double sheetGap = 50.0;    // distance between sheets (mm)
 
             // We never place plates closer than this to the sheet border.
-            // (border + 2 * gap gives plenty of clearance so nothing crosses the border)
+            // (border + 2 * gap gives clearance so nothing crosses the border)
             double placementMargin = sheetMargin + 2 * partGap;
 
             // Validate that every part fits inside a sheet with the inner margin.
@@ -247,7 +247,7 @@ namespace SW2026RibbonAddin.Commands
 
             MessageBox.Show(
                 "Laser cut nesting finished.\r\n\r\n" +
-                "Algorithm: Optimized" + Environment.NewLine +
+                "Algorithm: Optimized (rectangle-based)" + Environment.NewLine +
                 "Sheets used: " + sheetCount + Environment.NewLine +
                 "Total parts: " + totalInstances + Environment.NewLine +
                 "Output DWG: " + outPath,
@@ -256,7 +256,7 @@ namespace SW2026RibbonAddin.Commands
                 MessageBoxIcon.Information);
         }
 
-        #region Optimized free-rectangles algorithm
+        #region Optimized free-rectangles algorithm (improved heuristics)
 
         private static int NestFreeRectangles(
             List<PartDefinition> instances,
@@ -323,6 +323,10 @@ namespace SW2026RibbonAddin.Commands
             return sheets.Count;
         }
 
+        /// <summary>
+        /// Try to place a part on a sheet using a MaxRects-style heuristic:
+        /// Best Short-Side Fit, then Best Long-Side Fit as tiebreaker.
+        /// </summary>
         private static bool TryPlaceOnSheetFreeRects(
             SheetState sheet,
             PartDefinition part,
@@ -337,7 +341,8 @@ namespace SW2026RibbonAddin.Commands
 
             int bestIndex = -1;
             bool bestRotated = false;
-            double bestWaste = double.MaxValue;
+            double bestShortSideFit = double.MaxValue;
+            double bestLongSideFit = double.MaxValue;
 
             // Try all free rectangles, both orientations (0° and 90°)
             for (int i = 0; i < sheet.FreeRects.Count; i++)
@@ -370,21 +375,24 @@ namespace SW2026RibbonAddin.Commands
             if (!rotated)
             {
                 // No rotation: align bounding min directly
-                insertXWorld = sheet.OriginX + desiredMinLocalX - part.MinX;
-                insertYWorld = sheet.OriginY + desiredMinLocalY - part.MinY;
+                double worldMinX = sheet.OriginX + desiredMinLocalX;
+                double worldMinY = sheet.OriginY + desiredMinLocalY;
+
+                insertXWorld = worldMinX - part.MinX;
+                insertYWorld = worldMinY - part.MinY;
                 rotation = 0.0;
             }
             else
             {
                 // 90° rotation around insert point:
-                // x' = Tx - y, y' = Ty + x
-                // Bounding min after rotation:
-                //   minX' = Tx - MaxY, minY' = Ty + MinX
-                // We want those equal to desiredMinLocalX/Y (in world coords).
-                double maxYlocal = part.MaxY;
-
+                // rotate (x,y) -> (-y, x).
+                // Bounding min after rotation, about origin: (-MaxY, MinX).
+                // After translation (Tx,Ty) => (Tx - MaxY, Ty + MinX).
+                // We want these equal to desired world min coords.
                 double worldMinX = sheet.OriginX + desiredMinLocalX;
                 double worldMinY = sheet.OriginY + desiredMinLocalY;
+
+                double maxYlocal = part.MaxY;
 
                 insertXWorld = worldMinX + maxYlocal;   // Tx = worldMinX + MaxY
                 insertYWorld = worldMinY - part.MinX;   // Ty = worldMinY - MinX
@@ -417,10 +425,16 @@ namespace SW2026RibbonAddin.Commands
                 if (placeWCandidate > fr.Width || placeHCandidate > fr.Height)
                     return;
 
-                double waste = fr.Width * fr.Height - placeWCandidate * placeHCandidate;
-                if (waste < bestWaste)
+                double leftoverHoriz = fr.Width - placeWCandidate;
+                double leftoverVert = fr.Height - placeHCandidate;
+                double shortSideFit = Math.Min(leftoverHoriz, leftoverVert);
+                double longSideFit = Math.Max(leftoverHoriz, leftoverVert);
+
+                if (shortSideFit < bestShortSideFit ||
+                    (Math.Abs(shortSideFit - bestShortSideFit) < 1e-9 && longSideFit < bestLongSideFit))
                 {
-                    bestWaste = waste;
+                    bestShortSideFit = shortSideFit;
+                    bestLongSideFit = longSideFit;
                     bestIndex = rectIndex;
                     bestRotated = rotatedCandidate;
                 }
