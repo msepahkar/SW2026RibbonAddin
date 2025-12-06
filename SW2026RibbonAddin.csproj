@@ -88,6 +88,7 @@
     <Compile Include="Commands\EditSelectedFarsiNoteButton.cs" />
     <Compile Include="Commands\HelloButton.cs" />
     <Compile Include="Commands\IMehdiRibbonButton.cs" />
+    <Compile Include="Commands\LaserCutButton.cs" />
     <Compile Include="Commands\RibbonSection.cs" />
     <Compile Include="Commands\SheetMetalAssemblyHelper.cs" />
     <Compile Include="Commands\UpdateFarsiNotesButton.cs" />

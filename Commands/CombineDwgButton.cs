@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Text;
 using System.Windows.Forms;
 using ACadSharp;
 using ACadSharp.Entities;
@@ -233,11 +234,36 @@ namespace SW2026RibbonAddin.Commands
         }
 
         /// <summary>
+        /// Block name for a plate: P_{sanitizedPartName}_Q{quantity}
+        /// Quantity suffix is used later by the laser-cut nesting.
+        /// </summary>
+        private static string MakePlateBlockName(string fileName, int quantity)
+        {
+            string baseName = Path.GetFileNameWithoutExtension(fileName);
+            if (string.IsNullOrEmpty(baseName))
+                baseName = "Part";
+
+            var sb = new StringBuilder();
+            foreach (char c in baseName)
+            {
+                if (char.IsLetterOrDigit(c))
+                    sb.Append(c);
+                else
+                    sb.Append('_');
+            }
+
+            string safe = sb.Length > 0 ? sb.ToString() : "Part";
+            int q = Math.Max(1, quantity);
+
+            return string.Format(CultureInfo.InvariantCulture, "P_{0}_Q{1}", safe, q);
+        }
+
+        /// <summary>
         /// For each thickness, create thickness_XXX.dwg with all plates of that thickness
         /// laid out side-by-side:
         /// - bottoms aligned on Y = 0
         /// - two text lines beneath each plate (thickness + quantity)
-        /// - horizontal spacing based on max(plate width, text width) + margin
+        /// - horizontal spacing based on max(plate width, text width + padding) + margin
         /// </summary>
         private static void CreatePerThicknessDwgs(string mainFolder, List<CombinedPart> parts)
         {
@@ -287,8 +313,9 @@ namespace SW2026RibbonAddin.Commands
                         continue;
                     }
 
-                    // Create a block for this plate and copy all model space entities into it
-                    string blockName = "P_" + Guid.NewGuid().ToString("N");
+                    // Create a block for this plate and copy all model space entities into it.
+                    // Block name encodes the quantity for later laser nesting: P_..._Q{qty}
+                    string blockName = MakePlateBlockName(part.FileName, part.Quantity);
                     var block = new BlockRecord(blockName);
                     doc.BlockRecords.Add(block);
 
@@ -350,11 +377,14 @@ namespace SW2026RibbonAddin.Commands
 
                     // ---- text under plate ----
                     double textHeight = 20.0;
-                    double gap = 5.0;
 
+                    // More comfortable vertical spacing:
                     double baselineY = 0.0;
-                    double textY1 = baselineY - textHeight - gap;
-                    double textY2 = baselineY - 2 * textHeight - 2 * gap;
+                    double gapPlateToFirst = 8.0;     // plate bottom -> first line
+                    double gapBetweenLines = 10.0;    // between line 1 and line 2
+
+                    double textY1 = baselineY - textHeight - gapPlateToFirst;
+                    double textY2 = textY1 - textHeight - gapBetweenLines;
 
                     string label1 = $"Plate: {thicknessText} mm";
                     string label2 = $"Qty: {part.Quantity}";
@@ -363,9 +393,19 @@ namespace SW2026RibbonAddin.Commands
                     double textWidth2 = EstimateTextWidth(label2, textHeight);
                     double maxTextWidth = Math.Max(textWidth1, textWidth2);
 
-                    // Column width is the max of the block and the text so that
-                    // wide text gets enough space and does not overlap neighbors.
-                    double columnWidth = Math.Max(blockWidth, maxTextWidth);
+                    // Column width: if text is wider than plate, give extra horizontal
+                    // room so that texts from neighboring plates do not overlap.
+                    double columnWidth;
+                    double extraTextSidePadding = textHeight; // padding each side when text controls width
+
+                    if (maxTextWidth > blockWidth)
+                    {
+                        columnWidth = maxTextWidth + 2.0 * extraTextSidePadding;
+                    }
+                    else
+                    {
+                        columnWidth = blockWidth;
+                    }
 
                     // Center of this column (also block + text center)
                     double columnCenterX = cursorX + columnWidth / 2.0;
@@ -420,7 +460,9 @@ namespace SW2026RibbonAddin.Commands
             }
         }
 
-        private const double TextWidthFactor = 0.6;
+        // Conservative factor so the estimated width is slightly larger than real text,
+        // which helps guarantee that neighboring texts do not overlap.
+        private const double TextWidthFactor = 1.0;
 
         private static double EstimateTextWidth(string text, double textHeight)
         {
