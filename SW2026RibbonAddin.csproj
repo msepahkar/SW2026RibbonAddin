@@ -85,7 +85,6 @@
     <Compile Include="Commands\AddinContext.cs" />
     <Compile Include="Commands\CombineDwgButton.cs" />
     <Compile Include="Commands\DwgButton.cs" />
-    <Compile Include="Commands\DwgPostProcessor.cs" />
     <Compile Include="Commands\EditSelectedFarsiNoteButton.cs" />
     <Compile Include="Commands\HelloButton.cs" />
     <Compile Include="Commands\IMehdiRibbonButton.cs" />

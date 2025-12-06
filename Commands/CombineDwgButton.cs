@@ -20,7 +20,7 @@ namespace SW2026RibbonAddin.Commands
         public string Tooltip => "Combine DWG exports from multiple jobs into per-thickness DWGs and a summary CSV.";
         public string Hint => "Combine DWG exports";
 
-        public string SmallIconFile => "combine_dwg_20.png";   
+        public string SmallIconFile => "combine_dwg_20.png";
         public string LargeIconFile => "combine_dwg_32.png";
 
         public RibbonSection Section => RibbonSection.DWG;
@@ -71,6 +71,8 @@ namespace SW2026RibbonAddin.Commands
 
     internal static class DwgBatchCombiner
     {
+        private static readonly Random _random = new Random();
+
         private sealed class CombinedPart
         {
             public string FileName;
@@ -290,6 +292,9 @@ namespace SW2026RibbonAddin.Commands
                     var block = new BlockRecord(blockName);
                     doc.BlockRecords.Add(block);
 
+                    // Pick a random ACI color for this plate (same color for all entities in the block)
+                    var blockColor = new Color((byte)_random.Next(1, 256));
+
                     foreach (var ent in srcModel.Entities)
                     {
                         if (ent == null)
@@ -298,6 +303,9 @@ namespace SW2026RibbonAddin.Commands
                         var cloned = ent.Clone() as Entity;
                         if (cloned == null)
                             continue;
+
+                        // Apply block color to the cloned entity
+                        cloned.Color = blockColor;
 
                         block.Entities.Add(cloned);
                     }
