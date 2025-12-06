@@ -237,7 +237,7 @@ namespace SW2026RibbonAddin.Commands
         /// laid out side-by-side:
         /// - bottoms aligned on Y = 0
         /// - two text lines beneath each plate (thickness + quantity)
-        /// - horizontal spacing based on plate width + margin
+        /// - horizontal spacing based on max(plate width, text width) + margin
         /// </summary>
         private static void CreatePerThicknessDwgs(string mainFolder, List<CombinedPart> parts)
         {
@@ -257,7 +257,7 @@ namespace SW2026RibbonAddin.Commands
                 BlockRecord modelSpace = doc.BlockRecords["*Model_Space"];
 
                 double cursorX = 0.0;
-                const double marginX = 50.0;  // margin between plates (smaller than before)
+                const double marginX = 50.0;  // base margin between plates
 
                 foreach (var part in g)
                 {
@@ -292,7 +292,7 @@ namespace SW2026RibbonAddin.Commands
                     var block = new BlockRecord(blockName);
                     doc.BlockRecords.Add(block);
 
-                    // Pick a random ACI color for this plate (same color for all entities in the block)
+                    // Pick a random ACI color (1..255) for all entities in this block
                     var blockColor = new Color((byte)_random.Next(1, 256));
 
                     foreach (var ent in srcModel.Entities)
@@ -304,7 +304,7 @@ namespace SW2026RibbonAddin.Commands
                         if (cloned == null)
                             continue;
 
-                        // Apply block color to the cloned entity
+                        // Apply the random block color
                         cloned.Color = blockColor;
 
                         block.Entities.Add(cloned);
@@ -344,12 +344,35 @@ namespace SW2026RibbonAddin.Commands
                         minY = 0.0;
                     }
 
-                    double width = maxX - minX;
-                    if (width <= 0.0)
-                        width = 1.0; // avoid zero-width issues
+                    double blockWidth = maxX - minX;
+                    if (blockWidth <= 0.0)
+                        blockWidth = 1.0; // avoid zero-width issues
 
-                    // Align bottom to Y=0, left edge at cursorX
-                    double insertX = cursorX - minX;
+                    // ---- text under plate ----
+                    double textHeight = 20.0;
+                    double gap = 5.0;
+
+                    double baselineY = 0.0;
+                    double textY1 = baselineY - textHeight - gap;
+                    double textY2 = baselineY - 2 * textHeight - 2 * gap;
+
+                    string label1 = $"Plate: {thicknessText} mm";
+                    string label2 = $"Qty: {part.Quantity}";
+
+                    double textWidth1 = EstimateTextWidth(label1, textHeight);
+                    double textWidth2 = EstimateTextWidth(label2, textHeight);
+                    double maxTextWidth = Math.Max(textWidth1, textWidth2);
+
+                    // Column width is the max of the block and the text so that
+                    // wide text gets enough space and does not overlap neighbors.
+                    double columnWidth = Math.Max(blockWidth, maxTextWidth);
+
+                    // Center of this column (also block + text center)
+                    double columnCenterX = cursorX + columnWidth / 2.0;
+
+                    // Align block bottom to Y = 0 and center it in the column.
+                    double blockCenterLocalX = (minX + maxX) * 0.5;
+                    double insertX = columnCenterX - blockCenterLocalX;
                     double insertY = -minY;
 
                     var insert = new Insert(block)
@@ -362,38 +385,32 @@ namespace SW2026RibbonAddin.Commands
 
                     doc.Entities.Add(insert);
 
-                    // ---- text under plate ----
-                    double textHeight = 20.0;
-                    double gap = 5.0;
+                    // Center text on the same column center.
+                    double plateCenterX = columnCenterX;
 
-                    double baselineY = 0.0;
-                    double textY1 = baselineY - textHeight - gap;
-                    double textY2 = baselineY - 2 * textHeight - 2 * gap;
-
-                    double plateCenterX = cursorX + width / 2.0;
-
-                    string label1 = $"Plate: {thicknessText} mm";
-                    string label2 = $"Qty: {part.Quantity}";
+                    // Shift insertion points so that text is centered on the plate.
+                    double text1InsertX = plateCenterX - textWidth1 / 2.0;
+                    double text2InsertX = plateCenterX - textWidth2 / 2.0;
 
                     var text1 = new MText
                     {
                         Value = label1,
-                        InsertPoint = new XYZ(plateCenterX, textY1, 0.0),
+                        InsertPoint = new XYZ(text1InsertX, textY1, 0.0),
                         Height = textHeight
                     };
 
                     var text2 = new MText
                     {
                         Value = label2,
-                        InsertPoint = new XYZ(plateCenterX, textY2, 0.0),
+                        InsertPoint = new XYZ(text2InsertX, textY2, 0.0),
                         Height = textHeight
                     };
 
                     doc.Entities.Add(text1);
                     doc.Entities.Add(text2);
 
-                    // Move cursor to the right of this plate, with a small margin
-                    cursorX += width + marginX;
+                    // Move cursor to the right of this plate, based on the column width
+                    cursorX += columnWidth + marginX;
                 }
 
                 using (var writer = new DwgWriter(outPath, doc))
@@ -401,6 +418,17 @@ namespace SW2026RibbonAddin.Commands
                     writer.Write();
                 }
             }
+        }
+
+        private const double TextWidthFactor = 0.6;
+
+        private static double EstimateTextWidth(string text, double textHeight)
+        {
+            if (string.IsNullOrEmpty(text) || textHeight <= 0.0)
+                return 0.0;
+
+            // Very simple approximation: width ≈ characters * textHeight * factor
+            return text.Length * textHeight * TextWidthFactor;
         }
     }
 }
