@@ -20,7 +20,6 @@ namespace SW2026RibbonAddin.Commands
         public string Tooltip => "Nest a combined DWG into laser sheets.";
         public string Hint => "Laser cut nesting";
 
-        // Use your own icons here if you prefer.
         public string SmallIconFile => "laser_cut_20.png";
         public string LargeIconFile => "laser_cut_32.png";
 
@@ -38,6 +37,7 @@ namespace SW2026RibbonAddin.Commands
             double sheetWidth;
             double sheetHeight;
 
+            // Ask for sheet size
             using (var dlg = new LaserCutOptionsForm())
             {
                 if (dlg.ShowDialog() != DialogResult.OK)
@@ -49,6 +49,7 @@ namespace SW2026RibbonAddin.Commands
 
             try
             {
+                // Always use the optimized nesting algorithm
                 DwgLaserNester.Nest(dwgPath, sheetWidth, sheetHeight);
             }
             catch (Exception ex)
@@ -92,6 +93,8 @@ namespace SW2026RibbonAddin.Commands
             public string BlockName;
             public double MinX;
             public double MinY;
+            public double MaxX;
+            public double MaxY;
             public double Width;
             public double Height;
             public int Quantity;
@@ -102,14 +105,20 @@ namespace SW2026RibbonAddin.Commands
             public int Index;
             public double OriginX;
             public double OriginY;
-            public double CurrentX;
-            public double CurrentY;
-            public double RowHeight;
+            public List<FreeRect> FreeRects = new List<FreeRect>();
+        }
+
+        private sealed class FreeRect
+        {
+            public double X;
+            public double Y;
+            public double Width;
+            public double Height;
         }
 
         /// <summary>
         /// Reads a combined DWG (one produced by CombineDwg) and nests all plate blocks
-        /// P_*_Q{qty} onto as many sheets as required.
+        /// P_*_Q{qty} onto as many sheets as required using the optimized algorithm.
         /// </summary>
         public static void Nest(string sourceDwgPath, double sheetWidth, double sheetHeight)
         {
@@ -148,10 +157,18 @@ namespace SW2026RibbonAddin.Commands
                 return;
             }
 
-            // Validate that every part fits inside a sheet with margins.
-            const double sheetMargin = 5.0;
-            double usableWidth = sheetWidth - 2 * sheetMargin;
-            double usableHeight = sheetHeight - 2 * sheetMargin;
+            // Sheet framing and spacing
+            const double sheetMargin = 10.0; // visible border (mm)
+            const double partGap = 5.0;      // gap between parts (mm)
+            const double sheetGap = 50.0;    // distance between sheets (mm)
+
+            // We never place plates closer than this to the sheet border.
+            // (border + 2 * gap gives plenty of clearance so nothing crosses the border)
+            double placementMargin = sheetMargin + 2 * partGap;
+
+            // Validate that every part fits inside a sheet with the inner margin.
+            double usableWidth = sheetWidth - 2 * placementMargin;
+            double usableHeight = sheetHeight - 2 * placementMargin;
 
             foreach (var p in parts)
             {
@@ -171,145 +188,47 @@ namespace SW2026RibbonAddin.Commands
                     instances.Add(def);
             }
 
-            // Largest parts first (by height, then width).
+            // Optimized algorithm: place largest parts first (by area).
             instances.Sort((a, b) =>
             {
-                int cmp = b.Height.CompareTo(a.Height);
-                if (cmp != 0) return cmp;
-                return b.Width.CompareTo(a.Width);
+                double areaA = a.Width * a.Height;
+                double areaB = b.Width * b.Height;
+                return areaB.CompareTo(areaA);
             });
 
-            // Wipe existing model-space entities; we will rebuild layout for sheets only.
-            doc.Entities.Clear();
+            // Compute extents of the original combined layout (model space)
+            GetModelSpaceExtents(doc, out double origMinX, out double origMinY, out double origMaxX, out double origMaxY);
 
             var modelSpace = doc.BlockRecords["*Model_Space"];
 
-            const double partGap = 5.0;      // distance between plates
-            const double sheetGap = 50.0;    // distance between sheet rectangles
-
-            var sheets = new List<SheetState>();
-
-            SheetState NewSheet()
-            {
-                var sheet = new SheetState
-                {
-                    Index = sheets.Count + 1,
-                    OriginX = sheets.Count * (sheetWidth + sheetGap),
-                    OriginY = 0.0,
-                    CurrentX = sheetMargin,
-                    CurrentY = sheetMargin,
-                    RowHeight = 0.0
-                };
-
-                sheets.Add(sheet);
-
-                // Draw sheet boundary as four lines.
-                var bottom = new Line
-                {
-                    StartPoint = new XYZ(sheet.OriginX, sheet.OriginY, 0.0),
-                    EndPoint = new XYZ(sheet.OriginX + sheetWidth, sheet.OriginY, 0.0)
-                };
-                var right = new Line
-                {
-                    StartPoint = new XYZ(sheet.OriginX + sheetWidth, sheet.OriginY, 0.0),
-                    EndPoint = new XYZ(sheet.OriginX + sheetWidth, sheet.OriginY + sheetHeight, 0.0)
-                };
-                var top = new Line
-                {
-                    StartPoint = new XYZ(sheet.OriginX + sheetWidth, sheet.OriginY + sheetHeight, 0.0),
-                    EndPoint = new XYZ(sheet.OriginX, sheet.OriginY + sheetHeight, 0.0)
-                };
-                var left = new Line
-                {
-                    StartPoint = new XYZ(sheet.OriginX, sheet.OriginY + sheetHeight, 0.0),
-                    EndPoint = new XYZ(sheet.OriginX, sheet.OriginY, 0.0)
-                };
-
-                modelSpace.Entities.Add(bottom);
-                modelSpace.Entities.Add(right);
-                modelSpace.Entities.Add(top);
-                modelSpace.Entities.Add(left);
-
-                // Add "SHEET n" text near upper-left corner.
-                var txt = new MText
-                {
-                    Value = $"SHEET {sheet.Index}",
-                    InsertPoint = new XYZ(sheet.OriginX + sheetMargin,
-                                          sheet.OriginY + sheetHeight - 20.0, 0.0),
-                    Height = 15.0
-                };
-                modelSpace.Entities.Add(txt);
-
-                return sheet;
-            }
+            // Place sheets ABOVE the original combined layout so the original
+            // plates remain visible at the bottom of the nested DWG.
+            double baseSheetOriginY = origMaxY + 200.0; // gap above original
+            double baseSheetOriginX = origMinX;
 
             var progress = new LaserCutProgressForm(totalInstances)
             {
-                Text = "Laser cut nesting"
+                Text = "Laser cut nesting (optimized)"
             };
 
-            int placed = 0;
             int sheetCount;
             try
             {
                 progress.Show();
                 Application.DoEvents();
 
-                var sheet = NewSheet();
-
-                foreach (var inst in instances)
-                {
-                    while (true)
-                    {
-                        // Is there room in current row?
-                        if (sheet.CurrentX + inst.Width <= sheetWidth - sheetMargin)
-                        {
-                            // Place at current position.
-                            double localX = sheet.CurrentX;
-                            double localY = sheet.CurrentY;
-
-                            double worldX = sheet.OriginX + localX;
-                            double worldY = sheet.OriginY + localY;
-
-                            // Adjust for block's local min corner so bounding box is inside the sheet.
-                            double insertX = worldX - inst.MinX;
-                            double insertY = worldY - inst.MinY;
-
-                            var insert = new Insert(inst.Block)
-                            {
-                                InsertPoint = new XYZ(insertX, insertY, 0.0),
-                                XScale = 1.0,
-                                YScale = 1.0,
-                                ZScale = 1.0
-                            };
-
-                            modelSpace.Entities.Add(insert);
-
-                            sheet.CurrentX += inst.Width + partGap;
-                            if (inst.Height > sheet.RowHeight)
-                                sheet.RowHeight = inst.Height;
-
-                            placed++;
-                            progress.Step($"Placed {placed} of {totalInstances} plates...");
-                            break;
-                        }
-                        else
-                        {
-                            // Move to next row.
-                            sheet.CurrentX = sheetMargin;
-                            sheet.CurrentY += sheet.RowHeight + partGap;
-                            sheet.RowHeight = 0.0;
-
-                            // Not enough vertical space either? Start new sheet.
-                            if (sheet.CurrentY + inst.Height > sheetHeight - sheetMargin)
-                            {
-                                sheet = NewSheet();
-                            }
-                        }
-                    }
-                }
-
-                sheetCount = sheets.Count;
+                sheetCount = NestFreeRectangles(
+                    instances,
+                    modelSpace,
+                    sheetWidth,
+                    sheetHeight,
+                    placementMargin,
+                    sheetGap,
+                    partGap,
+                    baseSheetOriginX,
+                    baseSheetOriginY,
+                    progress,
+                    totalInstances);
             }
             finally
             {
@@ -319,7 +238,7 @@ namespace SW2026RibbonAddin.Commands
             // Write nested result to a new DWG next to the source.
             string dir = Path.GetDirectoryName(sourceDwgPath);
             string nameNoExt = Path.GetFileNameWithoutExtension(sourceDwgPath);
-            string outPath = Path.Combine(dir ?? string.Empty, nameNoExt + "_nested.dwg");
+            string outPath = Path.Combine(dir ?? string.Empty, nameNoExt + "_nested_optimized.dwg");
 
             using (var writer = new DwgWriter(outPath, doc))
             {
@@ -328,12 +247,301 @@ namespace SW2026RibbonAddin.Commands
 
             MessageBox.Show(
                 "Laser cut nesting finished.\r\n\r\n" +
+                "Algorithm: Optimized" + Environment.NewLine +
                 "Sheets used: " + sheetCount + Environment.NewLine +
                 "Total parts: " + totalInstances + Environment.NewLine +
                 "Output DWG: " + outPath,
                 "Laser Cut",
                 MessageBoxButtons.OK,
                 MessageBoxIcon.Information);
+        }
+
+        #region Optimized free-rectangles algorithm
+
+        private static int NestFreeRectangles(
+            List<PartDefinition> instances,
+            BlockRecord modelSpace,
+            double sheetWidth,
+            double sheetHeight,
+            double placementMargin,
+            double sheetGap,
+            double partGap,
+            double startOriginX,
+            double baseOriginY,
+            LaserCutProgressForm progress,
+            int totalInstances)
+        {
+            var sheets = new List<SheetState>();
+
+            SheetState NewSheet()
+            {
+                var sheet = new SheetState
+                {
+                    Index = sheets.Count + 1,
+                    OriginX = startOriginX + sheets.Count * (sheetWidth + sheetGap),
+                    OriginY = baseOriginY
+                };
+
+                sheets.Add(sheet);
+                DrawSheetOutline(sheet, sheetWidth, sheetHeight, modelSpace);
+
+                sheet.FreeRects.Add(new FreeRect
+                {
+                    X = placementMargin,
+                    Y = placementMargin,
+                    Width = sheetWidth - 2 * placementMargin,
+                    Height = sheetHeight - 2 * placementMargin
+                });
+
+                return sheet;
+            }
+
+            int placed = 0;
+            var sheetState = NewSheet();
+
+            foreach (var inst in instances)
+            {
+                while (true)
+                {
+                    if (TryPlaceOnSheetFreeRects(
+                        sheetState,
+                        inst,
+                        partGap,
+                        modelSpace,
+                        ref placed,
+                        totalInstances,
+                        progress))
+                    {
+                        break;
+                    }
+
+                    // Could not fit on current sheet; add another
+                    sheetState = NewSheet();
+                }
+            }
+
+            return sheets.Count;
+        }
+
+        private static bool TryPlaceOnSheetFreeRects(
+            SheetState sheet,
+            PartDefinition part,
+            double partGap,
+            BlockRecord modelSpace,
+            ref int placed,
+            int totalInstances,
+            LaserCutProgressForm progress)
+        {
+            if (sheet.FreeRects.Count == 0)
+                return false;
+
+            int bestIndex = -1;
+            bool bestRotated = false;
+            double bestWaste = double.MaxValue;
+
+            // Try all free rectangles, both orientations (0° and 90°)
+            for (int i = 0; i < sheet.FreeRects.Count; i++)
+            {
+                var fr = sheet.FreeRects[i];
+
+                EvaluateOrientation(fr, part.Width, part.Height, false, i);
+                EvaluateOrientation(fr, part.Height, part.Width, true, i);
+            }
+
+            if (bestIndex < 0)
+                return false;
+
+            var chosenRect = sheet.FreeRects[bestIndex];
+            bool rotated = bestRotated;
+
+            double w = rotated ? part.Height : part.Width;
+            double h = rotated ? part.Width : part.Height;
+            double placeW = w + partGap;
+            double placeH = h + partGap;
+
+            // Desired minimum corner of the part's bounding box (local to sheet)
+            double desiredMinLocalX = chosenRect.X + partGap * 0.5;
+            double desiredMinLocalY = chosenRect.Y + partGap * 0.5;
+
+            double insertXWorld;
+            double insertYWorld;
+            double rotation;
+
+            if (!rotated)
+            {
+                // No rotation: align bounding min directly
+                insertXWorld = sheet.OriginX + desiredMinLocalX - part.MinX;
+                insertYWorld = sheet.OriginY + desiredMinLocalY - part.MinY;
+                rotation = 0.0;
+            }
+            else
+            {
+                // 90° rotation around insert point:
+                // x' = Tx - y, y' = Ty + x
+                // Bounding min after rotation:
+                //   minX' = Tx - MaxY, minY' = Ty + MinX
+                // We want those equal to desiredMinLocalX/Y (in world coords).
+                double maxYlocal = part.MaxY;
+
+                double worldMinX = sheet.OriginX + desiredMinLocalX;
+                double worldMinY = sheet.OriginY + desiredMinLocalY;
+
+                insertXWorld = worldMinX + maxYlocal;   // Tx = worldMinX + MaxY
+                insertYWorld = worldMinY - part.MinX;   // Ty = worldMinY - MinX
+                rotation = Math.PI / 2.0;
+            }
+
+            var insert = new Insert(part.Block)
+            {
+                InsertPoint = new XYZ(insertXWorld, insertYWorld, 0.0),
+                XScale = 1.0,
+                YScale = 1.0,
+                ZScale = 1.0,
+                Rotation = rotation
+            };
+            modelSpace.Entities.Add(insert);
+
+            // Split the used free rectangle into right and top remainders
+            SplitFreeRect(sheet, bestIndex, chosenRect, placeW, placeH);
+
+            placed++;
+            progress.Step($"Placed {placed} of {totalInstances} plates...");
+
+            return true;
+
+            void EvaluateOrientation(FreeRect fr, double wCandidate, double hCandidate, bool rotatedCandidate, int rectIndex)
+            {
+                double placeWCandidate = wCandidate + partGap;
+                double placeHCandidate = hCandidate + partGap;
+
+                if (placeWCandidate > fr.Width || placeHCandidate > fr.Height)
+                    return;
+
+                double waste = fr.Width * fr.Height - placeWCandidate * placeHCandidate;
+                if (waste < bestWaste)
+                {
+                    bestWaste = waste;
+                    bestIndex = rectIndex;
+                    bestRotated = rotatedCandidate;
+                }
+            }
+        }
+
+        private static void SplitFreeRect(
+            SheetState sheet,
+            int rectIndex,
+            FreeRect usedRect,
+            double usedWidth,
+            double usedHeight)
+        {
+            sheet.FreeRects.RemoveAt(rectIndex);
+
+            const double minSize = 1.0;
+
+            // Right remainder
+            double rightWidth = usedRect.Width - usedWidth;
+            if (rightWidth > minSize)
+            {
+                sheet.FreeRects.Add(new FreeRect
+                {
+                    X = usedRect.X + usedWidth,
+                    Y = usedRect.Y,
+                    Width = rightWidth,
+                    Height = usedRect.Height
+                });
+            }
+
+            // Top remainder
+            double topHeight = usedRect.Height - usedHeight;
+            if (topHeight > minSize)
+            {
+                sheet.FreeRects.Add(new FreeRect
+                {
+                    X = usedRect.X,
+                    Y = usedRect.Y + usedHeight,
+                    Width = usedWidth,
+                    Height = topHeight
+                });
+            }
+        }
+
+        #endregion
+
+        #region Helpers
+
+        private static void DrawSheetOutline(
+            SheetState sheet,
+            double sheetWidth,
+            double sheetHeight,
+            BlockRecord modelSpace)
+        {
+            var bottom = new Line
+            {
+                StartPoint = new XYZ(sheet.OriginX, sheet.OriginY, 0.0),
+                EndPoint = new XYZ(sheet.OriginX + sheetWidth, sheet.OriginY, 0.0)
+            };
+            var right = new Line
+            {
+                StartPoint = new XYZ(sheet.OriginX + sheetWidth, sheet.OriginY, 0.0),
+                EndPoint = new XYZ(sheet.OriginX + sheetWidth, sheet.OriginY + sheetHeight, 0.0)
+            };
+            var top = new Line
+            {
+                StartPoint = new XYZ(sheet.OriginX + sheetWidth, sheet.OriginY + sheetHeight, 0.0),
+                EndPoint = new XYZ(sheet.OriginX, sheet.OriginY + sheetHeight, 0.0)
+            };
+            var left = new Line
+            {
+                StartPoint = new XYZ(sheet.OriginX, sheet.OriginY + sheetHeight, 0.0),
+                EndPoint = new XYZ(sheet.OriginX, sheet.OriginY, 0.0)
+            };
+
+            modelSpace.Entities.Add(bottom);
+            modelSpace.Entities.Add(right);
+            modelSpace.Entities.Add(top);
+            modelSpace.Entities.Add(left);
+        }
+
+        private static void GetModelSpaceExtents(
+            CadDocument doc,
+            out double minX,
+            out double minY,
+            out double maxX,
+            out double maxY)
+        {
+            var modelSpace = doc.BlockRecords["*Model_Space"];
+
+            minX = double.MaxValue;
+            minY = double.MaxValue;
+            maxX = double.MinValue;
+            maxY = double.MinValue;
+
+            foreach (var ent in modelSpace.Entities)
+            {
+                try
+                {
+                    var bb = ent.GetBoundingBox();
+                    var bmin = bb.Min;
+                    var bmax = bb.Max;
+
+                    if (bmin.X < minX) minX = bmin.X;
+                    if (bmin.Y < minY) minY = bmin.Y;
+                    if (bmax.X > maxX) maxX = bmax.X;
+                    if (bmax.Y > maxY) maxY = bmax.Y;
+                }
+                catch
+                {
+                    // ignore entities without bbox
+                }
+            }
+
+            if (minX == double.MaxValue || maxX == double.MinValue)
+            {
+                minX = 0.0;
+                minY = 0.0;
+                maxX = 0.0;
+                maxY = 0.0;
+            }
         }
 
         private static IEnumerable<PartDefinition> LoadPartDefinitions(CadDocument doc)
@@ -345,11 +553,9 @@ namespace SW2026RibbonAddin.Commands
                 if (string.IsNullOrEmpty(br.Name))
                     continue;
 
-                // Skip model/paper space and other special blocks.
                 if (br.Name.StartsWith("*", StringComparison.Ordinal))
                     continue;
 
-                // We only care about plate blocks created by CombineDwg, which start with "P_".
                 if (!br.Name.StartsWith("P_", StringComparison.OrdinalIgnoreCase))
                     continue;
 
@@ -384,7 +590,6 @@ namespace SW2026RibbonAddin.Commands
                 if (minX == double.MaxValue || maxX == double.MinValue ||
                     minY == double.MaxValue || maxY == double.MinValue)
                 {
-                    // no measurable geometry
                     continue;
                 }
 
@@ -400,6 +605,8 @@ namespace SW2026RibbonAddin.Commands
                     BlockName = br.Name,
                     MinX = minX,
                     MinY = minY,
+                    MaxX = maxX,
+                    MaxY = maxY,
                     Width = width,
                     Height = height,
                     Quantity = qty
@@ -411,7 +618,6 @@ namespace SW2026RibbonAddin.Commands
 
         private static int ParseQuantityFromBlockName(string blockName)
         {
-            // Expected pattern: "..._Q<number>"
             if (string.IsNullOrEmpty(blockName))
                 return 1;
 
@@ -425,6 +631,8 @@ namespace SW2026RibbonAddin.Commands
 
             return 1;
         }
+
+        #endregion
     }
 
     internal sealed class LaserCutOptionsForm : Form
