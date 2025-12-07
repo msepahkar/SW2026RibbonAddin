@@ -39,37 +39,85 @@ namespace SW2026RibbonAddin.Commands
     internal static class StdScrewLibrary
     {
         private static List<StdScrewDefinition> _screws;
+        private static string _lastBaseDir;
 
+        /// <summary>
+        /// Legacy property – used by other methods like FindBestScrew.
+        /// It just returns the currently cached list.
+        /// </summary>
         public static List<StdScrewDefinition> Screws
         {
             get
             {
-                if (_screws == null)
-                    _screws = LoadFromDisk();
-
-                return _screws;
+                // Avoid null – always return a list
+                return _screws ?? (_screws = new List<StdScrewDefinition>());
             }
         }
 
-        public static void Reload()
+        /// <summary>
+        /// Get list of screws for the given model.
+        /// It first tries STD next to the active document,
+        /// then falls back to STD next to the add‑in DLL.
+        /// </summary>
+        public static List<StdScrewDefinition> GetScrewsForModel(IModelDoc2 model)
         {
-            _screws = LoadFromDisk();
+            string baseDir = GetBestBaseDirectory(model);
+
+            // Reuse cache if base directory did not change
+            if (_screws != null &&
+                string.Equals(baseDir, _lastBaseDir, StringComparison.OrdinalIgnoreCase))
+            {
+                return _screws;
+            }
+
+            _lastBaseDir = baseDir;
+            _screws = LoadFromDisk(baseDir);
+            return _screws;
         }
 
-        private static List<StdScrewDefinition> LoadFromDisk()
+        /// <summary>
+        /// Decide where to look for STD:
+        ///  1) next to active document, if it has a path and a STD subfolder
+        ///  2) next to the add‑in DLL
+        /// </summary>
+        private static string GetBestBaseDirectory(IModelDoc2 model)
+        {
+            // 1) Try folder of active document
+            if (model != null)
+            {
+                string docPath = model.GetPathName();
+                if (!string.IsNullOrWhiteSpace(docPath))
+                {
+                    string docDir = Path.GetDirectoryName(docPath);
+                    if (!string.IsNullOrWhiteSpace(docDir))
+                    {
+                        string stdInDocDir = Path.Combine(docDir, "STD");
+                        if (Directory.Exists(stdInDocDir))
+                            return docDir;
+                    }
+                }
+            }
+
+            // 2) Fallback: folder of the add‑in DLL
+            string asmDir = Path.GetDirectoryName(typeof(Addin).Assembly.Location);
+            return asmDir ?? System.Environment.CurrentDirectory;
+        }
+
+        private static List<StdScrewDefinition> LoadFromDisk(string baseDir)
         {
             var result = new List<StdScrewDefinition>();
 
+            if (string.IsNullOrWhiteSpace(baseDir))
+                return result;
+
+            // Look in <baseDir>\STD and all its subfolders
+            string stdDir = Path.Combine(baseDir, "STD");
+            if (!Directory.Exists(stdDir))
+                return result;
+
             try
             {
-                // Assumes STD folder is next to the add-in DLL
-                string asmDir = Path.GetDirectoryName(typeof(Addin).Assembly.Location);
-                string stdDir = Path.Combine(asmDir ?? string.Empty, "STD");
-
-                if (!Directory.Exists(stdDir))
-                    return result;
-
-                foreach (string file in Directory.GetFiles(stdDir, "*.SLDPRT"))
+                foreach (string file in Directory.GetFiles(stdDir, "*.SLDPRT", SearchOption.AllDirectories))
                 {
                     if (TryParseScrewFile(file, out StdScrewDefinition def))
                         result.Add(def);
@@ -219,18 +267,21 @@ namespace SW2026RibbonAddin.Commands
                 return;
             }
 
-            var screws = StdScrewLibrary.Screws;
+            var screws = StdScrewLibrary.GetScrewsForModel(model);
             if (screws.Count == 0)
             {
                 MessageBox.Show(
                     "No screw parts were found.\r\n\r\n" +
-                    "Place your STD folder next to the add-in DLL and make sure it contains screw parts such as:\r\n" +
-                    "  411004-000100-00 (ISO 4017) M6×10-8.8.SLDPRT",
+                    "I looked for a folder named \"STD\" next to the active document and next to the add-in DLL.\r\n" +
+                    "Make sure your screw parts (*.SLDPRT) are inside one of these locations:\r\n" +
+                    "  - <your assembly folder>\\STD\\\r\n" +
+                    "  - <add-in DLL folder>\\STD\\",
                     "Insert STD Screw",
                     MessageBoxButtons.OK,
                     MessageBoxIcon.Warning);
                 return;
             }
+
 
             List<HoleStack> stacks = CollectSelectedHoleStacks(model);
             if (stacks.Count == 0)
@@ -313,7 +364,20 @@ namespace SW2026RibbonAddin.Commands
                 return false;
             }
 
-            // Insert the component roughly at the axis origin (mates will position it correctly)
+            // 1) Make sure the screw model is loaded into memory
+            int openErr, openWarn;
+            IModelDoc2 screwDoc = EnsureScrewModelLoaded(swApp, screw.FilePath, out openErr, out openWarn);
+            if (screwDoc == null)
+            {
+                swApp.SendMsgToUser2(
+                    "Failed to open screw model:\r\n" + screw.FilePath +
+                    (openErr != 0 ? $"\r\nError code: {openErr}" : ""),
+                    (int)swMessageBoxIcon_e.swMbStop,
+                    (int)swMessageBoxBtn_e.swMbOk);
+                return false;
+            }
+
+            // 2) Now add the component to the assembly
             Component2 comp = asmDoc.AddComponent5(
                 screw.FilePath,
                 (int)swAddComponentConfigOptions_e.swAddComponentConfigOptions_CurrentSelectedConfig,
@@ -711,5 +775,51 @@ namespace SW2026RibbonAddin.Commands
             v[1] /= n;
             v[2] /= n;
         }
+
+        /// <summary>
+        /// Ensure that the screw model is loaded in memory so AddComponent5 can use it.
+        /// Returns the loaded IModelDoc2 or null on failure.
+        /// </summary>
+        private static IModelDoc2 EnsureScrewModelLoaded(SldWorks swApp, string filePath,
+            out int errors, out int warnings)
+        {
+            errors = 0;
+            warnings = 0;
+
+            if (string.IsNullOrWhiteSpace(filePath))
+                return null;
+
+            // Already open? (try full path first)
+            IModelDoc2 doc = swApp.GetOpenDocumentByName(filePath) as IModelDoc2;
+            if (doc != null)
+                return doc;
+
+            // Try by file name only (in case user has it open from another folder)
+            string fileNameOnly = Path.GetFileName(filePath);
+            if (!string.IsNullOrEmpty(fileNameOnly))
+            {
+                doc = swApp.GetOpenDocumentByName(fileNameOnly) as IModelDoc2;
+                if (doc != null)
+                    return doc;
+            }
+
+            // Open invisibly as a PART
+            bool wasVisible = swApp.GetDocumentVisible((int)swDocumentTypes_e.swDocPART);
+            swApp.DocumentVisible(false, (int)swDocumentTypes_e.swDocPART);
+
+            doc = swApp.OpenDoc6(
+                filePath,
+                (int)swDocumentTypes_e.swDocPART,
+                (int)swOpenDocOptions_e.swOpenDocOptions_Silent,
+                "",
+                ref errors,
+                ref warnings) as IModelDoc2;
+
+            // Restore visibility flag
+            swApp.DocumentVisible(wasVisible, (int)swDocumentTypes_e.swDocPART);
+
+            return doc;
+        }
+
     }
 }

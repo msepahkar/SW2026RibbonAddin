@@ -88,9 +88,11 @@
     <Compile Include="Commands\EditSelectedFarsiNoteButton.cs" />
     <Compile Include="Commands\HelloButton.cs" />
     <Compile Include="Commands\IMehdiRibbonButton.cs" />
+    <Compile Include="Commands\InsertStdScrewButton.cs" />
     <Compile Include="Commands\LaserCutButton.cs" />
     <Compile Include="Commands\RibbonSection.cs" />
     <Compile Include="Commands\SheetMetalAssemblyHelper.cs" />
+    <Compile Include="Commands\StdScrewInserter.cs" />
     <Compile Include="Commands\UpdateFarsiNotesButton.cs" />
     <Compile Include="Forms\AssemblyQuantityForm.cs">
       <SubType>Form</SubType>
@@ -136,6 +138,10 @@
   <ItemGroup>
     <EmbeddedResource Include="Resources\laser_cut_20.png" />
     <EmbeddedResource Include="Resources\laser_cut_32.png" />
+  </ItemGroup>
+  <ItemGroup>
+    <EmbeddedResource Include="Resources\std_screw_20.png" />
+    <EmbeddedResource Include="Resources\std_screw_32.png" />
   </ItemGroup>
   <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets" />
   <PropertyGroup>
