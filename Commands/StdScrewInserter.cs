@@ -34,7 +34,10 @@ namespace SW2026RibbonAddin.Commands
     }
 
     /// <summary>
-    /// Loads and caches screws from the STD folder located next to the add-in DLL.
+    /// Loads and caches screws from the STD folder.
+    /// Priority:
+    ///   1) STD next to the active document
+    ///   2) STD next to the add-in DLL
     /// </summary>
     internal static class StdScrewLibrary
     {
@@ -42,14 +45,13 @@ namespace SW2026RibbonAddin.Commands
         private static string _lastBaseDir;
 
         /// <summary>
-        /// Legacy property – used by other methods like FindBestScrew.
-        /// It just returns the currently cached list.
+        /// Legacy property – used by helper methods.
+        /// It just returns the currently cached list (never null).
         /// </summary>
         public static List<StdScrewDefinition> Screws
         {
             get
             {
-                // Avoid null – always return a list
                 return _screws ?? (_screws = new List<StdScrewDefinition>());
             }
         }
@@ -103,6 +105,9 @@ namespace SW2026RibbonAddin.Commands
             return asmDir ?? System.Environment.CurrentDirectory;
         }
 
+        /// <summary>
+        /// Load all *.SLDPRT screws under &lt;baseDir&gt;\STD and subfolders.
+        /// </summary>
         private static List<StdScrewDefinition> LoadFromDisk(string baseDir)
         {
             var result = new List<StdScrewDefinition>();
@@ -110,7 +115,6 @@ namespace SW2026RibbonAddin.Commands
             if (string.IsNullOrWhiteSpace(baseDir))
                 return result;
 
-            // Look in <baseDir>\STD and all its subfolders
             string stdDir = Path.Combine(baseDir, "STD");
             if (!Directory.Exists(stdDir))
                 return result;
@@ -234,8 +238,12 @@ namespace SW2026RibbonAddin.Commands
     {
         // Tolerances and allowances
         private const double AxisDistanceTolerance = 1e-4;  // 0.1 mm, in meters
-        private const double DiameterSlackMm = 0.6;         // allowed oversize vs screw nominal
         private const double LengthAllowanceMm = 2.0;       // extra length beyond stack height
+
+        // Screw/hole fit heuristics (metric)
+        private const double MinClearanceMm = 0.3;          // hole bigger than screw by at least this
+        private const double MinTapInterferenceMm = 0.2;    // screw bigger than hole by at least this
+        private const double EqualToleranceMm = 0.15;       // "almost equal" zone
 
         /// <summary>
         /// Entry point called by the ribbon button.
@@ -267,6 +275,7 @@ namespace SW2026RibbonAddin.Commands
                 return;
             }
 
+            // Load screw library (sets StdScrewLibrary.Screws internally)
             var screws = StdScrewLibrary.GetScrewsForModel(model);
             if (screws.Count == 0)
             {
@@ -281,7 +290,6 @@ namespace SW2026RibbonAddin.Commands
                     MessageBoxIcon.Warning);
                 return;
             }
-
 
             List<HoleStack> stacks = CollectSelectedHoleStacks(model);
             if (stacks.Count == 0)
@@ -352,6 +360,14 @@ namespace SW2026RibbonAddin.Commands
                 return false;
             }
 
+            // Find plate surface at the top of the stack (for screw head contact)
+            IFace2 topPlateFace = FindStackEndFace(
+                stack,
+                axisOrigin,
+                axisDirUnit,
+                top: true,
+                out double tHoleTop);
+
             double requiredLengthMm = stackHeightMm + LengthAllowanceMm;
 
             StdScrewDefinition screw = FindBestScrew(holeDiameterMm, requiredLengthMm);
@@ -377,7 +393,7 @@ namespace SW2026RibbonAddin.Commands
                 return false;
             }
 
-            // 2) Now add the component to the assembly
+            // 2) Insert the component roughly at the axis origin (mates will position it)
             Component2 comp = asmDoc.AddComponent5(
                 screw.FilePath,
                 (int)swAddComponentConfigOptions_e.swAddComponentConfigOptions_CurrentSelectedConfig,
@@ -397,8 +413,22 @@ namespace SW2026RibbonAddin.Commands
                 return false;
             }
 
-            // Concentric mate between smallest cylindrical face of the hole and screw shank
+            // First: concentric mate between hole cylinder and screw shank
             AddConcentricMate(swModel, asmDoc, comp, stack, screw);
+
+            // Second: coincident mate between screw head and top plate
+            if (topPlateFace != null)
+            {
+                AddCoincidentMate(
+                    swModel,
+                    asmDoc,
+                    comp,
+                    screw,
+                    axisOrigin,
+                    axisDirUnit,
+                    topPlateFace,
+                    tHoleTop);
+            }
 
             swApp.SendMsgToUser2(
                 $"Inserted {Path.GetFileNameWithoutExtension(screw.FilePath)} for hole Ø{holeDiameterMm:F2}×{stackHeightMm:F1} mm.",
@@ -572,34 +602,122 @@ namespace SW2026RibbonAddin.Commands
         }
 
         /// <summary>
-        /// Pick screw with:
-        ///   - largest diameter not exceeding hole diameter (plus small slack)
-        ///   - length >= requiredLength if possible, otherwise the longest in that diameter group.
+        /// Decide which screw to use for a measured hole diameter and required length.
+        /// Heuristic:
+        ///   - If hole clearly bigger than nearest M diameter -> clearance: screw smaller than hole.
+        ///   - If hole clearly smaller than nearest M diameter -> tapped/threaded: screw bigger than hole.
+        ///   - If almost equal -> treat as clearance and choose one size down if possible.
         /// </summary>
         private static StdScrewDefinition FindBestScrew(double holeDiameterMm, double requiredLengthMm)
         {
-            var candidatesByDia = StdScrewLibrary.Screws
-                .Where(s => s.DiameterMm <= holeDiameterMm + DiameterSlackMm)
-                .OrderByDescending(s => s.DiameterMm)
-                .ToList();
-
-            if (candidatesByDia.Count == 0)
+            var screws = StdScrewLibrary.Screws;
+            if (screws == null || screws.Count == 0)
                 return null;
 
-            StdScrewDefinition best =
-                candidatesByDia
-                    .Where(s => s.LengthMm >= requiredLengthMm)
-                    .OrderBy(s => s.LengthMm)
-                    .FirstOrDefault();
+            var diams = screws
+                .Select(s => s.DiameterMm)
+                .Distinct()
+                .OrderBy(d => d)
+                .ToList();
+
+            if (diams.Count == 0)
+                return null;
+
+            // Which nominal diameter is closest to the hole?
+            double closestDia = diams
+                .OrderBy(d => Math.Abs(holeDiameterMm - d))
+                .First();
+
+            double diffClosest = holeDiameterMm - closestDia; // positive => hole bigger than screw
+
+            bool treatAsClearance;
+
+            if (diffClosest > EqualToleranceMm)
+            {
+                // Hole clearly larger than nearest nominal diameter -> clearance case
+                treatAsClearance = true;
+            }
+            else if (diffClosest < -EqualToleranceMm)
+            {
+                // Hole clearly smaller than nearest nominal diameter -> tapped/threaded case
+                treatAsClearance = false;
+            }
+            else
+            {
+                // Hole is almost the same as the nominal diameter.
+                // Prefer clearance by going one size down if possible.
+                double holeMinusClearance = holeDiameterMm - MinClearanceMm;
+
+                double? down = diams
+                    .Where(d => d < holeMinusClearance)
+                    .Cast<double?>()
+                    .LastOrDefault();
+
+                treatAsClearance = down.HasValue;
+            }
+
+            double targetDia;
+
+            if (treatAsClearance)
+            {
+                // Clearance: choose the largest M diameter that still leaves at least MinClearanceMm
+                var diaCandidates = diams
+                    .Where(d => holeDiameterMm - d >= MinClearanceMm)
+                    .ToList();
+
+                if (diaCandidates.Count == 0)
+                {
+                    // If we cannot maintain clearance, fall back to nearest smaller or equal diameter
+                    targetDia = diams
+                        .Where(d => d <= holeDiameterMm)
+                        .DefaultIfEmpty(diams.First())
+                        .Max();
+                }
+                else
+                {
+                    targetDia = diaCandidates.Max();
+                }
+            }
+            else
+            {
+                // Tapped: choose the smallest M diameter at least MinTapInterferenceMm larger than the hole
+                var diaCandidates = diams
+                    .Where(d => d - holeDiameterMm >= MinTapInterferenceMm)
+                    .ToList();
+
+                if (diaCandidates.Count == 0)
+                {
+                    // If nothing satisfies interference, fall back to nearest larger or equal
+                    targetDia = diams
+                        .Where(d => d >= holeDiameterMm)
+                        .DefaultIfEmpty(diams.Last())
+                        .Min();
+                }
+                else
+                {
+                    targetDia = diaCandidates.Min();
+                }
+            }
+
+            // Now choose the length for that diameter
+            const double DiaTolerance = 0.01; // 0.01 mm tolerance on nominal diameter
+            var lengthCandidates = screws
+                .Where(s => Math.Abs(s.DiameterMm - targetDia) < DiaTolerance)
+                .OrderBy(s => s.LengthMm)
+                .ToList();
+
+            if (lengthCandidates.Count == 0)
+                return null;
+
+            // Smallest length that is still long enough
+            StdScrewDefinition best = lengthCandidates
+                .FirstOrDefault(s => s.LengthMm >= requiredLengthMm);
 
             if (best != null)
                 return best;
 
-            // Otherwise, longest screw of the largest allowed diameter
-            return candidatesByDia
-                .OrderByDescending(s => s.DiameterMm)
-                .ThenByDescending(s => s.LengthMm)
-                .First();
+            // Otherwise, longest available with that diameter
+            return lengthCandidates.Last();
         }
 
         /// <summary>
@@ -649,7 +767,7 @@ namespace SW2026RibbonAddin.Commands
 
                 if (mateError != (int)swAddMateError_e.swAddMateError_NoError)
                 {
-                    Debug.WriteLine("AddMate5 returned error: " + mateError);
+                    Debug.WriteLine("Concentric mate failed: " + mateError);
                 }
             }
             catch (Exception ex)
@@ -709,6 +827,335 @@ namespace SW2026RibbonAddin.Commands
             }
 
             return bestFace;
+        }
+
+        /// <summary>
+        /// Find the planar face at one end of the stack (top=true => towards +axis).
+        /// Returns null if nothing suitable is found.
+        /// </summary>
+        private static IFace2 FindStackEndFace(
+            HoleStack stack,
+            double[] axisOrigin,
+            double[] axisDirUnit,
+            bool top,
+            out double tCenterOut)
+        {
+            tCenterOut = 0.0;
+            IFace2 bestFace = null;
+            bool any = false;
+
+            foreach (HoleFaceInfo fi in stack.Faces)
+            {
+                IFace2 cylFace = fi.Face;
+                ILoop2 loop = cylFace.GetFirstLoop() as ILoop2;
+
+                while (loop != null)
+                {
+                    object[] edges = loop.GetEdges() as object[];
+                    if (edges != null)
+                    {
+                        foreach (object edgeObj in edges)
+                        {
+                            IEdge edge = edgeObj as IEdge;
+                            if (edge == null)
+                                continue;
+
+                            object[] adjFaces = edge.GetTwoAdjacentFaces2() as object[];
+                            if (adjFaces == null)
+                                continue;
+
+                            foreach (object fObj in adjFaces)
+                            {
+                                IFace2 face = fObj as IFace2;
+                                if (face == null || face == cylFace)
+                                    continue;
+
+                                ISurface surf = face.IGetSurface();
+                                if (surf == null || !surf.IsPlane())
+                                    continue;
+
+                                double[] box = face.GetBox() as double[];
+                                if (box == null || box.Length < 6)
+                                    continue;
+
+                                double xMin = box[0];
+                                double yMin = box[1];
+                                double zMin = box[2];
+                                double xMax = box[3];
+                                double yMax = box[4];
+                                double zMax = box[5];
+
+                                double[][] corners =
+                                {
+                                    new[] { xMin, yMin, zMin },
+                                    new[] { xMin, yMin, zMax },
+                                    new[] { xMin, yMax, zMin },
+                                    new[] { xMin, yMax, zMax },
+                                    new[] { xMax, yMin, zMin },
+                                    new[] { xMax, yMin, zMax },
+                                    new[] { xMax, yMax, zMin },
+                                    new[] { xMax, yMax, zMax }
+                                };
+
+                                double tMin = double.MaxValue;
+                                double tMax = double.MinValue;
+
+                                foreach (double[] p in corners)
+                                {
+                                    double[] v =
+                                    {
+                                        p[0] - axisOrigin[0],
+                                        p[1] - axisOrigin[1],
+                                        p[2] - axisOrigin[2]
+                                    };
+
+                                    double t = Dot(v, axisDirUnit);
+                                    if (t < tMin) tMin = t;
+                                    if (t > tMax) tMax = t;
+                                }
+
+                                double tCenter = 0.5 * (tMin + tMax);
+
+                                if (!any)
+                                {
+                                    any = true;
+                                    bestFace = face;
+                                    tCenterOut = tCenter;
+                                }
+                                else if (top ? (tCenter > tCenterOut) : (tCenter < tCenterOut))
+                                {
+                                    bestFace = face;
+                                    tCenterOut = tCenter;
+                                }
+                            }
+                        }
+                    }
+
+                    loop = loop.GetNext() as ILoop2;
+                }
+            }
+
+            return bestFace;
+        }
+
+        /// <summary>
+        /// Find a planar face on the screw head to mate against the plate.
+        /// We look for a planar face whose radius is larger than the shank radius
+        /// and whose position along the axis is closest to the plate face.
+        /// </summary>
+        private static IFace2 FindHeadContactFaceForScrew(
+            Component2 comp,
+            StdScrewDefinition screw,
+            double[] axisOrigin,
+            double[] axisDirUnit,
+            double tHoleTop)
+        {
+            object bodyInfo;
+            object[] bodies = comp.GetBodies3((int)swBodyType_e.swAllBodies, out bodyInfo) as object[];
+            if (bodies == null || bodies.Length == 0)
+                return null;
+
+            double shankRadius = screw.DiameterMm / 2.0 / 1000.0;
+            double minRadiusForHead = shankRadius * 1.05; // head should be a bit larger
+
+            IFace2 bestFace = null;
+            double bestScore = double.MaxValue;
+
+            foreach (object bodyObj in bodies)
+            {
+                IBody2 body = bodyObj as IBody2;
+                if (body == null)
+                    continue;
+
+                object[] faces = body.GetFaces() as object[];
+                if (faces == null)
+                    continue;
+
+                foreach (object faceObj in faces)
+                {
+                    IFace2 face = faceObj as IFace2;
+                    if (face == null)
+                        continue;
+
+                    ISurface surf = face.IGetSurface();
+                    if (surf == null || !surf.IsPlane())
+                        continue;
+
+                    double[] box = face.GetBox() as double[];
+                    if (box == null || box.Length < 6)
+                        continue;
+
+                    double xMin = box[0];
+                    double yMin = box[1];
+                    double zMin = box[2];
+                    double xMax = box[3];
+                    double yMax = box[4];
+                    double zMax = box[5];
+
+                    double[][] corners =
+                    {
+                        new[] { xMin, yMin, zMin },
+                        new[] { xMin, yMin, zMax },
+                        new[] { xMin, yMax, zMin },
+                        new[] { xMin, yMax, zMax },
+                        new[] { xMax, yMin, zMin },
+                        new[] { xMax, yMin, zMax },
+                        new[] { xMax, yMax, zMin },
+                        new[] { xMax, yMax, zMax }
+                    };
+
+                    double tMin = double.MaxValue;
+                    double tMax = double.MinValue;
+                    double localMaxRadius = 0.0;
+
+                    foreach (double[] p in corners)
+                    {
+                        double[] v =
+                        {
+                            p[0] - axisOrigin[0],
+                            p[1] - axisOrigin[1],
+                            p[2] - axisOrigin[2]
+                        };
+
+                        double t = Dot(v, axisDirUnit);
+                        if (t < tMin) tMin = t;
+                        if (t > tMax) tMax = t;
+
+                        double[] vPerp =
+                        {
+                            v[0] - t * axisDirUnit[0],
+                            v[1] - t * axisDirUnit[1],
+                            v[2] - t * axisDirUnit[2]
+                        };
+
+                        double r = Norm(vPerp);
+                        if (r > localMaxRadius)
+                            localMaxRadius = r;
+                    }
+
+                    // Ignore small planar faces (thread roots, chamfers, etc.)
+                    if (localMaxRadius < minRadiusForHead)
+                        continue;
+
+                    double tCenter = 0.5 * (tMin + tMax);
+                    double score = Math.Abs(tCenter - tHoleTop); // closer to the plate is better
+
+                    if (score < bestScore)
+                    {
+                        bestScore = score;
+                        bestFace = face;
+                    }
+                }
+            }
+
+            return bestFace;
+        }
+
+        /// <summary>
+        /// Add coincident mate between plate top face and screw head face.
+        /// </summary>
+        private static void AddCoincidentMate(
+            IModelDoc2 swModel,
+            IAssemblyDoc asmDoc,
+            Component2 screwComp,
+            StdScrewDefinition screw,
+            double[] axisOrigin,
+            double[] axisDirUnit,
+            IFace2 topPlateFace,
+            double tHoleTop)
+        {
+            try
+            {
+                IFace2 headFace = FindHeadContactFaceForScrew(
+                    screwComp, screw, axisOrigin, axisDirUnit, tHoleTop);
+
+                if (headFace == null || topPlateFace == null)
+                    return;
+
+                swModel.ClearSelection2(true);
+
+                IEntity entPlate = (IEntity)topPlateFace;
+                IEntity entHead = (IEntity)headFace;
+
+                bool sel1 = entPlate.Select4(false, null);
+                bool sel2 = entHead.Select4(true, null);
+
+                if (!sel1 || !sel2)
+                {
+                    swModel.ClearSelection2(true);
+                    return;
+                }
+
+                int mateError;
+                Mate2 mate = asmDoc.AddMate5(
+                    (int)swMateType_e.swMateCOINCIDENT,
+                    (int)swMateAlign_e.swMateAlignALIGNED,
+                    false,
+                    0, 0, 0, 0, 0, 0, 0, 0,
+                    false,
+                    false,
+                    0,
+                    out mateError);
+
+                swModel.ClearSelection2(true);
+
+                if (mateError != (int)swAddMateError_e.swAddMateError_NoError)
+                {
+                    Debug.WriteLine("Coincident mate failed: " + mateError);
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine("Failed to add coincident mate: " + ex);
+            }
+        }
+
+        /// <summary>
+        /// Ensure that the screw model is loaded in memory so AddComponent5 can use it.
+        /// Returns the loaded IModelDoc2 or null on failure.
+        /// </summary>
+        private static IModelDoc2 EnsureScrewModelLoaded(
+            SldWorks swApp,
+            string filePath,
+            out int errors,
+            out int warnings)
+        {
+            errors = 0;
+            warnings = 0;
+
+            if (string.IsNullOrWhiteSpace(filePath))
+                return null;
+
+            // Already open? (try full path first)
+            IModelDoc2 doc = swApp.GetOpenDocumentByName(filePath) as IModelDoc2;
+            if (doc != null)
+                return doc;
+
+            // Try by file name only (in case user has it open from another folder)
+            string fileNameOnly = Path.GetFileName(filePath);
+            if (!string.IsNullOrEmpty(fileNameOnly))
+            {
+                doc = swApp.GetOpenDocumentByName(fileNameOnly) as IModelDoc2;
+                if (doc != null)
+                    return doc;
+            }
+
+            // Open invisibly as a PART
+            bool wasVisible = swApp.GetDocumentVisible((int)swDocumentTypes_e.swDocPART);
+            swApp.DocumentVisible(false, (int)swDocumentTypes_e.swDocPART);
+
+            doc = swApp.OpenDoc6(
+                filePath,
+                (int)swDocumentTypes_e.swDocPART,
+                (int)swOpenDocOptions_e.swOpenDocOptions_Silent,
+                "",
+                ref errors,
+                ref warnings) as IModelDoc2;
+
+            // Restore visibility flag
+            swApp.DocumentVisible(wasVisible, (int)swDocumentTypes_e.swDocPART);
+
+            return doc;
         }
 
         /// <summary>
@@ -775,51 +1222,5 @@ namespace SW2026RibbonAddin.Commands
             v[1] /= n;
             v[2] /= n;
         }
-
-        /// <summary>
-        /// Ensure that the screw model is loaded in memory so AddComponent5 can use it.
-        /// Returns the loaded IModelDoc2 or null on failure.
-        /// </summary>
-        private static IModelDoc2 EnsureScrewModelLoaded(SldWorks swApp, string filePath,
-            out int errors, out int warnings)
-        {
-            errors = 0;
-            warnings = 0;
-
-            if (string.IsNullOrWhiteSpace(filePath))
-                return null;
-
-            // Already open? (try full path first)
-            IModelDoc2 doc = swApp.GetOpenDocumentByName(filePath) as IModelDoc2;
-            if (doc != null)
-                return doc;
-
-            // Try by file name only (in case user has it open from another folder)
-            string fileNameOnly = Path.GetFileName(filePath);
-            if (!string.IsNullOrEmpty(fileNameOnly))
-            {
-                doc = swApp.GetOpenDocumentByName(fileNameOnly) as IModelDoc2;
-                if (doc != null)
-                    return doc;
-            }
-
-            // Open invisibly as a PART
-            bool wasVisible = swApp.GetDocumentVisible((int)swDocumentTypes_e.swDocPART);
-            swApp.DocumentVisible(false, (int)swDocumentTypes_e.swDocPART);
-
-            doc = swApp.OpenDoc6(
-                filePath,
-                (int)swDocumentTypes_e.swDocPART,
-                (int)swOpenDocOptions_e.swOpenDocOptions_Silent,
-                "",
-                ref errors,
-                ref warnings) as IModelDoc2;
-
-            // Restore visibility flag
-            swApp.DocumentVisible(wasVisible, (int)swDocumentTypes_e.swDocPART);
-
-            return doc;
-        }
-
     }
 }
