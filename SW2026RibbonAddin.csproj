@@ -81,19 +81,17 @@
     <Compile Include="Addin.cs" />
     <Compile Include="ArabicNoteCodec.cs" />
     <Compile Include="ArabicTextUtils.cs" />
-    <Compile Include="Commands\AddFarsiNoteButton.cs" />
-    <Compile Include="Commands\AddinContext.cs" />
-    <Compile Include="Commands\CombineDwgButton.cs" />
-    <Compile Include="Commands\DwgButton.cs" />
-    <Compile Include="Commands\EditSelectedFarsiNoteButton.cs" />
-    <Compile Include="Commands\HelloButton.cs" />
-    <Compile Include="Commands\IMehdiRibbonButton.cs" />
-    <Compile Include="Commands\InsertStdScrewButton.cs" />
-    <Compile Include="Commands\LaserCutButton.cs" />
-    <Compile Include="Commands\RibbonSection.cs" />
-    <Compile Include="Commands\SheetMetalAssemblyHelper.cs" />
-    <Compile Include="Commands\StdScrewInserter.cs" />
-    <Compile Include="Commands\UpdateFarsiNotesButton.cs" />
+    <Compile Include="Commands\farsi\AddFarsiNoteButton.cs" />
+    <Compile Include="Commands\general\AddinContext.cs" />
+    <Compile Include="Commands\dwg\CombineDwgButton.cs" />
+    <Compile Include="Commands\dwg\DwgButton.cs" />
+    <Compile Include="Commands\farsi\EditSelectedFarsiNoteButton.cs" />
+    <Compile Include="Commands\general\HelloButton.cs" />
+    <Compile Include="Commands\general\IMehdiRibbonButton.cs" />
+    <Compile Include="Commands\dwg\LaserCutButton.cs" />
+    <Compile Include="Commands\general\RibbonSection.cs" />
+    <Compile Include="Commands\dwg\SheetMetalAssemblyHelper.cs" />
+    <Compile Include="Commands\farsi\UpdateFarsiNotesButton.cs" />
     <Compile Include="Forms\AssemblyQuantityForm.cs">
       <SubType>Form</SubType>
     </Compile>
@@ -146,6 +144,9 @@
   <ItemGroup>
     <EmbeddedResource Include="Resources\clone_20.png" />
     <EmbeddedResource Include="Resources\clone_32.png" />
+  </ItemGroup>
+  <ItemGroup>
+    <Folder Include="Commands\part_creation\" />
   </ItemGroup>
   <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets" />
   <PropertyGroup>
