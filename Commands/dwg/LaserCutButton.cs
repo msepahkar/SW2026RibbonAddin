@@ -116,6 +116,108 @@ namespace SW2026RibbonAddin.Commands
             public double Height;
         }
 
+
+        /// <summary>
+        /// Try to determine plate thickness (in mm) from the DWG file name
+        /// produced by CombineDwg, e.g. "thickness_2_5.dwg".
+        /// </summary>
+        private static double? TryGetPlateThicknessFromFileName(string sourceDwgPath)
+        {
+            if (string.IsNullOrWhiteSpace(sourceDwgPath))
+                return null;
+
+            string fileName = Path.GetFileNameWithoutExtension(sourceDwgPath);
+            if (string.IsNullOrWhiteSpace(fileName))
+                return null;
+
+            const string prefix = "thickness_";
+            int idx = fileName.IndexOf(prefix, StringComparison.OrdinalIgnoreCase);
+            if (idx < 0)
+                return null;
+
+            string token = fileName.Substring(idx + prefix.Length);
+            if (string.IsNullOrWhiteSpace(token))
+                return null;
+
+            // Combined DWGs are produced with decimal separators replaced by '_',
+            // e.g. thickness_2_5.dwg for a 2.5 mm plate.
+            token = token.Replace('_', '.');
+
+            if (double.TryParse(token, NumberStyles.Float, CultureInfo.InvariantCulture, out double value) &&
+                value > 0.0 && value < 1000.0)
+            {
+                return value;
+            }
+
+            return null;
+        }
+
+        /// <summary>
+        /// Try to determine plate thickness (in mm) by parsing MText labels
+        /// like "Plate: X mm" that CombineDwg writes under each plate.
+        /// </summary>
+        private static double? TryGetPlateThicknessFromMText(CadDocument doc)
+        {
+            if (doc == null)
+                return null;
+
+            try
+            {
+                foreach (var ent in doc.Entities)
+                {
+                    if (ent is MText mtext)
+                    {
+                        string text = mtext.Value;
+                        if (string.IsNullOrWhiteSpace(text))
+                            continue;
+
+                        int idx = text.IndexOf("Plate:", StringComparison.OrdinalIgnoreCase);
+                        if (idx < 0)
+                            continue;
+
+                        string after = text.Substring(idx + "Plate:".Length).Trim();
+
+                        // Remove trailing "mm" if present.
+                        int mmIdx = after.IndexOf("mm", StringComparison.OrdinalIgnoreCase);
+                        if (mmIdx >= 0)
+                        {
+                            after = after.Substring(0, mmIdx).Trim();
+                        }
+
+                        if (string.IsNullOrWhiteSpace(after))
+                            continue;
+
+                        // Normalise decimal separator and parse using invariant culture.
+                        after = after.Replace(',', '.');
+
+                        if (double.TryParse(after, NumberStyles.Float, CultureInfo.InvariantCulture, out double value) &&
+                            value > 0.0 && value < 1000.0)
+                        {
+                            return value;
+                        }
+                    }
+                }
+            }
+            catch
+            {
+                // Best-effort only; ignore and fall back to defaults.
+            }
+
+            return null;
+        }
+
+        /// <summary>
+        /// Get plate thickness in mm from either the DWG file name or the MText labels.
+        /// </summary>
+        private static double? TryGetPlateThicknessMm(CadDocument doc, string sourceDwgPath)
+        {
+            var fromFileName = TryGetPlateThicknessFromFileName(sourceDwgPath);
+            if (fromFileName.HasValue)
+                return fromFileName;
+
+            return TryGetPlateThicknessFromMText(doc);
+        }
+
         /// <summary>
         /// Reads a combined DWG (one produced by CombineDwg) and nests all plate blocks
         /// P_*_Q{qty} onto as many sheets as required using an optimized rectangle-based algorithm.
@@ -158,9 +260,18 @@ namespace SW2026RibbonAddin.Commands
             }
 
             // Sheet framing and spacing
-            const double sheetMargin = 10.0; // visible border (mm)
-            const double partGap = 5.0;      // gap between parts (mm)
-            const double sheetGap = 50.0;    // distance between sheets (mm)
+            const double sheetMargin = 10.0;    // visible border (mm)
+            const double defaultPartGap = 5.0;  // minimum nominal gap between parts (mm)
+            const double sheetGap = 50.0;       // distance between sheets (mm)
+
+            // Determine plate thickness (mm) if possible and ensure the gap
+            // between plates is never smaller than the plate thickness.
+            double partGap = defaultPartGap;
+            double? plateThicknessMm = TryGetPlateThicknessMm(doc, sourceDwgPath);
+            if (plateThicknessMm.HasValue && plateThicknessMm.Value > partGap)
+            {
+                partGap = plateThicknessMm.Value;
+            }
 
             // We never place plates closer than this to the sheet border.
             // (border + 2 * gap gives clearance so nothing crosses the border)
