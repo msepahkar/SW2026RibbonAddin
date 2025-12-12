@@ -92,6 +92,7 @@
     <Compile Include="Commands\general\RibbonSection.cs" />
     <Compile Include="Commands\dwg\SheetMetalAssemblyHelper.cs" />
     <Compile Include="Commands\farsi\UpdateFarsiNotesButton.cs" />
+    <Compile Include="Commands\part_creation\ClonePartButton.cs" />
     <Compile Include="Forms\AssemblyQuantityForm.cs">
       <SubType>Form</SubType>
     </Compile>
@@ -145,9 +146,7 @@
     <EmbeddedResource Include="Resources\clone_20.png" />
     <EmbeddedResource Include="Resources\clone_32.png" />
   </ItemGroup>
-  <ItemGroup>
-    <Folder Include="Commands\part_creation\" />
-  </ItemGroup>
+  <ItemGroup />
   <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets" />
   <PropertyGroup>
     <PostBuildEvent>
