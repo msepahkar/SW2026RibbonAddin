@@ -5,7 +5,7 @@
         General = 0,
         FarsiNotes = 10,
         DWG = 20,
-        Part_Creation = 30,
+        PartCreation = 30,
         // Add more sections here in the future
     }
 }

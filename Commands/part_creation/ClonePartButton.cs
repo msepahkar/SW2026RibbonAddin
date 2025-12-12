@@ -1,36 +1,24 @@
 ﻿using System;
-using System.Collections.Generic;
 using System.Diagnostics;
+using System.IO;
 using System.Windows.Forms;
 using SolidWorks.Interop.sldworks;
 using SolidWorks.Interop.swconst;
 
 namespace SW2026RibbonAddin.Commands
 {
-    /// <summary>
-    /// Ribbon button that clones the active PART document into a new part:
-    /// - Reads all items (features) from the active part's feature tree
-    /// - Creates a new part document from the default part template
-    /// - Copies the features into the new part one by one
-    /// </summary>
     internal sealed class ClonePartButton : IMehdiRibbonButton
     {
         public string Id => "ClonePart";
-
         public string DisplayName => "Clone\nPart";
-        public string Tooltip =>
-            "Create a new part and copy all features from the active part into it.";
-        public string Hint => "Clone the active part into a new document";
+        public string Tooltip => "Create a new copy of the active part (same feature tree, new file).";
+        public string Hint => "Clone the active part into a new part file";
 
-        // Reuse an existing icon for now; you can swap to dedicated icons later
-        public string SmallIconFile => "hello_20.png";
-        public string LargeIconFile => "hello_32.png";
+        public string SmallIconFile => "clone_20.png";
+        public string LargeIconFile => "clone_32.png";
 
-        // Put this in the new section we added
-        public RibbonSection Section => RibbonSection.PartTools;
+        public RibbonSection Section => RibbonSection.PartCreation;
         public int SectionOrder => 0;
-
-        // Treat as a free feature
         public bool IsFreeFeature => true;
 
         public void Execute(AddinContext context)
@@ -53,14 +41,14 @@ namespace SW2026RibbonAddin.Commands
                 if (model.GetType() != (int)swDocumentTypes_e.swDocPART)
                 {
                     MessageBox.Show(
-                        "Clone Part is only available when a PART document is active.",
+                        "Clone Part is only available for part documents.",
                         "Clone Part",
                         MessageBoxButtons.OK,
                         MessageBoxIcon.Information);
                     return;
                 }
 
-                CloneActivePart(swApp, (IPartDoc)model);
+                ClonePartUsingSaveAsCopy(swApp, (IPartDoc)model);
             }
             catch (Exception ex)
             {
@@ -91,136 +79,114 @@ namespace SW2026RibbonAddin.Commands
             }
         }
 
-        /// <summary>
-        /// Implementation of:
-        /// - read all items in the tree of the active part
-        /// - create a new part
-        /// - add all items one by one to the tree of the new part
-        /// </summary>
-        private static void CloneActivePart(SldWorks swApp, IPartDoc srcPart)
+        private static void ClonePartUsingSaveAsCopy(SldWorks swApp, IPartDoc srcPart)
         {
             if (swApp == null || srcPart == null)
                 return;
 
             var srcModel = (IModelDoc2)srcPart;
+            string srcPath = srcModel.GetPathName();
 
-            // 1) Read all items (features) from the feature tree
-            var features = new List<IFeature>();
-            var feat = srcModel.FirstFeature();
-
-            while (feat != null)
-            {
-                features.Add(feat);
-                feat = feat.GetNextFeature();
-            }
-
-            if (features.Count == 0)
+            if (string.IsNullOrWhiteSpace(srcPath))
             {
                 MessageBox.Show(
-                    "The active part does not contain any features to clone.",
+                    "Please save the part once before cloning it.",
                     "Clone Part",
                     MessageBoxButtons.OK,
                     MessageBoxIcon.Information);
                 return;
             }
 
-            // 2) Create a new part based on the user’s default part template
-            string template = swApp.GetUserPreferenceStringValue(
-                (int)swUserPreferenceStringValue_e.swDefaultTemplatePart);
+            string folder = Path.GetDirectoryName(srcPath) ?? "";
+            string baseName = Path.GetFileNameWithoutExtension(srcPath) ?? "Part";
+            string ext = Path.GetExtension(srcPath);
+            string defaultCloneName = baseName + "_Clone" + ext;
 
-            if (string.IsNullOrWhiteSpace(template))
+            using (var dlg = new SaveFileDialog())
             {
-                MessageBox.Show(
-                    "SOLIDWORKS default part template is not configured.\r\n" +
-                    "Set it in Tools > Options > System Options > Default Templates.",
-                    "Clone Part",
-                    MessageBoxButtons.OK,
-                    MessageBoxIcon.Warning);
-                return;
-            }
+                dlg.Title = "Clone Part - choose file name";
+                dlg.InitialDirectory = folder;
+                dlg.Filter = "SOLIDWORKS Part (*.sldprt)|*.sldprt|All files (*.*)|*.*";
+                dlg.FileName = defaultCloneName;
 
-            var newModel = (IModelDoc2)swApp.NewDocument(
-                template,
-                (int)swDwgPaperSizes_e.swDwgPaperA4, // ignored for parts but required by signature
-                0,
-                0);
+                if (dlg.ShowDialog() != DialogResult.OK)
+                    return;
 
-            if (newModel == null)
-            {
-                MessageBox.Show(
-                    "Failed to create the new part document.",
-                    "Clone Part",
-                    MessageBoxButtons.OK,
-                    MessageBoxIcon.Error);
-                return;
-            }
+                string clonePath = dlg.FileName;
 
-            string srcTitle = srcModel.GetTitle();
-            string newTitle = newModel.GetTitle();
+                // 1) Save a copy of the current part
+                int saveErr = srcModel.SaveAs3(
+                    clonePath,
+                    (int)swSaveAsVersion_e.swSaveAsCurrentVersion,
+                    (int)swSaveAsOptions_e.swSaveAsOptions_Copy);
 
-            try
-            {
-                // 3) Add all items (features) one by one to the new part
-                foreach (var f in features)
+                // SaveAs3 returns 0 on success
+                if (saveErr != 0)
                 {
-                    string typeName = f.GetTypeName2();
-
-                    // Optionally skip special “folder” features such as History
-                    if (ShouldSkipFeature(typeName))
-                        continue;
-
-                    srcModel.ClearSelection2(true);
-
-                    // Select the feature in the source tree
-                    if (!f.Select2(false, -1))
-                        continue;
-
-                    // Copy from source
-                    srcModel.EditCopy();
-
-                    // Paste into target
-                    int actErr = 0;
-                    swApp.ActivateDoc2(newTitle, false, ref actErr);
-                    newModel.EditPaste();
-
-                    // Reactivate source for the next feature
-                    swApp.ActivateDoc2(srcTitle, false, ref actErr);
+                    MessageBox.Show(
+                        "Failed to create cloned part.\r\n\r\nError code: " + saveErr,
+                        "Clone Part",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Error);
+                    return;
                 }
 
-                // Leave the cloned part active
+                // 2) Open the cloned part
+                int openErrors = 0;
+                int openWarnings = 0;
+
+                var newModel = (IModelDoc2)swApp.OpenDoc6(
+                    clonePath,
+                    (int)swDocumentTypes_e.swDocPART,
+                    (int)swOpenDocOptions_e.swOpenDocOptions_Silent,
+                    "",
+                    ref openErrors,
+                    ref openWarnings);
+
+                if (newModel == null || openErrors != 0)
                 {
-                    int actErr = 0;
-                    swApp.ActivateDoc2(newTitle, false, ref actErr);
+                    MessageBox.Show(
+                        "Clone was saved but could not be opened.\r\n\r\nError code: " + openErrors,
+                        "Clone Part",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Error);
+                    return;
                 }
-            }
-            catch (Exception ex)
-            {
-                Debug.WriteLine(ex);
-                MessageBox.Show(
-                    "Error while cloning part:\r\n\r\n" + ex.Message,
-                    "Clone Part",
-                    MessageBoxButtons.OK,
-                    MessageBoxIcon.Error);
-            }
-        }
 
-        /// <summary>
-        /// Minimal filter to avoid copying non‑geometry “folder” features.
-        /// You can expand this list as needed once you see the actual type names you get.
-        /// </summary>
-        private static bool ShouldSkipFeature(string typeName)
-        {
-            if (string.IsNullOrEmpty(typeName))
-                return true;
+                // 3) Force the clone to be a NON‑Toolbox part and save once
+                try
+                {
+                    var newExt = (ModelDocExtension)newModel.Extension;
 
-            // Example minimal filtering
-            switch (typeName)
-            {
-                case "HistoryFolder":
-                    return true;
+                    // swNotAToolboxPart (0) = Not a Toolbox part
+                    newExt.ToolboxPartType = (int)swToolBoxPartType_e.swNotAToolboxPart;
 
-                default:
-                    return false;
+                    int saveErrors2 = 0;
+                    int saveWarnings2 = 0;
+                    bool saveOk = newModel.Save3(
+                        (int)swSaveAsOptions_e.swSaveAsOptions_Silent,
+                        ref saveErrors2,
+                        ref saveWarnings2);
+
+                    if (!saveOk || saveErrors2 != 0)
+                    {
+                        MessageBox.Show(
+                            "Clone was created but could not be fully de‑linked from Toolbox.\r\n\r\nSave error code: " +
+                            saveErrors2,
+                            "Clone Part",
+                            MessageBoxButtons.OK,
+                            MessageBoxIcon.Warning);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    // If ToolboxPartType is not available for some reason, we just log and continue
+                    Debug.WriteLine(ex);
+                }
+
+                // 4) Activate the cloned part
+                int actErr = 0;
+                swApp.ActivateDoc2(newModel.GetTitle(), false, ref actErr);
             }
         }
     }
