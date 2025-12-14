@@ -95,7 +95,6 @@ namespace SW2026RibbonAddin
                 InitializeLicenseState();
                 InitializeButtons();
                 CreateUI();
-                CreateTopLevelMenu();
 
                 _swApp.CommandOpenPreNotify += OnCommandOpenPreNotify;
 
@@ -114,12 +113,6 @@ namespace SW2026RibbonAddin
             {
                 if (_swApp != null)
                     _swApp.CommandOpenPreNotify -= OnCommandOpenPreNotify;
-            }
-            catch { }
-
-            try
-            {
-                RemoveTopLevelMenu();   // <‑‑ new: remove "Mehdi" menu
             }
             catch { }
 
@@ -341,89 +334,6 @@ namespace SW2026RibbonAddin
             catch (Exception ex)
             {
                 Debug.WriteLine("CreateUI - tab creation failed: " + ex.Message);
-            }
-        }
-
-        /// <summary>
-        /// Create a top‑level "Mehdi" pull‑down menu and fill it with the same
-        /// commands as the ribbon (OnCmd0…OnCmd15).
-        /// </summary>
-        private void CreateTopLevelMenu()
-        {
-            try
-            {
-                if (_swApp == null)
-                    return;
-
-                // Show the menu when PART, ASSEMBLY, or DRAWING is active.
-                // If you also want it with no document open, you can add swDocNONE here.
-                int[] docTypes =
-                {
-            (int)swDocumentTypes_e.swDocPART,
-            (int)swDocumentTypes_e.swDocASSEMBLY,
-            (int)swDocumentTypes_e.swDocDRAWING
-        };
-
-                foreach (int docType in docTypes)
-                {
-                    // Create root "Mehdi" menu. Safe to call more than once.
-                    _swApp.AddMenu(docType, MEHDI_MENU_CAPTION, MEHDI_MENU_POSITION);
-
-                    // One menu item per ribbon button, reusing OnCmdN / OnCmdNEnable
-                    for (int slot = 0; slot < _buttons.Count && slot < MAX_CMD_SLOTS; slot++)
-                    {
-                        var button = _buttons[slot];
-
-                        string menuItem = $"{button.DisplayName}@{MEHDI_MENU_CAPTION}";
-                        string callback = $"OnCmd{slot}";
-                        string enable = $"OnCmd{slot}Enable";
-
-                        // Use AddMenuItem3, not 5 – 5 is flaky in some versions :contentReference[oaicite:1]{index=1}
-                        _swApp.AddMenuItem3(
-                            docType,
-                            _cookie,
-                            menuItem,
-                            -1,              // append at end of Mehdi menu
-                            callback,
-                            enable,
-                            button.Tooltip,  // status bar hint
-                            ""               // no bitmap
-                        );
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                Debug.WriteLine("CreateTopLevelMenu error: " + ex);
-            }
-        }
-
-        /// <summary>
-        /// Remove the top‑level "Mehdi" menu on disconnect.
-        /// </summary>
-        private void RemoveTopLevelMenu()
-        {
-            if (_swApp == null)
-                return;
-
-            try
-            {
-                int[] docTypes =
-                {
-            (int)swDocumentTypes_e.swDocPART,
-            (int)swDocumentTypes_e.swDocASSEMBLY,
-            (int)swDocumentTypes_e.swDocDRAWING
-        };
-
-                foreach (int docType in docTypes)
-                {
-                    // Signature is RemoveMenu(DocType, MenuCaption, DocumentName) :contentReference[oaicite:2]{index=2}
-                    _swApp.RemoveMenu(docType, MEHDI_MENU_CAPTION, "");
-                }
-            }
-            catch (Exception ex)
-            {
-                Debug.WriteLine("RemoveTopLevelMenu error: " + ex);
             }
         }
 
