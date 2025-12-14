@@ -48,6 +48,11 @@ namespace SW2026RibbonAddin
         private const string MAIN_CMD_GROUP_TITLE = "Mehdi Tools";
         private const string MAIN_CMD_GROUP_TOOLTIP = "Custom tools";
 
+        // Top‑level classic menu (root “Mehdi” menu)
+        private const string MEHDI_MENU_CAPTION = "Mehdi";
+        // 5 = between Tools and Window, per usual SolidWorks examples :contentReference[oaicite:0]{index=0}
+        private const int MEHDI_MENU_POSITION = 5;
+
         // Farsi note command strings (legacy text)
         private const string HELLO_CMD_NAME = "Hello";
         private const string HELLO_CMD_TOOLTIP = "Show a hello message";
