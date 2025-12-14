@@ -154,11 +154,11 @@ namespace SW2026RibbonAddin.Commands
                 }
 
                 // 3) Force the clone to be a NON‑Toolbox part and save once
+                // 3) Make sure the cloned file is a *normal* (non‑Toolbox) part
                 try
                 {
+                    // First clear the flag in the in‑memory document (current session)
                     var newExt = (ModelDocExtension)newModel.Extension;
-
-                    // swNotAToolboxPart (0) = Not a Toolbox part
                     newExt.ToolboxPartType = (int)swToolBoxPartType_e.swNotAToolboxPart;
 
                     int saveErrors2 = 0;
@@ -171,16 +171,20 @@ namespace SW2026RibbonAddin.Commands
                     if (!saveOk || saveErrors2 != 0)
                     {
                         MessageBox.Show(
-                            "Clone was created but could not be fully de‑linked from Toolbox.\r\n\r\nSave error code: " +
-                            saveErrors2,
+                            "Clone was created but could not be fully de‑linked from Toolbox.\r\n\r\n" +
+                            "Save error code: " + saveErrors2,
                             "Clone Part",
                             MessageBoxButtons.OK,
                             MessageBoxIcon.Warning);
                     }
+
+                    // Then also clear the Toolbox flag in the file header via Document Manager,
+                    // so the part stays a normal part when moved to another machine.
+                    ToolboxFlagHelper.ClearToolboxFlagOnDisk(clonePath);
                 }
                 catch (Exception ex)
                 {
-                    // If ToolboxPartType is not available for some reason, we just log and continue
+                    // If anything goes wrong, log it but don't crash the add‑in
                     Debug.WriteLine(ex);
                 }
 
