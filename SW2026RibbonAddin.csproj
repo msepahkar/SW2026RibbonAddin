@@ -97,11 +97,20 @@
     <Compile Include="Commands\dwg\SheetMetalAssemblyHelper.cs" />
     <Compile Include="Commands\farsi\UpdateFarsiNotesButton.cs" />
     <Compile Include="Commands\part_creation\ClonePartButton.cs" />
+    <Compile Include="Commands\part_creation\CreateFastenerReferenceButton.cs" />
+    <Compile Include="Commands\part_creation\FastenerMetadata.cs" />
+    <Compile Include="Commands\part_creation\SetFastenerPropertiesButton.cs" />
     <Compile Include="Commands\part_creation\ToolboxFlagHelper.cs" />
     <Compile Include="Forms\AssemblyQuantityForm.cs">
       <SubType>Form</SubType>
     </Compile>
     <Compile Include="Forms\FarsiNoteForm.cs">
+      <SubType>Form</SubType>
+    </Compile>
+    <Compile Include="Forms\FastenerPropertiesForm.cs">
+      <SubType>Form</SubType>
+    </Compile>
+    <Compile Include="Forms\FastenerReferenceTypeForm.cs">
       <SubType>Form</SubType>
     </Compile>
     <Compile Include="Forms\MouseGhostForm.cs">
