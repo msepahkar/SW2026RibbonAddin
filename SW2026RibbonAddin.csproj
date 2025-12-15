@@ -160,7 +160,12 @@
     <EmbeddedResource Include="Resources\clone_20.png" />
     <EmbeddedResource Include="Resources\clone_32.png" />
   </ItemGroup>
-  <ItemGroup />
+  <ItemGroup>
+    <EmbeddedResource Include="Resources\custom_properties_20.png" />
+    <EmbeddedResource Include="Resources\custom_properties_32.png" />
+    <EmbeddedResource Include="Resources\reference_geometry_20.png" />
+    <EmbeddedResource Include="Resources\reference_geometry_32.png" />
+  </ItemGroup>
   <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets" />
   <PropertyGroup>
     <PostBuildEvent>

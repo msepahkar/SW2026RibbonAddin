@@ -1,5 +1,7 @@
 ﻿using System;
 using System.Globalization;
+using System.Text;
+using System.Text.RegularExpressions;
 using SolidWorks.Interop.sldworks;
 using SolidWorks.Interop.swconst;
 
@@ -30,8 +32,8 @@ namespace SW2026RibbonAddin
     }
 
     /// <summary>
-    /// Helper to read/write fastener custom properties and to infer defaults
-    /// from filename / ISO standard.
+    /// Helper to read/write fastener custom properties and infer defaults
+    /// from filename / Toolbox naming.
     /// </summary>
     internal static class FastenerPropertyHelper
     {
@@ -57,14 +59,14 @@ namespace SW2026RibbonAddin
                 Material = SafeGetCustomInfo(model, "Material")
             };
 
-            // 1) Infer from filename (PartNumber, Standard, size / length / strength)
+            // Infer from filename (Toolbox name or our naming)
             var fileName = TryGetFileNameWithoutExtension(model);
             if (!string.IsNullOrWhiteSpace(fileName))
             {
                 InferFromFileName(fileName, values);
             }
 
-            // 2) Infer Family from Standard if still unknown
+            // Infer Family from Standard if still unknown
             if (string.IsNullOrWhiteSpace(values.Family) && !string.IsNullOrWhiteSpace(values.Standard))
             {
                 values.Family = GuessFamilyFromStandard(values.Standard);
@@ -76,7 +78,7 @@ namespace SW2026RibbonAddin
                 values.Family = "Bolt";
             }
 
-            // 3) Default type based on standard
+            // Default type based on standard
             if (values.Family.Equals("Bolt", StringComparison.OrdinalIgnoreCase) &&
                 string.IsNullOrWhiteSpace(values.BoltType) &&
                 !string.IsNullOrWhiteSpace(values.Standard))
@@ -96,7 +98,7 @@ namespace SW2026RibbonAddin
                 values.NutType = "HexNut";
             }
 
-            // 4) Default strength class for bolts / nuts
+            // Default strength class for bolts / nuts
             if (string.IsNullOrWhiteSpace(values.StrengthClass) &&
                 (values.Family.Equals("Bolt", StringComparison.OrdinalIgnoreCase) ||
                  values.Family.Equals("Nut", StringComparison.OrdinalIgnoreCase)))
@@ -104,7 +106,7 @@ namespace SW2026RibbonAddin
                 values.StrengthClass = GuessDefaultStrengthClass(values.Standard);
             }
 
-            // 5) Auto-suggest description if missing
+            // Auto-suggest description if missing
             if (string.IsNullOrWhiteSpace(values.Description))
             {
                 values.Description = BuildDescription(values);
@@ -121,12 +123,13 @@ namespace SW2026RibbonAddin
             var ext = model.Extension as ModelDocExtension;
             if (ext == null) return;
 
+            // NOTE: CustomPropertyManager is an indexer in this interop
             var pm = ext.CustomPropertyManager[""];
             if (pm == null) return;
 
             // Numeric values stored as text but parseable
             AddOrUpdate(pm, "PartNumber", values.PartNumber);
-            AddOrUpdate(pm, "Standard", values.Standard);
+            AddOrUpdate(pm, "Standard", CanonicalizeStandard(values.Standard));
             AddOrUpdate(pm, "NominalDiameter", NormalizeNumeric(values.NominalDiameter));
             AddOrUpdate(pm, "Length", NormalizeNumeric(values.Length));
             AddOrUpdate(pm, "StrengthClass", values.StrengthClass);
@@ -169,25 +172,26 @@ namespace SW2026RibbonAddin
             if (v == null) return string.Empty;
 
             var family = v.Family ?? string.Empty;
-            var sb = new System.Text.StringBuilder();
+            var sb = new StringBuilder();
 
-            if (!string.IsNullOrWhiteSpace(v.Standard))
+            var std = CanonicalizeStandard(v.Standard);
+            if (!string.IsNullOrWhiteSpace(std))
             {
-                sb.Append(v.Standard.Trim());
+                sb.Append(std.Trim());
                 sb.Append(' ');
             }
 
             if (!string.IsNullOrWhiteSpace(v.NominalDiameter))
             {
                 sb.Append('M');
-                sb.Append(v.NominalDiameter.Trim());
+                sb.Append(NormalizeNumeric(v.NominalDiameter));
             }
 
             if (family.Equals("Bolt", StringComparison.OrdinalIgnoreCase) &&
                 !string.IsNullOrWhiteSpace(v.Length))
             {
                 sb.Append('x');
-                sb.Append(v.Length.Trim());
+                sb.Append(NormalizeNumeric(v.Length));
             }
 
             if (!string.IsNullOrWhiteSpace(v.StrengthClass) &&
@@ -216,6 +220,60 @@ namespace SW2026RibbonAddin
             return sb.ToString().Trim();
         }
 
+        /// <summary>
+        /// Builds the standard file name according to our convention:
+        /// Bolts:  PartNumber_Standard_MdaxL-Strength
+        /// Washers: PartNumber_Standard_Mda
+        /// Nuts:   PartNumber_Standard_Mda-Strength
+        /// </summary>
+        public static string BuildStandardFileName(FastenerInitialValues v, string currentExtension)
+        {
+            if (v == null) throw new ArgumentNullException(nameof(v));
+
+            if (string.IsNullOrWhiteSpace(v.PartNumber) ||
+                string.IsNullOrWhiteSpace(v.Standard) ||
+                string.IsNullOrWhiteSpace(v.NominalDiameter))
+            {
+                // Not enough information to build a standard file name
+                return null;
+            }
+
+            var ext = string.IsNullOrWhiteSpace(currentExtension)
+                ? ".sldprt"
+                : currentExtension;
+
+            var family = v.Family ?? "Bolt";
+
+            var sizeToken = "M" + NormalizeNumeric(v.NominalDiameter);
+            var strengthToken = string.Empty;
+
+            if (family.Equals("Bolt", StringComparison.OrdinalIgnoreCase))
+            {
+                if (!string.IsNullOrWhiteSpace(v.Length))
+                {
+                    sizeToken += "x" + NormalizeNumeric(v.Length);
+                }
+
+                if (!string.IsNullOrWhiteSpace(v.StrengthClass))
+                {
+                    strengthToken = "-" + v.StrengthClass.Trim();
+                }
+            }
+            else if (family.Equals("Nut", StringComparison.OrdinalIgnoreCase))
+            {
+                if (!string.IsNullOrWhiteSpace(v.StrengthClass))
+                {
+                    strengthToken = "-" + v.StrengthClass.Trim();
+                }
+            }
+            // Washers: M + nominal diameter only, no strength in file name.
+
+            var std = CanonicalizeStandard(v.Standard);
+            var partNumber = v.PartNumber.Trim();
+
+            return $"{partNumber}_{std}_{sizeToken}{strengthToken}{ext}";
+        }
+
         // ----------------- internal helpers -----------------
 
         private static void AddOrUpdate(ICustomPropertyManager pm, string name, string value)
@@ -225,9 +283,8 @@ namespace SW2026RibbonAddin
 
             value ??= string.Empty;
 
-            // 30 = swCustomInfoType_e.swCustomInfoText
-            // 1  = swCustomPropertyAddOption_e.swCustomPropertyReplaceValue
-            pm.Add3(name,
+            pm.Add3(
+                name,
                 (int)swCustomInfoType_e.swCustomInfoText,
                 value,
                 (int)swCustomPropertyAddOption_e.swCustomPropertyReplaceValue);
@@ -258,17 +315,94 @@ namespace SW2026RibbonAddin
         {
             if (string.IsNullOrWhiteSpace(fileName) || v == null) return;
 
-            // 411001-000100-00_ISO4017_M4x10-8.8
+            // 1) Our own naming format: PartNumber_Standard_M4x10-8.8
             var tokens = fileName.Split(new[] { '_' }, StringSplitOptions.RemoveEmptyEntries);
 
-            if (tokens.Length >= 1 && string.IsNullOrWhiteSpace(v.PartNumber))
-                v.PartNumber = tokens[0];
+            bool looksLikeOurNaming =
+                tokens.Length >= 2 &&
+                (tokens[1].StartsWith("ISO", StringComparison.OrdinalIgnoreCase) ||
+                 tokens[1].StartsWith("DIN", StringComparison.OrdinalIgnoreCase));
 
-            if (tokens.Length >= 2 && string.IsNullOrWhiteSpace(v.Standard))
-                v.Standard = tokens[1];
+            if (looksLikeOurNaming)
+            {
+                if (tokens.Length >= 1 && string.IsNullOrWhiteSpace(v.PartNumber))
+                    v.PartNumber = tokens[0];
 
-            if (tokens.Length >= 3)
-                ParseSizeToken(tokens[2], v);
+                if (tokens.Length >= 2 && string.IsNullOrWhiteSpace(v.Standard))
+                    v.Standard = CanonicalizeStandard(tokens[1]);
+
+                if (tokens.Length >= 3)
+                    ParseSizeToken(tokens[2], v);
+
+                return;
+            }
+
+            // 2) Toolbox naming format, e.g. "ISO 4017 - M 8 x 45 - N"
+            InferFromToolboxFileName(fileName, v);
+        }
+
+        // Handles Toolbox‑style names such as:
+        // "ISO 4017 - M8 x 45-N"
+        // "ISO 4032 - M8"
+        private static void InferFromToolboxFileName(string fileName, FastenerInitialValues v)
+        {
+            var name = fileName.Trim();
+
+            // Bolt pattern with M<size> x <length>
+            var boltRx = new Regex(
+                @"^(ISO|DIN)\s*([0-9\-]+)\s*-\s*M\s*([0-9]+(?:[.,][0-9]+)?)\s*x\s*([0-9]+(?:[.,][0-9]+)?)",
+                RegexOptions.IgnoreCase);
+
+            var m = boltRx.Match(name);
+            if (m.Success)
+            {
+                var stdPrefix = m.Groups[1].Value.ToUpperInvariant();
+                var stdNum = m.Groups[2].Value;
+                var dia = m.Groups[3].Value.Replace(',', '.');
+                var len = m.Groups[4].Value.Replace(',', '.');
+
+                if (string.IsNullOrWhiteSpace(v.Standard))
+                    v.Standard = stdPrefix + stdNum;
+
+                if (string.IsNullOrWhiteSpace(v.NominalDiameter))
+                    v.NominalDiameter = dia;
+
+                if (string.IsNullOrWhiteSpace(v.Length))
+                    v.Length = len;
+
+                if (string.IsNullOrWhiteSpace(v.Family))
+                    v.Family = "Bolt";
+
+                return;
+            }
+
+            // Nuts / washers often look like "ISO 4032 - M 8" or "ISO 7089 - 8.4"
+            var nutWashRx = new Regex(
+                @"^(ISO|DIN)\s*([0-9\-]+)\s*-\s*([0-9M][0-9.,]*)",
+                RegexOptions.IgnoreCase);
+
+            var m2 = nutWashRx.Match(name);
+            if (m2.Success)
+            {
+                var stdPrefix = m2.Groups[1].Value.ToUpperInvariant();
+                var stdNum = m2.Groups[2].Value;
+                var third = m2.Groups[3].Value.Trim();
+
+                if (string.IsNullOrWhiteSpace(v.Standard))
+                    v.Standard = stdPrefix + stdNum;
+
+                var diaText = third;
+                if (diaText.StartsWith("M", StringComparison.OrdinalIgnoreCase))
+                    diaText = diaText.Substring(1);
+
+                diaText = diaText.Replace(',', '.');
+
+                if (string.IsNullOrWhiteSpace(v.NominalDiameter))
+                    v.NominalDiameter = diaText;
+
+                if (string.IsNullOrWhiteSpace(v.Family))
+                    v.Family = GuessFamilyFromStandard(stdPrefix + stdNum);
+            }
         }
 
         // M4x10-8.8, M4-8.8 or M4
@@ -283,7 +417,7 @@ namespace SW2026RibbonAddin
                 return;
 
             int i = mIdx + 1;
-            var dia = new System.Text.StringBuilder();
+            var dia = new StringBuilder();
             while (i < t.Length && (char.IsDigit(t[i]) || t[i] == '.' || t[i] == ','))
             {
                 dia.Append(t[i]);
@@ -296,7 +430,7 @@ namespace SW2026RibbonAddin
             if (i < t.Length && (t[i] == 'x' || t[i] == 'X'))
             {
                 i++;
-                var len = new System.Text.StringBuilder();
+                var len = new StringBuilder();
                 while (i < t.Length && (char.IsDigit(t[i]) || t[i] == '.' || t[i] == ','))
                 {
                     len.Append(t[i]);
@@ -319,28 +453,34 @@ namespace SW2026RibbonAddin
             if (string.IsNullOrWhiteSpace(standard))
                 return null;
 
-            var std = standard.ToUpperInvariant();
+            var std = CanonicalizeStandard(standard);
 
             // Bolts / screws
-            if (std.StartsWith("ISO4014") || std.StartsWith("ISO4017") ||
-                std.StartsWith("ISO4762") || std.StartsWith("ISO7045") ||
-                std.StartsWith("ISO7046") || std.StartsWith("ISO2009") ||
-                std.StartsWith("ISO2010"))
+            if (std.StartsWith("ISO4014", StringComparison.OrdinalIgnoreCase) ||
+                std.StartsWith("ISO4017", StringComparison.OrdinalIgnoreCase) ||
+                std.StartsWith("ISO4762", StringComparison.OrdinalIgnoreCase) ||
+                std.StartsWith("ISO7045", StringComparison.OrdinalIgnoreCase) ||
+                std.StartsWith("ISO7046", StringComparison.OrdinalIgnoreCase) ||
+                std.StartsWith("ISO2009", StringComparison.OrdinalIgnoreCase) ||
+                std.StartsWith("ISO2010", StringComparison.OrdinalIgnoreCase))
             {
                 return "Bolt";
             }
 
             // Washers
-            if (std.StartsWith("ISO7089") || std.StartsWith("ISO7090") ||
-                std.StartsWith("ISO7092") || std.StartsWith("ISO7093") ||
-                std.StartsWith("ISO7094"))
+            if (std.StartsWith("ISO7089", StringComparison.OrdinalIgnoreCase) ||
+                std.StartsWith("ISO7090", StringComparison.OrdinalIgnoreCase) ||
+                std.StartsWith("ISO7092", StringComparison.OrdinalIgnoreCase) ||
+                std.StartsWith("ISO7093", StringComparison.OrdinalIgnoreCase) ||
+                std.StartsWith("ISO7094", StringComparison.OrdinalIgnoreCase))
             {
                 return "Washer";
             }
 
             // Nuts
-            if (std.StartsWith("ISO4032") || std.StartsWith("ISO4033") ||
-                std.StartsWith("ISO8673"))
+            if (std.StartsWith("ISO4032", StringComparison.OrdinalIgnoreCase) ||
+                std.StartsWith("ISO4033", StringComparison.OrdinalIgnoreCase) ||
+                std.StartsWith("ISO8673", StringComparison.OrdinalIgnoreCase))
             {
                 return "Nut";
             }
@@ -353,18 +493,21 @@ namespace SW2026RibbonAddin
             if (string.IsNullOrWhiteSpace(standard))
                 return null;
 
-            var std = standard.ToUpperInvariant();
+            var std = CanonicalizeStandard(standard);
 
-            if (std.StartsWith("ISO4014") || std.StartsWith("ISO4017"))
+            if (std.StartsWith("ISO4014", StringComparison.OrdinalIgnoreCase) ||
+                std.StartsWith("ISO4017", StringComparison.OrdinalIgnoreCase))
                 return "HexBolt";
 
-            if (std.StartsWith("ISO4762"))
+            if (std.StartsWith("ISO4762", StringComparison.OrdinalIgnoreCase))
                 return "SocketHeadCap";
 
-            if (std.StartsWith("ISO7045") || std.StartsWith("ISO2009"))
+            if (std.StartsWith("ISO7045", StringComparison.OrdinalIgnoreCase) ||
+                std.StartsWith("ISO2009", StringComparison.OrdinalIgnoreCase))
                 return "PanHead";
 
-            if (std.StartsWith("ISO7046") || std.StartsWith("ISO2010"))
+            if (std.StartsWith("ISO7046", StringComparison.OrdinalIgnoreCase) ||
+                std.StartsWith("ISO2010", StringComparison.OrdinalIgnoreCase))
                 return "Countersunk";
 
             return null;
@@ -375,15 +518,17 @@ namespace SW2026RibbonAddin
             if (string.IsNullOrWhiteSpace(standard))
                 return "8.8";
 
-            var std = standard.ToUpperInvariant();
+            var std = CanonicalizeStandard(standard);
 
-            if (std.StartsWith("ISO4014") || std.StartsWith("ISO4017") ||
-                std.StartsWith("ISO4762"))
+            if (std.StartsWith("ISO4014", StringComparison.OrdinalIgnoreCase) ||
+                std.StartsWith("ISO4017", StringComparison.OrdinalIgnoreCase) ||
+                std.StartsWith("ISO4762", StringComparison.OrdinalIgnoreCase))
             {
                 return "8.8";
             }
 
-            if (std.StartsWith("ISO4032") || std.StartsWith("ISO8673"))
+            if (std.StartsWith("ISO4032", StringComparison.OrdinalIgnoreCase) ||
+                std.StartsWith("ISO8673", StringComparison.OrdinalIgnoreCase))
             {
                 return "8";
             }
@@ -406,6 +551,16 @@ namespace SW2026RibbonAddin
 
             // Fallback: store as-is
             return raw;
+        }
+
+        private static string CanonicalizeStandard(string standard)
+        {
+            if (string.IsNullOrWhiteSpace(standard))
+                return string.Empty;
+
+            // Remove spaces so "ISO 4017" -> "ISO4017"
+            var s = standard.Trim().Replace(" ", string.Empty);
+            return s;
         }
     }
 }

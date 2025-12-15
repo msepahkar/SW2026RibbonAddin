@@ -16,8 +16,8 @@ namespace SW2026RibbonAddin.Commands
             "Create Mate_Axis / Mate_Underside / Mate_Bottom / Mate_Top reference geometry on the active fastener part.";
         public string Hint => "Create standardized reference geometry for bolts, washers, and nuts";
 
-        public string SmallIconFile => "std_screw_20.png";
-        public string LargeIconFile => "std_screw_32.png";
+        public string SmallIconFile => "reference_geometry_20.png";
+        public string LargeIconFile => "reference_geometry_32.png";
 
         public RibbonSection Section => RibbonSection.PartCreation;
         public int SectionOrder => 2;
@@ -32,9 +32,18 @@ namespace SW2026RibbonAddin.Commands
                 if (model == null)
                     return AddinContext.Disable;
 
-                return model.GetType() == (int)swDocumentTypes_e.swDocPART
-                    ? AddinContext.Enable
-                    : AddinContext.Disable;
+                if (model.GetType() != (int)swDocumentTypes_e.swDocPART)
+                    return AddinContext.Disable;
+
+                // Only allow on standalone (non‑Toolbox) parts
+                var ext = model.Extension as ModelDocExtension;
+                if (ext != null &&
+                    ext.ToolboxPartType != (int)swToolBoxPartType_e.swNotAToolboxPart)
+                {
+                    return AddinContext.Disable;
+                }
+
+                return AddinContext.Enable;
             }
             catch
             {
@@ -61,9 +70,23 @@ namespace SW2026RibbonAddin.Commands
                     return;
                 }
 
-                // Try to reuse Family from custom properties
+                // Ensure this is not a Toolbox library part (we only want standalone clones)
+                var ext = model.Extension as ModelDocExtension;
+                if (ext != null &&
+                    ext.ToolboxPartType != (int)swToolBoxPartType_e.swNotAToolboxPart)
+                {
+                    MessageBox.Show(
+                        "This part is still controlled by Toolbox.\r\n\r\n" +
+                        "Use the 'Clone Part' command first to create a standalone fastener,\r\n" +
+                        "then run 'Create fastener references...'.",
+                        "Create fastener references",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Information);
+                    return;
+                }
+
                 var values = FastenerPropertyHelper.BuildInitialValues(model);
-                var family = values.Family;
+                string family = values.Family;
 
                 if (!IsSupportedFamily(family))
                 {
@@ -75,7 +98,7 @@ namespace SW2026RibbonAddin.Commands
                         family = typeForm.SelectedFamily;
                     }
 
-                    // Persist chosen Family so we do not ask again next time
+                    // Persist the chosen family so we do not have to ask again
                     values.Family = family;
                     FastenerPropertyHelper.WriteProperties(model, values);
                 }
@@ -130,7 +153,7 @@ namespace SW2026RibbonAddin.Commands
                     return;
                 }
 
-                // Y20 – visually highlight what we created/updated
+                // Highlight what we created/updated
                 model.ClearSelection2(true);
                 axisFeat?.Select2(false, -1);
                 undersidePlane?.Select2(true, -1);
@@ -146,7 +169,7 @@ namespace SW2026RibbonAddin.Commands
             }
             catch (Exception ex)
             {
-                MessageBox.Show("Error while creating fastener references:\n" + ex.Message,
+                MessageBox.Show("Error while creating fastener references:\r\n\r\n" + ex.Message,
                     "Create fastener references");
                 Debug.WriteLine("CreateFastenerReferencesButton.Execute error: " + ex);
             }
@@ -396,7 +419,6 @@ namespace SW2026RibbonAddin.Commands
             model.ClearSelection2(true);
 
             var entity = (IEntity)face;
-            // ISelectData is optional – null is OK
             entity.Select4(false, null);
 
             bool ok = model.InsertAxis2(true);
@@ -455,7 +477,6 @@ namespace SW2026RibbonAddin.Commands
             if (featMgr == null)
                 throw new InvalidOperationException("FeatureManager is not available.");
 
-            // Coincident ref plane with selected face
             featMgr.InsertRefPlane(
                 (int)swRefPlaneReferenceConstraints_e.swRefPlaneReferenceConstraint_Coincident,
                 0.0, 0,
