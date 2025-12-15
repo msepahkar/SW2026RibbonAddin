@@ -155,6 +155,7 @@ namespace SW2026RibbonAddin.Commands
 
                 // 3) Force the clone to be a NON‑Toolbox part and save once
                 // 3) Make sure the cloned file is a *normal* (non‑Toolbox) part
+                // 3) Make sure the cloned file is a *normal* (non‑Toolbox) part
                 try
                 {
                     // First clear the flag in the in‑memory document (current session)

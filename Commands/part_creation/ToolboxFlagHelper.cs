@@ -6,9 +6,8 @@ namespace SW2026RibbonAddin
 {
     internal static class ToolboxFlagHelper
     {
-        // TODO: put your Document Manager license key here
-        // Example format:
-        // "CompanyName:swdocmgr_general-00000-{31 times},swdocmgr_previews-00000-{31 times},..."
+        // Document Manager key – in your working build you left this as a placeholder,
+        // and Document Manager still worked in your environment. Keep it the same.
         private const string DOC_MGR_KEY = "PUT-YOUR-DOC-MANAGER-KEY-HERE";
 
         // Cache the DM application instance
@@ -68,7 +67,7 @@ namespace SW2026RibbonAddin
                 dmDoc = app.GetDocument(
                     partPath,
                     SwDmDocumentType.swDmDocumentPart,
-                    false,                    // not read‑only
+                    false,    // not read‑only
                     out openErr);
 
                 if (dmDoc == null || openErr != SwDmDocumentOpenError.swDmDocumentOpenErrorNone)
@@ -85,7 +84,7 @@ namespace SW2026RibbonAddin
                 dmDoc.ToolboxPart = SwDmToolboxPartType.swDmNotAToolboxPart;
 
                 // Persist the change in the file header
-                dmDoc.Save();   // returns SwDmDocumentSaveError, which we can safely ignore here
+                dmDoc.Save();   // SwDmDocumentSaveError can be ignored here
             }
             catch (Exception ex)
             {
