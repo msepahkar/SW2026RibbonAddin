@@ -20,14 +20,14 @@
     <LangVersion>latest</LangVersion>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)' == 'Debug|x64'">
-	<DebugSymbols>true</DebugSymbols>
+    <DebugSymbols>true</DebugSymbols>
     <DebugType>full</DebugType>
     <Optimize>false</Optimize>
     <OutputPath>bin\x64\Debug\</OutputPath>
     <DefineConstants>DEBUG;TRACE</DefineConstants>
     <ErrorReport>prompt</ErrorReport>
     <WarningLevel>4</WarningLevel>
-	  <PostBuildEvent>
+    <PostBuildEvent>
 		  "$(SystemRoot)\Microsoft.NET\Framework64\v4.0.30319\regasm.exe" "$(MSBuildProjectDirectory)\$(OutputPath)$(AssemblyName).dll" /codebase
 	  </PostBuildEvent>
   </PropertyGroup>
@@ -38,6 +38,12 @@
     <DefineConstants>TRACE</DefineConstants>
     <ErrorReport>prompt</ErrorReport>
     <WarningLevel>4</WarningLevel>
+  </PropertyGroup>
+  <PropertyGroup>
+    <SignAssembly>true</SignAssembly>
+  </PropertyGroup>
+  <PropertyGroup>
+    <AssemblyOriginatorKeyFile>SW2026RibbonAddin.snk</AssemblyOriginatorKeyFile>
   </PropertyGroup>
   <ItemGroup>
     <Reference Include="ACadSharp, Version=3.3.7.0, Culture=neutral, PublicKeyToken=835670d357149d36, processorArchitecture=MSIL">
@@ -145,6 +151,7 @@
   <ItemGroup>
     <None Include="app.config" />
     <None Include="packages.config" />
+    <None Include="SW2026RibbonAddin.snk" />
   </ItemGroup>
   <ItemGroup>
     <EmbeddedResource Include="Resources\combine_dwg_20.png" />
@@ -169,5 +176,4 @@
     <EmbeddedResource Include="Resources\reference_geometry_32.png" />
   </ItemGroup>
   <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets" />
-
 </Project>

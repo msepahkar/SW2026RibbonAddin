@@ -36,11 +36,6 @@ namespace SW2026RibbonAddin
 
         private LicenseState _licenseState = LicenseState.TrialActive;
 
-        // Legacy indices (no longer used, but kept for compatibility)
-        private int _helloCmdIndex = -1;
-        private int _farsiCmdIndex = -1;
-        private int _editSelNoteCmdIndex = -1;
-        private int _updateAllNotesCmdIndex = -1;
 
         // Command group + tab constants
         private const int MAIN_CMD_GROUP_ID = 20258;
@@ -426,38 +421,46 @@ namespace SW2026RibbonAddin
 
             try
             {
-                using (var first = images[0])
+                int width = images.Length * iconSize;
+                int height = iconSize;
+
+                using (var strip = new Bitmap(width, height, PixelFormat.Format32bppArgb))
+                using (var g = Graphics.FromImage(strip))
                 {
-                    if (first == null) return;
+                    g.Clear(Color.Transparent);
 
-                    using (var bmpFirst = new Bitmap(first))
+                    for (int i = 0; i < images.Length; i++)
                     {
-                        int width = images.Length * iconSize;
-                        int height = iconSize;
+                        var s = images[i];
+                        if (s == null)
+                            continue;
 
-                        using (var strip = new Bitmap(width, height, PixelFormat.Format32bppArgb))
-                        using (var g = Graphics.FromImage(strip))
+                        try
                         {
-                            g.Clear(Color.Transparent);
+                            // Robust approach: copy each source stream into memory first.
+                            // This avoids issues where the stream has already been read/advanced,
+                            // isn't seekable, or where Bitmap keeps a reference to the stream.
+                            byte[] bytes = ReadAllBytesFromStart(s);
 
-                            for (int i = 0; i < images.Length; i++)
+                            using (var ms = new MemoryStream(bytes))
+                            using (var tmp = new Bitmap(ms))
+                            using (var bmp = new Bitmap(tmp)) // clone to fully detach from the stream
                             {
-                                var s = images[i];
-                                if (s == null) continue;
-
-                                using (var bmp = new Bitmap(s))
-                                {
-                                    g.DrawImage(
-                                        bmp,
-                                        new Rectangle(i * iconSize, 0, iconSize, iconSize),
-                                        new Rectangle(0, 0, bmp.Width, bmp.Height),
-                                        GraphicsUnit.Pixel);
-                                }
+                                g.DrawImage(
+                                    bmp,
+                                    new Rectangle(i * iconSize, 0, iconSize, iconSize),
+                                    new Rectangle(0, 0, bmp.Width, bmp.Height),
+                                    GraphicsUnit.Pixel);
                             }
-
-                            strip.Save(outFile, ImageFormat.Png);
+                        }
+                        catch (Exception exIcon)
+                        {
+                            // Keep going so one bad icon doesn't break the whole strip.
+                            Debug.WriteLine($"BuildStrip: icon {i} failed: {exIcon.Message}");
                         }
                     }
+
+                    strip.Save(outFile, ImageFormat.Png);
                 }
             }
             catch (Exception ex)
@@ -473,6 +476,28 @@ namespace SW2026RibbonAddin
                         try { s?.Dispose(); } catch { }
                     }
                 }
+            }
+        }
+
+        private static byte[] ReadAllBytesFromStart(Stream s)
+        {
+            if (s == null)
+                return Array.Empty<byte>();
+
+            try
+            {
+                if (s.CanSeek)
+                    s.Position = 0;
+            }
+            catch
+            {
+                // Ignore: some streams report CanSeek but throw on Position.
+            }
+
+            using (var ms = new MemoryStream())
+            {
+                s.CopyTo(ms);
+                return ms.ToArray();
             }
         }
 
