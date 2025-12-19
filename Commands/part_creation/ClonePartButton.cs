@@ -120,7 +120,6 @@ namespace SW2026RibbonAddin.Commands
                     (int)swSaveAsVersion_e.swSaveAsCurrentVersion,
                     (int)swSaveAsOptions_e.swSaveAsOptions_Copy);
 
-                // SaveAs3 returns 0 on success
                 if (saveErr != 0)
                 {
                     MessageBox.Show(
@@ -153,39 +152,22 @@ namespace SW2026RibbonAddin.Commands
                     return;
                 }
 
-                // 3) Force the clone to be a NON‑Toolbox part and save once
-                // 3) Make sure the cloned file is a *normal* (non‑Toolbox) part
-                // 3) Make sure the cloned file is a *normal* (non‑Toolbox) part
+                // 3) Make sure the cloned file is a normal (non‑Toolbox) part and save once
                 try
                 {
-                    // First clear the flag in the in‑memory document (current session)
-                    var newExt = (ModelDocExtension)newModel.Extension;
-                    newExt.ToolboxPartType = (int)swToolBoxPartType_e.swNotAToolboxPart;
-
-                    int saveErrors2 = 0;
-                    int saveWarnings2 = 0;
-                    bool saveOk = newModel.Save3(
-                        (int)swSaveAsOptions_e.swSaveAsOptions_Silent,
-                        ref saveErrors2,
-                        ref saveWarnings2);
-
-                    if (!saveOk || saveErrors2 != 0)
+                    if (!ToolboxFlagHelper.TryMarkAsNotToolboxAndSave(newModel, out string reason))
                     {
+                        // Not fatal — clone exists; we just warn.
                         MessageBox.Show(
-                            "Clone was created but could not be fully de‑linked from Toolbox.\r\n\r\n" +
-                            "Save error code: " + saveErrors2,
+                            "Clone was created, but SOLIDWORKS could not fully clear Toolbox status.\r\n\r\n" +
+                            (string.IsNullOrWhiteSpace(reason) ? "" : ("Details: " + reason)),
                             "Clone Part",
                             MessageBoxButtons.OK,
                             MessageBoxIcon.Warning);
                     }
-
-                    // Then also clear the Toolbox flag in the file header via Document Manager,
-                    // so the part stays a normal part when moved to another machine.
-                    ToolboxFlagHelper.ClearToolboxFlagOnDisk(clonePath);
                 }
                 catch (Exception ex)
                 {
-                    // If anything goes wrong, log it but don't crash the add‑in
                     Debug.WriteLine(ex);
                 }
 

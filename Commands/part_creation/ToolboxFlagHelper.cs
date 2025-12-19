@@ -1,105 +1,60 @@
 ﻿using System;
 using System.Diagnostics;
-using SolidWorks.Interop.swdocumentmgr;
+using SolidWorks.Interop.sldworks;
+using SolidWorks.Interop.swconst;
 
 namespace SW2026RibbonAddin
 {
     internal static class ToolboxFlagHelper
     {
-        // Document Manager key – in your working build you left this as a placeholder,
-        // and Document Manager still worked in your environment. Keep it the same.
-        private const string DOC_MGR_KEY = "PUT-YOUR-DOC-MANAGER-KEY-HERE";
-
-        // Cache the DM application instance
-        private static SwDMApplication _dmApp;
-
-        private static SwDMApplication GetDmApp()
-        {
-            if (_dmApp != null)
-                return _dmApp;
-
-            // Create the class factory COM object
-            var factoryType = Type.GetTypeFromProgID("SwDocumentMgr.SwDMClassFactory");
-            if (factoryType == null)
-            {
-                Debug.WriteLine("Document Manager SDK is not installed (SwDMClassFactory type missing).");
-                return null;
-            }
-
-            var factory = Activator.CreateInstance(factoryType) as SwDMClassFactory;
-            if (factory == null)
-            {
-                Debug.WriteLine("Failed to create SwDMClassFactory.");
-                return null;
-            }
-
-            try
-            {
-                _dmApp = factory.GetApplication(DOC_MGR_KEY);
-            }
-            catch (Exception ex)
-            {
-                Debug.WriteLine("Failed to get Document Manager application: " + ex);
-                _dmApp = null;
-            }
-
-            return _dmApp;
-        }
-
         /// <summary>
-        /// Clears the Toolbox flag (IsToolboxPart) in the file header of the given part.
-        /// After this runs successfully, the file behaves as a normal part on any machine.
+        /// Marks the currently-open model as NOT a Toolbox part, then saves silently.
+        /// This is enough for most workflows to remove the "bolt" behavior/icon.
         /// </summary>
-        internal static void ClearToolboxFlagOnDisk(string partPath)
+        internal static bool TryMarkAsNotToolboxAndSave(IModelDoc2 model, out string reason)
         {
-            if (string.IsNullOrWhiteSpace(partPath))
-                return;
+            reason = null;
 
-            var app = GetDmApp();
-            if (app == null)
-                return;
-
-            SwDmDocumentOpenError openErr;
-            SwDMDocument dmDoc = null;
+            if (model == null)
+            {
+                reason = "No active model.";
+                return false;
+            }
 
             try
             {
-                dmDoc = app.GetDocument(
-                    partPath,
-                    SwDmDocumentType.swDmDocumentPart,
-                    false,    // not read‑only
-                    out openErr);
-
-                if (dmDoc == null || openErr != SwDmDocumentOpenError.swDmDocumentOpenErrorNone)
+                var ext = model.Extension as ModelDocExtension;
+                if (ext == null)
                 {
-                    Debug.WriteLine($"DM: cannot open '{partPath}', error {openErr}.");
-                    return;
+                    reason = "ModelDocExtension is not available.";
+                    return false;
                 }
 
-                // Already a normal part? Nothing to do.
-                if (dmDoc.ToolboxPart == SwDmToolboxPartType.swDmNotAToolboxPart)
-                    return;
+                // Clear toolbox status in the active document
+                ext.ToolboxPartType = (int)swToolBoxPartType_e.swNotAToolboxPart;
 
-                // Clear the toolbox flag
-                dmDoc.ToolboxPart = SwDmToolboxPartType.swDmNotAToolboxPart;
+                // Save to persist it
+                int saveErrors = 0;
+                int saveWarnings = 0;
 
-                // Persist the change in the file header
-                dmDoc.Save();   // SwDmDocumentSaveError can be ignored here
+                bool ok = model.Save3(
+                    (int)swSaveAsOptions_e.swSaveAsOptions_Silent,
+                    ref saveErrors,
+                    ref saveWarnings);
+
+                if (!ok || saveErrors != 0)
+                {
+                    reason = $"Save failed. Error code: {saveErrors}.";
+                    return false;
+                }
+
+                return true;
             }
             catch (Exception ex)
             {
-                Debug.WriteLine("DM: failed to clear Toolbox flag: " + ex);
-            }
-            finally
-            {
-                try
-                {
-                    dmDoc?.CloseDoc();
-                }
-                catch
-                {
-                    // ignore close errors
-                }
+                Debug.WriteLine("TryMarkAsNotToolboxAndSave error: " + ex);
+                reason = ex.Message;
+                return false;
             }
         }
     }
