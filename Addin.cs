@@ -29,7 +29,7 @@ namespace SW2026RibbonAddin
         private ICommandGroup _cmdGroup;
 
         // Button infrastructure
-        private const int MAX_CMD_SLOTS = 16;
+        private const int MAX_CMD_SLOTS = 64;
         private readonly List<IMehdiRibbonButton> _buttons = new List<IMehdiRibbonButton>();
         private readonly IMehdiRibbonButton[] _slotButtons = new IMehdiRibbonButton[MAX_CMD_SLOTS];
         private readonly int[] _slotCommandIndices = new int[MAX_CMD_SLOTS];
@@ -110,6 +110,16 @@ namespace SW2026RibbonAddin
                     _swApp.CommandOpenPreNotify -= OnCommandOpenPreNotify;
             }
             catch { }
+
+            // If a placement session is active, make sure we detach mouse hooks and close the overlay
+            // to avoid leaving SOLIDWORKS in a weird state on disconnect.
+            try
+            {
+                _activePlacement?.Dispose();
+                _activePlacement = null;
+            }
+            catch { }
+
 
             try
             {
@@ -664,6 +674,150 @@ namespace SW2026RibbonAddin
 
         public void OnCmd15() => RunButtonSlot(15);
         public int OnCmd15Enable() => GetButtonEnableSlot(15);
+
+        public void OnCmd16() => RunButtonSlot(16);
+        public int OnCmd16Enable() => GetButtonEnableSlot(16);
+
+        public void OnCmd17() => RunButtonSlot(17);
+        public int OnCmd17Enable() => GetButtonEnableSlot(17);
+
+        public void OnCmd18() => RunButtonSlot(18);
+        public int OnCmd18Enable() => GetButtonEnableSlot(18);
+
+        public void OnCmd19() => RunButtonSlot(19);
+        public int OnCmd19Enable() => GetButtonEnableSlot(19);
+
+        public void OnCmd20() => RunButtonSlot(20);
+        public int OnCmd20Enable() => GetButtonEnableSlot(20);
+
+        public void OnCmd21() => RunButtonSlot(21);
+        public int OnCmd21Enable() => GetButtonEnableSlot(21);
+
+        public void OnCmd22() => RunButtonSlot(22);
+        public int OnCmd22Enable() => GetButtonEnableSlot(22);
+
+        public void OnCmd23() => RunButtonSlot(23);
+        public int OnCmd23Enable() => GetButtonEnableSlot(23);
+
+        public void OnCmd24() => RunButtonSlot(24);
+        public int OnCmd24Enable() => GetButtonEnableSlot(24);
+
+        public void OnCmd25() => RunButtonSlot(25);
+        public int OnCmd25Enable() => GetButtonEnableSlot(25);
+
+        public void OnCmd26() => RunButtonSlot(26);
+        public int OnCmd26Enable() => GetButtonEnableSlot(26);
+
+        public void OnCmd27() => RunButtonSlot(27);
+        public int OnCmd27Enable() => GetButtonEnableSlot(27);
+
+        public void OnCmd28() => RunButtonSlot(28);
+        public int OnCmd28Enable() => GetButtonEnableSlot(28);
+
+        public void OnCmd29() => RunButtonSlot(29);
+        public int OnCmd29Enable() => GetButtonEnableSlot(29);
+
+        public void OnCmd30() => RunButtonSlot(30);
+        public int OnCmd30Enable() => GetButtonEnableSlot(30);
+
+        public void OnCmd31() => RunButtonSlot(31);
+        public int OnCmd31Enable() => GetButtonEnableSlot(31);
+
+        public void OnCmd32() => RunButtonSlot(32);
+        public int OnCmd32Enable() => GetButtonEnableSlot(32);
+
+        public void OnCmd33() => RunButtonSlot(33);
+        public int OnCmd33Enable() => GetButtonEnableSlot(33);
+
+        public void OnCmd34() => RunButtonSlot(34);
+        public int OnCmd34Enable() => GetButtonEnableSlot(34);
+
+        public void OnCmd35() => RunButtonSlot(35);
+        public int OnCmd35Enable() => GetButtonEnableSlot(35);
+
+        public void OnCmd36() => RunButtonSlot(36);
+        public int OnCmd36Enable() => GetButtonEnableSlot(36);
+
+        public void OnCmd37() => RunButtonSlot(37);
+        public int OnCmd37Enable() => GetButtonEnableSlot(37);
+
+        public void OnCmd38() => RunButtonSlot(38);
+        public int OnCmd38Enable() => GetButtonEnableSlot(38);
+
+        public void OnCmd39() => RunButtonSlot(39);
+        public int OnCmd39Enable() => GetButtonEnableSlot(39);
+
+        public void OnCmd40() => RunButtonSlot(40);
+        public int OnCmd40Enable() => GetButtonEnableSlot(40);
+
+        public void OnCmd41() => RunButtonSlot(41);
+        public int OnCmd41Enable() => GetButtonEnableSlot(41);
+
+        public void OnCmd42() => RunButtonSlot(42);
+        public int OnCmd42Enable() => GetButtonEnableSlot(42);
+
+        public void OnCmd43() => RunButtonSlot(43);
+        public int OnCmd43Enable() => GetButtonEnableSlot(43);
+
+        public void OnCmd44() => RunButtonSlot(44);
+        public int OnCmd44Enable() => GetButtonEnableSlot(44);
+
+        public void OnCmd45() => RunButtonSlot(45);
+        public int OnCmd45Enable() => GetButtonEnableSlot(45);
+
+        public void OnCmd46() => RunButtonSlot(46);
+        public int OnCmd46Enable() => GetButtonEnableSlot(46);
+
+        public void OnCmd47() => RunButtonSlot(47);
+        public int OnCmd47Enable() => GetButtonEnableSlot(47);
+
+        public void OnCmd48() => RunButtonSlot(48);
+        public int OnCmd48Enable() => GetButtonEnableSlot(48);
+
+        public void OnCmd49() => RunButtonSlot(49);
+        public int OnCmd49Enable() => GetButtonEnableSlot(49);
+
+        public void OnCmd50() => RunButtonSlot(50);
+        public int OnCmd50Enable() => GetButtonEnableSlot(50);
+
+        public void OnCmd51() => RunButtonSlot(51);
+        public int OnCmd51Enable() => GetButtonEnableSlot(51);
+
+        public void OnCmd52() => RunButtonSlot(52);
+        public int OnCmd52Enable() => GetButtonEnableSlot(52);
+
+        public void OnCmd53() => RunButtonSlot(53);
+        public int OnCmd53Enable() => GetButtonEnableSlot(53);
+
+        public void OnCmd54() => RunButtonSlot(54);
+        public int OnCmd54Enable() => GetButtonEnableSlot(54);
+
+        public void OnCmd55() => RunButtonSlot(55);
+        public int OnCmd55Enable() => GetButtonEnableSlot(55);
+
+        public void OnCmd56() => RunButtonSlot(56);
+        public int OnCmd56Enable() => GetButtonEnableSlot(56);
+
+        public void OnCmd57() => RunButtonSlot(57);
+        public int OnCmd57Enable() => GetButtonEnableSlot(57);
+
+        public void OnCmd58() => RunButtonSlot(58);
+        public int OnCmd58Enable() => GetButtonEnableSlot(58);
+
+        public void OnCmd59() => RunButtonSlot(59);
+        public int OnCmd59Enable() => GetButtonEnableSlot(59);
+
+        public void OnCmd60() => RunButtonSlot(60);
+        public int OnCmd60Enable() => GetButtonEnableSlot(60);
+
+        public void OnCmd61() => RunButtonSlot(61);
+        public int OnCmd61Enable() => GetButtonEnableSlot(61);
+
+        public void OnCmd62() => RunButtonSlot(62);
+        public int OnCmd62Enable() => GetButtonEnableSlot(62);
+
+        public void OnCmd63() => RunButtonSlot(63);
+        public int OnCmd63Enable() => GetButtonEnableSlot(63);
 
         #endregion
 
