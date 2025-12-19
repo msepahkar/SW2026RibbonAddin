@@ -70,13 +70,43 @@ namespace SW2026RibbonAddin.Commands
 
         public int GetEnableState(AddinContext context)
         {
-            // Enabled whenever a document is open.
-            // On click, OnEditSelectedNoteFarsi() will validate drawing + selection.
+            // Enabled ONLY when:
+            // - Active doc is a drawing
+            // - Selection contains a Note (or an Annotation that resolves to a Note)
+            //
+            // This is called often by SOLIDWORKS, so keep it lightweight and no UI.
             try
             {
-                return context.ActiveModel != null
-                    ? AddinContext.Enable
-                    : AddinContext.Disable;
+                var model = context.ActiveModel;
+                if (model == null || model.GetType() != (int)swDocumentTypes_e.swDocDRAWING)
+                    return AddinContext.Disable;
+
+                var selMgr = model.SelectionManager as ISelectionMgr;
+                if (selMgr == null)
+                    return AddinContext.Disable;
+
+                if (selMgr.GetSelectedObjectCount2(-1) < 1)
+                    return AddinContext.Disable;
+
+                object selObj = null;
+                try { selObj = selMgr.GetSelectedObject6(1, -1); } catch { }
+
+                if (selObj == null)
+                    return AddinContext.Disable;
+
+                if (selObj is INote)
+                    return AddinContext.Enable;
+
+                if (selObj is IAnnotation ann)
+                {
+                    object specific = null;
+                    try { specific = ann.GetSpecificAnnotation(); } catch { }
+
+                    if (specific is INote)
+                        return AddinContext.Enable;
+                }
+
+                return AddinContext.Disable;
             }
             catch
             {

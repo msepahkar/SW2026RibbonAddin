@@ -127,19 +127,24 @@ namespace SW2026RibbonAddin.Commands
 
         public int GetEnableState(AddinContext context)
         {
-            // New strategy: keep DWG button enabled whenever some document is active.
+            // Enable only for Part/Assembly (since the command requires those doc types anyway)
             try
             {
-                return context.ActiveModel != null
-                    ? AddinContext.Enable
-                    : AddinContext.Disable;
+                var model = context.ActiveModel;
+                if (model == null)
+                    return AddinContext.Disable;
+
+                int docType = model.GetType();
+                bool isPart = docType == (int)swDocumentTypes_e.swDocPART;
+                bool isAsm = docType == (int)swDocumentTypes_e.swDocASSEMBLY;
+
+                return (isPart || isAsm) ? AddinContext.Enable : AddinContext.Disable;
             }
             catch
             {
                 return AddinContext.Disable;
             }
         }
-
         // ------------------------------------------------------------------
         //  Single part
         // ------------------------------------------------------------------
