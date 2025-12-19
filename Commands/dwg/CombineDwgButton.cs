@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Security.Cryptography;
 using System.Text;
 using System.Windows.Forms;
 using ACadSharp;
@@ -77,10 +78,25 @@ namespace SW2026RibbonAddin.Commands
         private sealed class CombinedPart
         {
             public string FileName;
-            public string FolderName;
             public string FullPath;
             public double ThicknessMm;
             public int Quantity;
+
+            // Identity protection:
+            // If two different jobs have the same FileName and thickness, we only merge if the hash matches.
+            public string HashHex; // full SHA256 hex or null if file missing/unreadable
+
+            // Source folders (can be multiple jobs)
+            public HashSet<string> SourceFolders = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            public string HashShort
+            {
+                get
+                {
+                    if (string.IsNullOrWhiteSpace(HashHex)) return null;
+                    return HashHex.Length <= 8 ? HashHex : HashHex.Substring(0, 8);
+                }
+            }
         }
 
         public static void Combine(string mainFolder)
@@ -115,7 +131,13 @@ namespace SW2026RibbonAddin.Commands
                 return;
             }
 
+            // Key strategy:
+            // - If DWG exists -> FileName + Thickness + SHA256 => merge only identical geometry.
+            // - If DWG missing/unreadable -> FileName + Thickness + FolderName => do NOT merge across jobs.
             var combined = new Dictionary<string, CombinedPart>(StringComparer.OrdinalIgnoreCase);
+
+            int rowsRead = 0;
+            int missingDwgCount = 0;
 
             // --- read all parts.csv and merge rows ---
             foreach (string sub in subFolders)
@@ -149,29 +171,53 @@ namespace SW2026RibbonAddin.Commands
                     if (cols.Length < 3)
                         continue;
 
-                    string fileName = cols[0].Trim();
+                    string fileName = (cols[0] ?? "").Trim();
                     if (string.IsNullOrEmpty(fileName))
                         continue;
 
-                    if (!double.TryParse(cols[1].Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out double tMm))
+                    if (!double.TryParse((cols[1] ?? "").Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out double tMm))
                         continue;
 
-                    if (!int.TryParse(cols[2].Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out int qty))
+                    if (!int.TryParse((cols[2] ?? "").Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out int qty))
                         continue;
 
-                    string key = MakeKey(fileName, tMm);
+                    rowsRead++;
+
+                    string fullPath = Path.Combine(sub, fileName);
+
+                    string hashHex = null;
+                    if (File.Exists(fullPath))
+                    {
+                        hashHex = TryComputeSha256Hex(fullPath);
+                    }
+                    else
+                    {
+                        missingDwgCount++;
+                    }
+
+                    string key = MakeKey(fileName, tMm, hashHex, folderName);
 
                     if (!combined.TryGetValue(key, out CombinedPart part))
                     {
                         part = new CombinedPart
                         {
                             FileName = fileName,
-                            FolderName = folderName,
-                            FullPath = Path.Combine(sub, fileName),
+                            FullPath = fullPath,
                             ThicknessMm = tMm,
-                            Quantity = 0
+                            Quantity = 0,
+                            HashHex = hashHex
                         };
+                        part.SourceFolders.Add(folderName);
+
                         combined.Add(key, part);
+                    }
+                    else
+                    {
+                        // If we already had a record and our stored FullPath is missing but this one exists, prefer existing file.
+                        if (!File.Exists(part.FullPath) && File.Exists(fullPath))
+                            part.FullPath = fullPath;
+
+                        part.SourceFolders.Add(folderName);
                     }
 
                     part.Quantity += qty;
@@ -204,13 +250,14 @@ namespace SW2026RibbonAddin.Commands
 
             foreach (var p in list)
             {
-                outLines.Add(
-                    string.Format(CultureInfo.InvariantCulture,
-                        "{0},{1},{2},{3}",
-                        p.FileName,
-                        p.ThicknessMm.ToString("0.###", CultureInfo.InvariantCulture),
-                        p.Quantity,
-                        p.FolderName));
+                string folders = string.Join(";", p.SourceFolders.OrderBy(x => x, StringComparer.OrdinalIgnoreCase));
+
+                outLines.Add(string.Format(CultureInfo.InvariantCulture,
+                    "{0},{1},{2},{3}",
+                    EscapeCsv(p.FileName),
+                    p.ThicknessMm.ToString("0.###", CultureInfo.InvariantCulture),
+                    p.Quantity,
+                    EscapeCsv(folders)));
             }
 
             File.WriteAllLines(allCsvPath, outLines);
@@ -220,24 +267,80 @@ namespace SW2026RibbonAddin.Commands
 
             MessageBox.Show(
                 "DWG combination finished.\r\n\r\n" +
+                "Rows read from CSVs: " + rowsRead + Environment.NewLine +
                 "Unique parts: " + list.Count + Environment.NewLine +
+                "Missing DWGs referenced by CSV: " + missingDwgCount + Environment.NewLine +
                 "Summary CSV: " + allCsvPath,
                 "Combine DWG",
                 MessageBoxButtons.OK,
                 MessageBoxIcon.Information);
         }
 
-        private static string MakeKey(string fileName, double thicknessMm)
+        private static string MakeKey(string fileName, double thicknessMm, string hashHex, string folderName)
         {
+            // If we can hash, use it to merge only identical DWGs.
+            if (!string.IsNullOrWhiteSpace(hashHex))
+            {
+                return fileName.Trim().ToUpperInvariant() + "|" +
+                       thicknessMm.ToString("0.###", CultureInfo.InvariantCulture) + "|" +
+                       hashHex.Trim().ToUpperInvariant();
+            }
+
+            // If DWG missing/unreadable, do not merge across folders (safer).
             return fileName.Trim().ToUpperInvariant() + "|" +
-                   thicknessMm.ToString("0.###", CultureInfo.InvariantCulture);
+                   thicknessMm.ToString("0.###", CultureInfo.InvariantCulture) + "|" +
+                   (folderName ?? "").Trim().ToUpperInvariant();
+        }
+
+        private static string TryComputeSha256Hex(string filePath)
+        {
+            try
+            {
+                using (var sha = SHA256.Create())
+                using (var fs = File.OpenRead(filePath))
+                {
+                    byte[] hash = sha.ComputeHash(fs);
+                    return BytesToHex(hash);
+                }
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private static string BytesToHex(byte[] bytes)
+        {
+            if (bytes == null || bytes.Length == 0)
+                return null;
+
+            var sb = new StringBuilder(bytes.Length * 2);
+            for (int i = 0; i < bytes.Length; i++)
+                sb.Append(bytes[i].ToString("x2", CultureInfo.InvariantCulture));
+
+            return sb.ToString();
+        }
+
+        private static string EscapeCsv(string value)
+        {
+            if (value == null)
+                return "";
+
+            bool mustQuote = value.Contains(",") || value.Contains("\"") || value.Contains("\r") || value.Contains("\n");
+            if (!mustQuote)
+                return value;
+
+            // Escape quotes by doubling them
+            string escaped = value.Replace("\"", "\"\"");
+            return "\"" + escaped + "\"";
         }
 
         /// <summary>
-        /// Block name for a plate: P_{sanitizedPartName}_Q{quantity}
+        /// Block name for a plate:
+        /// P_{sanitizedPartName}[_H{hash8}]_Q{quantity}
         /// Quantity suffix is used later by the laser-cut nesting.
         /// </summary>
-        private static string MakePlateBlockName(string fileName, int quantity)
+        private static string MakePlateBlockName(string fileName, string hashHex, int quantity)
         {
             string baseName = Path.GetFileNameWithoutExtension(fileName);
             if (string.IsNullOrEmpty(baseName))
@@ -255,7 +358,59 @@ namespace SW2026RibbonAddin.Commands
             string safe = sb.Length > 0 ? sb.ToString() : "Part";
             int q = Math.Max(1, quantity);
 
+            string h = null;
+            if (!string.IsNullOrWhiteSpace(hashHex))
+            {
+                string hh = hashHex.Trim();
+                h = hh.Length <= 8 ? hh : hh.Substring(0, 8);
+            }
+
+            // Keep _Q{qty} at the end so LaserCut parsing still works.
+            if (!string.IsNullOrEmpty(h))
+                return string.Format(CultureInfo.InvariantCulture, "P_{0}_H{1}_Q{2}", safe, h, q);
+
             return string.Format(CultureInfo.InvariantCulture, "P_{0}_Q{1}", safe, q);
+        }
+
+        private static bool BlockRecordExists(CadDocument doc, string blockName)
+        {
+            if (doc == null || string.IsNullOrWhiteSpace(blockName))
+                return false;
+
+            try
+            {
+                // Indexer throws if not found
+                var _ = doc.BlockRecords[blockName];
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static string EnsureUniqueBlockName(CadDocument doc, string desiredName)
+        {
+            if (doc == null || string.IsNullOrWhiteSpace(desiredName))
+                return desiredName;
+
+            if (!BlockRecordExists(doc, desiredName))
+                return desiredName;
+
+            // Insert suffix before _Q if possible, so qty stays parseable.
+            int qIdx = desiredName.LastIndexOf("_Q", StringComparison.OrdinalIgnoreCase);
+            string left = qIdx >= 0 ? desiredName.Substring(0, qIdx) : desiredName;
+            string right = qIdx >= 0 ? desiredName.Substring(qIdx) : "";
+
+            for (int i = 2; i < 9999; i++)
+            {
+                string candidate = left + "_D" + i.ToString(CultureInfo.InvariantCulture) + right;
+                if (!BlockRecordExists(doc, candidate))
+                    return candidate;
+            }
+
+            // Extreme fallback
+            return left + "_D" + Guid.NewGuid().ToString("N").Substring(0, 6) + right;
         }
 
         /// <summary>
@@ -314,12 +469,14 @@ namespace SW2026RibbonAddin.Commands
                     }
 
                     // Create a block for this plate and copy all model space entities into it.
-                    // Block name encodes the quantity for later laser nesting: P_..._Q{qty}
-                    string blockName = MakePlateBlockName(part.FileName, part.Quantity);
+                    // Block name encodes the quantity for later laser nesting: ..._Q{qty}
+                    string blockName = MakePlateBlockName(part.FileName, part.HashHex, part.Quantity);
+                    blockName = EnsureUniqueBlockName(doc, blockName);
+
                     var block = new BlockRecord(blockName);
                     doc.BlockRecords.Add(block);
 
-                    // Pick a random ACI color (1..255) for all entities in this block
+                    // Pick a random ACI color (1..255) for all entities in this block (kept as original behavior)
                     var blockColor = new Color((byte)_random.Next(1, 256));
 
                     foreach (var ent in srcModel.Entities)
