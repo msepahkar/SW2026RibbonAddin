@@ -18,7 +18,7 @@ namespace SW2026RibbonAddin.Commands
         public string Id => "LaserCut";
 
         public string DisplayName => "Laser\nCut";
-        public string Tooltip => "Nest a combined DWG into laser sheets (improved packing + layers + rotation rules).";
+        public string Tooltip => "Nest a combined DWG into laser sheets (better packing + layers + rotation + optional report + logs).";
         public string Hint => "Laser cut nesting";
 
         public string SmallIconFile => "laser_cut_20.png";
@@ -41,7 +41,6 @@ namespace SW2026RibbonAddin.Commands
             int anyAngleStepDeg;
             bool writeReportCsv;
 
-            // Ask for sheet size + rotation mode + report option
             using (var dlg = new LaserCutOptionsForm())
             {
                 if (dlg.ShowDialog() != DialogResult.OK)
@@ -56,7 +55,14 @@ namespace SW2026RibbonAddin.Commands
 
             try
             {
-                DwgLaserNester.Nest(dwgPath, sheetWidth, sheetHeight, rotationMode, anyAngleStepDeg, writeReportCsv);
+                // UI mode: show one result MessageBox at the end
+                DwgLaserNester.Nest(
+                    dwgPath,
+                    sheetWidth,
+                    sheetHeight,
+                    rotationMode,
+                    anyAngleStepDeg,
+                    writeReportCsv);
             }
             catch (Exception ex)
             {
@@ -68,11 +74,7 @@ namespace SW2026RibbonAddin.Commands
             }
         }
 
-        public int GetEnableState(AddinContext context)
-        {
-            // Independent of active SW document
-            return AddinContext.Enable;
-        }
+        public int GetEnableState(AddinContext context) => AddinContext.Enable;
 
         private static string SelectCombinedDwg()
         {
@@ -101,6 +103,61 @@ namespace SW2026RibbonAddin.Commands
 
     internal static class DwgLaserNester
     {
+        // -----------------------
+        // Step 6: LOGGING + RESULT
+        // -----------------------
+        internal sealed class NestResult
+        {
+            public string SourceDwgPath;
+            public string OutputDwgPath;
+
+            public int SheetsUsed;
+            public int TotalParts;
+
+            public int CandidateBlocks;
+            public int SkippedBlocks;
+
+            public int WarningCount;
+            public string LogPath;
+
+            public string ReportCsvPath;
+        }
+
+        private sealed class NestLog
+        {
+            private readonly List<string> _lines = new List<string>();
+            public int Count => _lines.Count;
+
+            public void Warn(string message)
+            {
+                if (string.IsNullOrWhiteSpace(message)) return;
+                _lines.Add($"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] WARN: {message}");
+            }
+
+            public void Info(string message)
+            {
+                if (string.IsNullOrWhiteSpace(message)) return;
+                _lines.Add($"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] INFO: {message}");
+            }
+
+            public string TryWriteToFile(string folder, string baseName)
+            {
+                try
+                {
+                    if (_lines.Count == 0) return null;
+                    if (string.IsNullOrEmpty(folder)) return null;
+
+                    string path = Path.Combine(folder, baseName + "_nest_log.txt");
+                    File.WriteAllLines(path, _lines, Encoding.UTF8);
+                    return path;
+                }
+                catch
+                {
+                    return null;
+                }
+            }
+        }
+
         private sealed class PartDefinition
         {
             public BlockRecord Block;
@@ -116,7 +173,7 @@ namespace SW2026RibbonAddin.Commands
 
             public int Quantity;
 
-            // Cache rotated bounds by integer degrees (for speed)
+            // Cache rotated bounds by angle degrees (for speed)
             public readonly Dictionary<int, RotatedBounds> RotatedCache = new Dictionary<int, RotatedBounds>();
         }
 
@@ -137,7 +194,7 @@ namespace SW2026RibbonAddin.Commands
             public double OriginX;
             public double OriginY;
 
-            public double UsedArea;      // sum of bounding areas (rough)
+            public double UsedArea;  // rough (sum of bbox areas)
             public int PlacedCount;
 
             public List<FreeRect> FreeRects = new List<FreeRect>();
@@ -166,10 +223,9 @@ namespace SW2026RibbonAddin.Commands
             public double InsertWorldY;
         }
 
-        /// <summary>
-        /// Try to determine plate thickness (in mm) from the DWG file name
-        /// produced by CombineDwg, e.g. "thickness_2_5.dwg".
-        /// </summary>
+        // -----------------------
+        // Thickness helpers
+        // -----------------------
         private static double? TryGetPlateThicknessFromFileName(string sourceDwgPath)
         {
             if (string.IsNullOrWhiteSpace(sourceDwgPath))
@@ -188,7 +244,6 @@ namespace SW2026RibbonAddin.Commands
             if (string.IsNullOrWhiteSpace(token))
                 return null;
 
-            // Combined DWGs are produced with decimal separators replaced by '_'
             token = token.Replace('_', '.');
 
             if (double.TryParse(token, NumberStyles.Float, CultureInfo.InvariantCulture, out double value) &&
@@ -200,10 +255,6 @@ namespace SW2026RibbonAddin.Commands
             return null;
         }
 
-        /// <summary>
-        /// Try to determine plate thickness (in mm) by parsing MText labels
-        /// like "Plate: X mm" that CombineDwg writes under each plate.
-        /// </summary>
         private static double? TryGetPlateThicknessFromMText(CadDocument doc)
         {
             if (doc == null)
@@ -259,6 +310,9 @@ namespace SW2026RibbonAddin.Commands
             return TryGetPlateThicknessFromMText(doc);
         }
 
+        // -----------------------
+        // Rotation helpers
+        // -----------------------
         private static List<int> BuildAngleList(RotationMode mode, int stepDeg)
         {
             var angles = new List<int>();
@@ -286,8 +340,7 @@ namespace SW2026RibbonAddin.Commands
                     if (stepDeg < 1) stepDeg = 10;
                     if (stepDeg > 90) stepDeg = 90;
 
-                    // True “any angle” is infinite; this is practical sampling.
-                    // 0..180 is enough for cutting (180..360 is same part orientation flipped).
+                    // Practical sampling: 0..180 is enough for cutting
                     for (int a = 0; a <= 180; a += stepDeg)
                         angles.Add(a);
 
@@ -297,16 +350,9 @@ namespace SW2026RibbonAddin.Commands
                     break;
             }
 
-            // Remove duplicates + keep sorted
-            angles = angles.Distinct().OrderBy(x => x).ToList();
-            return angles;
+            return angles.Distinct().OrderBy(x => x).ToList();
         }
 
-        /// <summary>
-        /// Compute rotated bounds of the part's bounding rectangle for a given angle (deg).
-        /// Rotation is around the insert point / origin (0,0).
-        /// We rotate the 4 bbox corners and take min/max.
-        /// </summary>
         private static RotatedBounds GetRotatedBounds(PartDefinition part, int angleDeg)
         {
             if (part.RotatedCache.TryGetValue(angleDeg, out RotatedBounds cached))
@@ -316,7 +362,6 @@ namespace SW2026RibbonAddin.Commands
             double c = Math.Cos(rad);
             double s = Math.Sin(rad);
 
-            // bbox corners
             var pts = new[]
             {
                 new XYZ(part.MinX, part.MinY, 0),
@@ -356,10 +401,9 @@ namespace SW2026RibbonAddin.Commands
             return rb;
         }
 
-        /// <summary>
-        /// Layer support: create layers if the library supports it.
-        /// We use reflection to avoid compile breaks if the API differs.
-        /// </summary>
+        // -----------------------
+        // Layers (best-effort, safe)
+        // -----------------------
         private static object EnsureLayer(CadDocument doc, string layerName)
         {
             if (doc == null || string.IsNullOrWhiteSpace(layerName))
@@ -372,7 +416,6 @@ namespace SW2026RibbonAddin.Commands
                 if (layersObj == null)
                     return null;
 
-                // Try string indexer: layers["NAME"]
                 var indexer = layersObj.GetType().GetProperty("Item", new[] { typeof(string) });
                 if (indexer != null)
                 {
@@ -385,23 +428,8 @@ namespace SW2026RibbonAddin.Commands
                     catch { }
                 }
 
-                // Create and add
                 var newLayer = new Layer(layerName);
 
-                // Find Add(Layer)
-                var add = layersObj.GetType().GetMethods()
-                    .FirstOrDefault(m =>
-                        m.Name == "Add" &&
-                        m.GetParameters().Length == 1 &&
-                        m.GetParameters()[0].ParameterType.IsAssignableFrom(typeof(Layer)));
-
-                if (add != null)
-                {
-                    add.Invoke(layersObj, new object[] { newLayer });
-                    return newLayer;
-                }
-
-                // Some versions might have Add(object) or Add(TableEntry)
                 var addAny = layersObj.GetType().GetMethods()
                     .FirstOrDefault(m => m.Name == "Add" && m.GetParameters().Length == 1);
 
@@ -426,7 +454,6 @@ namespace SW2026RibbonAddin.Commands
 
             try
             {
-                // Common patterns: Entity.Layer (Layer), Entity.Layer (string), or Entity.LayerName (string)
                 var pLayer = ent.GetType().GetProperty("Layer");
                 if (pLayer != null && pLayer.CanWrite)
                 {
@@ -456,15 +483,9 @@ namespace SW2026RibbonAddin.Commands
             }
         }
 
-        /// <summary>
-        /// Reads a combined DWG (from CombineDwg) and nests all plate blocks P_*_Q{qty}
-        /// onto as many sheets as required.
-        /// Output DWG contains:
-        /// - original layout on SOURCE layer
-        /// - sheets on SHEET layer
-        /// - nested parts on PARTS layer
-        /// - labels on LABELS layer
-        /// </summary>
+        // -----------------------
+        // Public entry (UI mode)
+        // -----------------------
         public static void Nest(
             string sourceDwgPath,
             double sheetWidth,
@@ -473,6 +494,23 @@ namespace SW2026RibbonAddin.Commands
             int anyAngleStepDeg,
             bool writeReportCsv)
         {
+            Nest(sourceDwgPath, sheetWidth, sheetHeight, rotationMode, anyAngleStepDeg, writeReportCsv, showUi: true);
+        }
+
+        // -----------------------
+        // Internal entry (silent mode for Step 7)
+        // -----------------------
+        internal static NestResult Nest(
+            string sourceDwgPath,
+            double sheetWidth,
+            double sheetHeight,
+            RotationMode rotationMode,
+            int anyAngleStepDeg,
+            bool writeReportCsv,
+            bool showUi)
+        {
+            var log = new NestLog();
+
             if (sheetWidth <= 0 || sheetHeight <= 0)
                 throw new ArgumentException("Sheet width and height must be positive.");
 
@@ -481,61 +519,87 @@ namespace SW2026RibbonAddin.Commands
 
             CadDocument doc;
             using (var reader = new DwgReader(sourceDwgPath))
-            {
                 doc = reader.Read();
-            }
 
             var modelSpace = doc.BlockRecords["*Model_Space"];
 
-            // --- layers (safe; if ACadSharp doesn’t support layers in your build, it just won’t crash) ---
+            string dir = Path.GetDirectoryName(sourceDwgPath);
+            string nameNoExt = Path.GetFileNameWithoutExtension(sourceDwgPath);
+
+            // Layers (best-effort)
             object layerSource = EnsureLayer(doc, "SOURCE");
             object layerSheet = EnsureLayer(doc, "SHEET");
             object layerParts = EnsureLayer(doc, "PARTS");
             object layerLabels = EnsureLayer(doc, "LABELS");
 
-            // Move the original combined layout to SOURCE layer
+            if (layerSource == null || layerSheet == null || layerParts == null || layerLabels == null)
+                log.Warn("Layers collection not available (or failed). Output will still work, but layers may not be set.");
+
+            // Move original entities to SOURCE layer (snapshot only)
             var originalEntities = modelSpace.Entities.ToList();
             foreach (var ent in originalEntities)
                 SetEntityLayer(ent, layerSource, "SOURCE");
 
-            var parts = LoadPartDefinitions(doc).ToList();
+            int candidateBlocks, skippedBlocks;
+            var parts = LoadPartDefinitions(doc, log, out candidateBlocks, out skippedBlocks).ToList();
+
             if (parts.Count == 0)
             {
-                MessageBox.Show(
-                    "No plate blocks were found in the selected DWG.\r\n" +
-                    "Make sure it is one of the combined thickness DWGs.",
-                    "Laser Cut",
-                    MessageBoxButtons.OK,
-                    MessageBoxIcon.Information);
-                return;
+                string msg = "No plate blocks were found in the selected DWG.\r\n" +
+                             "Make sure it is one of the combined thickness DWGs.";
+                if (showUi)
+                {
+                    MessageBox.Show(msg, "Laser Cut", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    return new NestResult
+                    {
+                        SourceDwgPath = sourceDwgPath,
+                        TotalParts = 0,
+                        SheetsUsed = 0,
+                        CandidateBlocks = candidateBlocks,
+                        SkippedBlocks = skippedBlocks
+                    };
+                }
+                throw new InvalidOperationException(msg);
             }
 
             int totalInstances = parts.Sum(p => p.Quantity);
             if (totalInstances <= 0)
             {
-                MessageBox.Show(
-                    "All parts in the selected DWG have zero quantity.",
-                    "Laser Cut",
-                    MessageBoxButtons.OK,
-                    MessageBoxIcon.Information);
-                return;
+                string msg = "All parts in the selected DWG have zero quantity.";
+                if (showUi)
+                {
+                    MessageBox.Show(msg, "Laser Cut", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    return new NestResult
+                    {
+                        SourceDwgPath = sourceDwgPath,
+                        TotalParts = 0,
+                        SheetsUsed = 0,
+                        CandidateBlocks = candidateBlocks,
+                        SkippedBlocks = skippedBlocks
+                    };
+                }
+                throw new InvalidOperationException(msg);
             }
 
             // Sheet framing and spacing
-            double sheetMargin = 10.0;     // visible border (mm)
-            double defaultPartGap = 5.0;   // nominal gap between parts (mm)
-            double sheetGap = 50.0;        // distance between sheets (mm)
+            double sheetMargin = 10.0;
+            double defaultPartGap = 5.0;
+            double sheetGap = 50.0;
 
-            // Determine plate thickness and ensure gap is never smaller than plate thickness
+            // Determine thickness; enforce gap and margin >= thickness
             double partGap = defaultPartGap;
             double? plateThicknessMm = TryGetPlateThicknessMm(doc, sourceDwgPath);
             if (plateThicknessMm.HasValue && plateThicknessMm.Value > 0)
             {
                 if (plateThicknessMm.Value > partGap) partGap = plateThicknessMm.Value;
                 if (plateThicknessMm.Value > sheetMargin) sheetMargin = plateThicknessMm.Value;
+                log.Info($"Plate thickness detected: {plateThicknessMm.Value:0.###} mm (gap/margin adjusted).");
+            }
+            else
+            {
+                log.Warn("Plate thickness not detected from filename or text. Using default gap/margin.");
             }
 
-            // Clearance margin so nothing gets too close to sheet border
             double placementMargin = sheetMargin + 2 * partGap;
 
             double usableWidth = sheetWidth - 2 * placementMargin;
@@ -544,14 +608,12 @@ namespace SW2026RibbonAddin.Commands
             if (usableWidth <= 0 || usableHeight <= 0)
                 throw new InvalidOperationException("Sheet is too small after margins/gaps.");
 
-            // Rotation angle list
             var anglesDeg = BuildAngleList(rotationMode, anyAngleStepDeg);
 
-            // Validate: every part must fit on usable area in at least one allowed rotation
+            // Validate fit (at least one allowed rotation)
             foreach (var p in parts)
             {
                 bool fits = false;
-
                 foreach (int a in anglesDeg)
                 {
                     var rb = GetRotatedBounds(p, a);
@@ -573,65 +635,58 @@ namespace SW2026RibbonAddin.Commands
                 }
             }
 
-            // Build instances list (expand quantities)
+            // Expand instances
             var instances = new List<PartDefinition>(totalInstances);
             foreach (var def in parts)
-            {
                 for (int i = 0; i < def.Quantity; i++)
                     instances.Add(def);
-            }
 
-            // Place largest parts first (by bbox area)
-            instances.Sort((a, b) =>
-            {
-                double areaA = a.Width * a.Height;
-                double areaB = b.Width * b.Height;
-                return areaB.CompareTo(areaA);
-            });
+            // Largest first
+            instances.Sort((a, b) => (b.Width * b.Height).CompareTo(a.Width * a.Height));
 
-            // Compute extents of original combined layout to place sheets above it
+            // Place sheets above original layout
             GetModelSpaceExtents(doc, out double origMinX, out double origMinY, out double origMaxX, out double origMaxY);
-
             double baseSheetOriginY = origMaxY + 200.0;
             double baseSheetOriginX = origMinX;
-
-            var progress = new LaserCutProgressForm(totalInstances)
-            {
-                Text = "Laser cut nesting (improved)"
-            };
 
             List<SheetState> sheets;
             List<PlacementRecord> placements;
 
-            try
+            using (var progress = showUi ? new LaserCutProgressForm(totalInstances) { Text = "Laser cut nesting" } : null)
             {
-                progress.Show();
-                Application.DoEvents();
+                try
+                {
+                    if (progress != null)
+                    {
+                        progress.Show();
+                        Application.DoEvents();
+                    }
 
-                NestFreeRectangles(
-                    instances,
-                    modelSpace,
-                    sheetWidth,
-                    sheetHeight,
-                    placementMargin,
-                    sheetGap,
-                    partGap,
-                    baseSheetOriginX,
-                    baseSheetOriginY,
-                    progress,
-                    totalInstances,
-                    anglesDeg,
-                    layerSheet,
-                    layerParts,
-                    out sheets,
-                    out placements);
-            }
-            finally
-            {
-                progress.Close();
+                    NestFreeRectangles(
+                        instances,
+                        modelSpace,
+                        sheetWidth,
+                        sheetHeight,
+                        placementMargin,
+                        sheetGap,
+                        partGap,
+                        baseSheetOriginX,
+                        baseSheetOriginY,
+                        progress,
+                        totalInstances,
+                        anglesDeg,
+                        layerSheet,
+                        layerParts,
+                        out sheets,
+                        out placements);
+                }
+                finally
+                {
+                    progress?.Close();
+                }
             }
 
-            // Add sheet labels (after nesting so we know counts + fill)
+            // Labels
             double usableArea = usableWidth * usableHeight;
             foreach (var s in sheets)
             {
@@ -639,15 +694,10 @@ namespace SW2026RibbonAddin.Commands
                 AddSheetLabel(modelSpace, s, sheetWidth, sheetHeight, sheetMargin, fillPct, layerLabels);
             }
 
-            // Write nested result to a new DWG next to the source
-            string dir = Path.GetDirectoryName(sourceDwgPath);
-            string nameNoExt = Path.GetFileNameWithoutExtension(sourceDwgPath);
+            // Write DWG
             string outPath = Path.Combine(dir ?? string.Empty, nameNoExt + "_nested_optimized.dwg");
-
             using (var writer = new DwgWriter(outPath, doc))
-            {
                 writer.Write();
-            }
 
             // Optional report CSV
             string reportPath = null;
@@ -658,26 +708,54 @@ namespace SW2026RibbonAddin.Commands
                     reportPath = Path.Combine(dir ?? string.Empty, nameNoExt + "_nest_report.csv");
                     WriteReportCsv(reportPath, sheetWidth, sheetHeight, placementMargin, partGap, sheets, placements, usableWidth, usableHeight);
                 }
-                catch
+                catch (Exception ex)
                 {
                     reportPath = null;
+                    log.Warn("Failed to write report CSV: " + ex.Message);
                 }
             }
 
-            MessageBox.Show(
-                "Laser cut nesting finished.\r\n\r\n" +
-                "Algorithm: Improved (MaxRects-style + prune + merge)\r\n" +
-                "Sheets used: " + sheets.Count + "\r\n" +
-                "Total parts: " + totalInstances + "\r\n" +
-                "Output DWG: " + outPath +
-                (string.IsNullOrEmpty(reportPath) ? "" : ("\r\nReport CSV: " + reportPath)),
-                "Laser Cut",
-                MessageBoxButtons.OK,
-                MessageBoxIcon.Information);
+            // Step 6: write warnings log if needed
+            string logPath = log.TryWriteToFile(dir ?? string.Empty, nameNoExt);
+
+            var result = new NestResult
+            {
+                SourceDwgPath = sourceDwgPath,
+                OutputDwgPath = outPath,
+                SheetsUsed = sheets.Count,
+                TotalParts = totalInstances,
+                CandidateBlocks = candidateBlocks,
+                SkippedBlocks = skippedBlocks,
+                WarningCount = log.Count,
+                LogPath = logPath,
+                ReportCsvPath = reportPath
+            };
+
+            if (showUi)
+            {
+                string extra =
+                    $"Blocks found: {candidateBlocks}\r\n" +
+                    $"Blocks skipped: {skippedBlocks}\r\n" +
+                    (string.IsNullOrEmpty(logPath) ? "" : $"Log: {logPath}\r\n") +
+                    (string.IsNullOrEmpty(reportPath) ? "" : $"Report CSV: {reportPath}\r\n");
+
+                MessageBox.Show(
+                    "Laser cut nesting finished.\r\n\r\n" +
+                    $"Sheets used: {result.SheetsUsed}\r\n" +
+                    $"Total parts: {result.TotalParts}\r\n" +
+                    $"Output DWG: {result.OutputDwgPath}\r\n" +
+                    extra,
+                    "Laser Cut",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Information);
+            }
+
+            return result;
         }
 
-        #region Improved packing (MaxRects-style split + prune + merge)
-
+        // -----------------------
+        // Improved packing (MaxRects-style split + prune + merge)
+        // -----------------------
         private static void NestFreeRectangles(
             List<PartDefinition> instances,
             BlockRecord modelSpace,
@@ -696,7 +774,7 @@ namespace SW2026RibbonAddin.Commands
             out List<SheetState> sheets,
             out List<PlacementRecord> placements)
         {
-            // ✅ Use locals (allowed inside local functions), then assign to out parameters at the end.
+            // IMPORTANT: use locals to avoid CS1628 with out params + local functions
             var sheetsLocal = new List<SheetState>();
             var placementsLocal = new List<PlacementRecord>(instances.Count);
 
@@ -710,7 +788,6 @@ namespace SW2026RibbonAddin.Commands
                 };
 
                 sheetsLocal.Add(sheet);
-
                 DrawSheetOutline(sheet, sheetWidth, sheetHeight, modelSpace, layerSheet);
 
                 sheet.FreeRects.Add(new FreeRect
@@ -738,7 +815,7 @@ namespace SW2026RibbonAddin.Commands
                         modelSpace,
                         anglesDeg,
                         layerParts,
-                        placementsLocal,   // ✅ use local
+                        placementsLocal,
                         ref placed,
                         totalInstances,
                         progress))
@@ -746,20 +823,14 @@ namespace SW2026RibbonAddin.Commands
                         break;
                     }
 
-                    // Could not fit on current sheet; add another
                     sheetState = NewSheet();
                 }
             }
 
-            // ✅ assign to out params once at end
             sheets = sheetsLocal;
             placements = placementsLocal;
         }
 
-        /// <summary>
-        /// Place the part in the best free rectangle (Best Short Side Fit, then Long Side Fit, then Area).
-        /// Tries all allowed angles.
-        /// </summary>
         private static bool TryPlaceOnSheet(
             SheetState sheet,
             PartDefinition part,
@@ -827,18 +898,15 @@ namespace SW2026RibbonAddin.Commands
 
             var chosen = sheet.FreeRects[bestRectIndex];
 
-            // Place at the bottom-left corner of the chosen free rect.
             double usedX = chosen.X;
             double usedY = chosen.Y;
 
-            // Actual part bbox min (inside used rect) leaves half gap on left/bottom.
             double partMinLocalX = usedX + partGap * 0.5;
             double partMinLocalY = usedY + partGap * 0.5;
 
             double worldMinX = sheet.OriginX + partMinLocalX;
             double worldMinY = sheet.OriginY + partMinLocalY;
 
-            // Translate so that rotated bbox min becomes worldMin.
             double insertX = worldMinX - bestBounds.MinX;
             double insertY = worldMinY - bestBounds.MinY;
 
@@ -856,7 +924,6 @@ namespace SW2026RibbonAddin.Commands
             SetEntityLayer(insert, layerParts, "PARTS");
             modelSpace.Entities.Add(insert);
 
-            // Record placement
             placements.Add(new PlacementRecord
             {
                 SheetIndex = sheet.Index,
@@ -870,11 +937,9 @@ namespace SW2026RibbonAddin.Commands
                 InsertWorldY = insertY
             });
 
-            // Update sheet stats
             sheet.PlacedCount++;
             sheet.UsedArea += bestBounds.Width * bestBounds.Height;
 
-            // Subtract used rectangle from free space (MaxRects style)
             var usedRect = new FreeRect
             {
                 X = usedX,
@@ -886,7 +951,7 @@ namespace SW2026RibbonAddin.Commands
             SubtractUsedRect(sheet, usedRect);
 
             placed++;
-            progress.Step($"Placed {placed} of {totalInstances} plates...");
+            progress?.Step($"Placed {placed} of {totalInstances} plates...");
 
             return true;
         }
@@ -899,11 +964,6 @@ namespace SW2026RibbonAddin.Commands
                      b.Y + b.Height <= a.Y);
         }
 
-        /// <summary>
-        /// MaxRects-style split: for every free rectangle that intersects the used area,
-        /// split it into up to 4 rectangles (left/right/bottom/top).
-        /// Then prune contained rects and merge adjacent.
-        /// </summary>
         private static void SubtractUsedRect(SheetState sheet, FreeRect used)
         {
             const double eps = 1e-9;
@@ -925,7 +985,6 @@ namespace SW2026RibbonAddin.Commands
                 double frRight = fr.X + fr.Width;
                 double frTop = fr.Y + fr.Height;
 
-                // Left strip
                 if (used.X > fr.X + eps)
                 {
                     newFree.Add(new FreeRect
@@ -937,7 +996,6 @@ namespace SW2026RibbonAddin.Commands
                     });
                 }
 
-                // Right strip
                 if (usedRight < frRight - eps)
                 {
                     newFree.Add(new FreeRect
@@ -949,7 +1007,6 @@ namespace SW2026RibbonAddin.Commands
                     });
                 }
 
-                // Bottom strip
                 if (used.Y > fr.Y + eps)
                 {
                     newFree.Add(new FreeRect
@@ -961,7 +1018,6 @@ namespace SW2026RibbonAddin.Commands
                     });
                 }
 
-                // Top strip
                 if (usedTop < frTop - eps)
                 {
                     newFree.Add(new FreeRect
@@ -974,7 +1030,6 @@ namespace SW2026RibbonAddin.Commands
                 }
             }
 
-            // Drop tiny rectangles
             sheet.FreeRects = newFree
                 .Where(r => r.Width > minSize && r.Height > minSize)
                 .ToList();
@@ -1027,9 +1082,7 @@ namespace SW2026RibbonAddin.Commands
                         var a = rects[i];
                         var b = rects[j];
 
-                        // Vertical merge: same X/Width, touching Y edges
                         bool sameX = Math.Abs(a.X - b.X) < eps && Math.Abs(a.Width - b.Width) < eps;
-
                         if (sameX)
                         {
                             if (Math.Abs(a.Y + a.Height - b.Y) < eps)
@@ -1049,9 +1102,7 @@ namespace SW2026RibbonAddin.Commands
                             }
                         }
 
-                        // Horizontal merge: same Y/Height, touching X edges
                         bool sameY = Math.Abs(a.Y - b.Y) < eps && Math.Abs(a.Height - b.Height) < eps;
-
                         if (sameY)
                         {
                             if (Math.Abs(a.X + a.Width - b.X) < eps)
@@ -1076,16 +1127,10 @@ namespace SW2026RibbonAddin.Commands
             while (changed);
         }
 
-        #endregion
-
-        #region Layers + sheet labels + report
-
-        private static void DrawSheetOutline(
-            SheetState sheet,
-            double sheetWidth,
-            double sheetHeight,
-            BlockRecord modelSpace,
-            object layerSheet)
+        // -----------------------
+        // Drawing helpers
+        // -----------------------
+        private static void DrawSheetOutline(SheetState sheet, double sheetWidth, double sheetHeight, BlockRecord modelSpace, object layerSheet)
         {
             var bottom = new Line
             {
@@ -1119,21 +1164,12 @@ namespace SW2026RibbonAddin.Commands
             modelSpace.Entities.Add(left);
         }
 
-        private static void AddSheetLabel(
-            BlockRecord modelSpace,
-            SheetState sheet,
-            double sheetWidth,
-            double sheetHeight,
-            double sheetMargin,
-            double fillPercent,
-            object layerLabels)
+        private static void AddSheetLabel(BlockRecord modelSpace, SheetState sheet, double sheetWidth, double sheetHeight, double sheetMargin, double fillPercent, object layerLabels)
         {
-            // Put label slightly above sheet
             double x = sheet.OriginX + sheetMargin;
             double y = sheet.OriginY + sheetHeight + sheetMargin;
 
-            string text =
-                $"Sheet {sheet.Index} | Parts: {sheet.PlacedCount} | Fill: {fillPercent:0.0}%";
+            string text = $"Sheet {sheet.Index} | Parts: {sheet.PlacedCount} | Fill: {fillPercent:0.0}%";
 
             var mt = new MText
             {
@@ -1216,16 +1252,10 @@ namespace SW2026RibbonAddin.Commands
             return "\"" + value.Replace("\"", "\"\"") + "\"";
         }
 
-        #endregion
-
-        #region Existing helpers (extents + load blocks + qty parsing)
-
-        private static void GetModelSpaceExtents(
-            CadDocument doc,
-            out double minX,
-            out double minY,
-            out double maxX,
-            out double maxY)
+        // -----------------------
+        // Extents + parts loading (Step 6: log skipped blocks)
+        // -----------------------
+        private static void GetModelSpaceExtents(CadDocument doc, out double minX, out double minY, out double maxX, out double maxY)
         {
             var modelSpace = doc.BlockRecords["*Model_Space"];
 
@@ -1249,7 +1279,7 @@ namespace SW2026RibbonAddin.Commands
                 }
                 catch
                 {
-                    // ignore entities without bbox
+                    // ignore
                 }
             }
 
@@ -1262,8 +1292,11 @@ namespace SW2026RibbonAddin.Commands
             }
         }
 
-        private static IEnumerable<PartDefinition> LoadPartDefinitions(CadDocument doc)
+        private static IEnumerable<PartDefinition> LoadPartDefinitions(CadDocument doc, NestLog log, out int candidateBlocks, out int skippedBlocks)
         {
+            candidateBlocks = 0;
+            skippedBlocks = 0;
+
             var list = new List<PartDefinition>();
 
             foreach (var br in doc.BlockRecords)
@@ -1277,14 +1310,28 @@ namespace SW2026RibbonAddin.Commands
                 if (!br.Name.StartsWith("P_", StringComparison.OrdinalIgnoreCase))
                     continue;
 
+                candidateBlocks++;
+
                 int qty = ParseQuantityFromBlockName(br.Name);
                 if (qty <= 0)
+                {
                     qty = 1;
+                    log.Warn($"Block '{br.Name}' had invalid quantity; defaulted to 1.");
+                }
+
+                if (br.Entities == null || br.Entities.Count == 0)
+                {
+                    skippedBlocks++;
+                    log.Warn($"Skipped block '{br.Name}' (empty block).");
+                    continue;
+                }
 
                 double minX = double.MaxValue;
                 double minY = double.MaxValue;
                 double maxX = double.MinValue;
                 double maxY = double.MinValue;
+
+                int entNoBBox = 0;
 
                 foreach (var ent in br.Entities)
                 {
@@ -1301,13 +1348,15 @@ namespace SW2026RibbonAddin.Commands
                     }
                     catch
                     {
-                        // ignore entities without bbox
+                        entNoBBox++;
                     }
                 }
 
                 if (minX == double.MaxValue || maxX == double.MinValue ||
                     minY == double.MaxValue || maxY == double.MinValue)
                 {
+                    skippedBlocks++;
+                    log.Warn($"Skipped block '{br.Name}' (no bounding box; entities without bbox: {entNoBBox}).");
                     continue;
                 }
 
@@ -1315,7 +1364,14 @@ namespace SW2026RibbonAddin.Commands
                 double height = maxY - minY;
 
                 if (width <= 0.0 || height <= 0.0)
+                {
+                    skippedBlocks++;
+                    log.Warn($"Skipped block '{br.Name}' (invalid size {width:0.###} x {height:0.###}).");
                     continue;
+                }
+
+                if (entNoBBox > 0)
+                    log.Warn($"Block '{br.Name}' contains {entNoBBox} entities without bbox (ignored for extents).");
 
                 list.Add(new PartDefinition
                 {
@@ -1330,6 +1386,9 @@ namespace SW2026RibbonAddin.Commands
                     Quantity = qty
                 });
             }
+
+            if (candidateBlocks > 0 && list.Count == 0)
+                log.Warn("Found P_* blocks but all were skipped (empty or bbox errors).");
 
             return list;
         }
@@ -1349,10 +1408,11 @@ namespace SW2026RibbonAddin.Commands
 
             return 1;
         }
-
-        #endregion
     }
 
+    // -----------------------
+    // Options form
+    // -----------------------
     internal sealed class LaserCutOptionsForm : Form
     {
         private readonly TextBox _txtWidth;
@@ -1543,6 +1603,9 @@ namespace SW2026RibbonAddin.Commands
         }
     }
 
+    // -----------------------
+    // Progress form
+    // -----------------------
     internal sealed class LaserCutProgressForm : Form
     {
         private readonly ProgressBar _progressBar;
