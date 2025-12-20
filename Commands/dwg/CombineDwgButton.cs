@@ -1,20 +1,15 @@
 ﻿using System;
 using System.Collections.Generic;
-using System.Drawing;                 // Bitmap/Graphics/Font (measurement only)
-using System.Drawing.Text;
 using System.Globalization;
 using System.IO;
 using System.Linq;
-using System.Security.Cryptography;
 using System.Text;
 using System.Windows.Forms;
 using ACadSharp;
 using ACadSharp.Entities;
 using ACadSharp.IO;
 using ACadSharp.Tables;
-using CSMath; // XYZ, BoundingBox, etc.
-
-// DWG entity colors must be ACadSharp.Color (avoid ambiguity with System.Drawing.Color)
+using CSMath;
 using AcadColor = ACadSharp.Color;
 
 namespace SW2026RibbonAddin.Commands
@@ -24,7 +19,7 @@ namespace SW2026RibbonAddin.Commands
         public string Id => "CombineDwg";
 
         public string DisplayName => "Combine\nDWG";
-        public string Tooltip => "Combine DWG exports from multiple jobs into per-thickness DWGs and a summary CSV.";
+        public string Tooltip => "Combine job DWGs into per-thickness DWGs (now normalizes MaterialType).";
         public string Hint => "Combine DWG exports";
 
         public string SmallIconFile => "combine_dwg_20.png";
@@ -43,15 +38,12 @@ namespace SW2026RibbonAddin.Commands
 
             try
             {
-                DwgBatchCombiner.Combine(mainFolder);
+                DwgBatchCombiner.Combine(mainFolder, showUi: true);
             }
             catch (Exception ex)
             {
-                MessageBox.Show(
-                    "Combine DWG failed:\r\n\r\n" + ex.Message,
-                    "Combine DWG",
-                    MessageBoxButtons.OK,
-                    MessageBoxIcon.Error);
+                MessageBox.Show("Combine DWG failed:\r\n\r\n" + ex.Message, "Combine DWG",
+                    MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
         }
 
@@ -61,7 +53,7 @@ namespace SW2026RibbonAddin.Commands
         {
             using (var dlg = new FolderBrowserDialog())
             {
-                dlg.Description = "Select the MAIN folder that contains job subfolders (each with parts.csv + DWGs)";
+                dlg.Description = "Select MAIN folder (contains job subfolders with parts.csv + DWGs)";
                 dlg.ShowNewFolderButton = false;
 
                 if (dlg.ShowDialog() != DialogResult.OK)
@@ -72,511 +64,361 @@ namespace SW2026RibbonAddin.Commands
         }
     }
 
+    // ✅ Shared normalizer used by Combine + LaserCut
+    internal static class MaterialTypeNormalizer
+    {
+        public const string TYPE_STEEL = "STEEL";
+        public const string TYPE_ALUMINUM = "ALUMINUM";
+        public const string TYPE_STAINLESS = "STAINLESS";
+        public const string TYPE_OTHER = "OTHER";
+
+        public static string NormalizeToType(string rawOrTag)
+        {
+            string s = (rawOrTag ?? "").Trim();
+            if (string.IsNullOrEmpty(s))
+                return TYPE_OTHER;
+
+            // strip long SW material strings: take last segment after :: or \ or /
+            if (s.Contains("::"))
+            {
+                var parts = s.Split(new[] { "::" }, StringSplitOptions.RemoveEmptyEntries);
+                s = parts.Length > 0 ? parts[parts.Length - 1] : s;
+            }
+            s = s.Replace('\\', '/');
+            if (s.Contains("/"))
+            {
+                var parts = s.Split(new[] { '/' }, StringSplitOptions.RemoveEmptyEntries);
+                s = parts.Length > 0 ? parts[parts.Length - 1] : s;
+            }
+
+            string u = s.Trim().ToUpperInvariant();
+
+            // quick keywords
+            if (u.Contains("STAINLESS") || u.StartsWith("SS") || u.Contains(" AISI 304") || u.Contains("304") || u.Contains("316"))
+                return TYPE_STAINLESS;
+
+            if (u.Contains("ALUMIN") || u.StartsWith("ALU") || u.Contains("AL-") || u.Contains("6061") || u.Contains("5083") || u.Contains("7075"))
+                return TYPE_ALUMINUM;
+
+            // steel patterns (common in EU/IR shops)
+            if (u.Contains("STEEL") || u.Contains("ST37") || u.Contains("ST-37") || u.Contains("S235") || u.Contains("S355") || u.Contains("A36") || u.Contains("CK") || u.Contains("C45"))
+                return TYPE_STEEL;
+
+            // fallback
+            return TYPE_OTHER;
+        }
+
+        public static string MakeSafeTag(string s)
+        {
+            s = (s ?? "").Trim().ToUpperInvariant();
+            if (string.IsNullOrEmpty(s)) s = TYPE_OTHER;
+
+            var sb = new StringBuilder(s.Length);
+            foreach (char c in s)
+            {
+                if (char.IsLetterOrDigit(c)) sb.Append(c);
+                else sb.Append('_');
+            }
+
+            string r = sb.ToString().Trim('_');
+            return string.IsNullOrEmpty(r) ? TYPE_OTHER : r;
+        }
+
+        public static string TryParseMaterialFromFileName(string fileName)
+        {
+            if (string.IsNullOrWhiteSpace(fileName))
+                return null;
+
+            const string token = "__MAT_";
+            int idx = fileName.IndexOf(token, StringComparison.OrdinalIgnoreCase);
+            if (idx < 0) return null;
+
+            int start = idx + token.Length;
+            if (start >= fileName.Length) return null;
+
+            int end = fileName.IndexOf("__", start, StringComparison.OrdinalIgnoreCase);
+            if (end < 0) end = fileName.Length;
+
+            string tag = fileName.Substring(start, end - start);
+            return string.IsNullOrWhiteSpace(tag) ? null : tag.Trim();
+        }
+    }
+
     internal static class DwgBatchCombiner
     {
-        private static readonly Random _random = new Random();
+        private static readonly Random _rnd = new Random();
 
-        // --------------------------------------------------------------------
-        // 1) RANDOM COLORS that are visible on black background
-        // --------------------------------------------------------------------
-        private static readonly byte[][] VisibleAciGroups =
-        {
-            new byte[] { 11, 241 },                 // bright reds / pinkish reds
-            new byte[] { 20, 30 },                  // oranges
-            new byte[] { 40, 50 },                  // yellows
-            new byte[] { 60, 70 },                  // yellow-green / lime
-            new byte[] { 80, 90 },                  // greens
-            new byte[] { 100, 110 },                // green-cyans
-            new byte[] { 120, 130 },                // cyans
-            new byte[] { 140, 150, 161, 171 },      // brighter blues
-            new byte[] { 191, 201 },                // brighter purples
-            new byte[] { 210, 220, 230 },           // magenta -> pink
-            new byte[] { 7 }                        // white
-        };
-
-        private static readonly Queue<byte> _visibleAciQueue = new Queue<byte>();
-
-        private static void Shuffle<T>(T[] array)
-        {
-            for (int i = array.Length - 1; i > 0; i--)
-            {
-                int j = _random.Next(i + 1);
-                T tmp = array[i];
-                array[i] = array[j];
-                array[j] = tmp;
-            }
-        }
-
-        private static void RefillVisibleColorQueue()
-        {
-            _visibleAciQueue.Clear();
-
-            int groupCount = VisibleAciGroups.Length;
-
-            int[] groupOrder = Enumerable.Range(0, groupCount).ToArray();
-            Shuffle(groupOrder);
-
-            var perGroupQueues = new Queue<byte>[groupCount];
-            for (int i = 0; i < groupCount; i++)
-            {
-                byte[] colors = (byte[])VisibleAciGroups[i].Clone();
-                Shuffle(colors);
-                perGroupQueues[i] = new Queue<byte>(colors);
-            }
-
-            bool addedAny;
-            do
-            {
-                addedAny = false;
-                foreach (int gi in groupOrder)
-                {
-                    if (perGroupQueues[gi].Count > 0)
-                    {
-                        _visibleAciQueue.Enqueue(perGroupQueues[gi].Dequeue());
-                        addedAny = true;
-                    }
-                }
-            }
-            while (addedAny);
-        }
-
-        private static AcadColor NextVisibleColor()
-        {
-            if (_visibleAciQueue.Count == 0)
-                RefillVisibleColorQueue();
-
-            return new AcadColor(_visibleAciQueue.Dequeue());
-        }
-
-        // --------------------------------------------------------------------
-        // 2) TEXT WIDTH ESTIMATION (conservative, avoids overlap in AutoCAD)
-        // --------------------------------------------------------------------
-        // Important: AutoCAD text width can be wider than Windows-measured Arial.
-        // So we compute:
-        //   width = MAX(GDI_estimate, char_count_estimate) * safety
-        // This prevents under-estimation and fixes overlap.
-        private const string MeasureFontFamily = "Arial";
-
-        // Tuning knobs (safe defaults)
-        private const double CharWidthFactor = 0.80;     // per-character width in "text heights"
-        private const double WidthSafetyFactor = 1.20;   // extra safety to prevent overlap
-        private const double SidePaddingFactor = 1.50;   // padding each side in "text heights"
-
-        private static readonly object _measureLock = new object();
-        private static Bitmap _measureBmp;
-        private static Graphics _measureG;
-
-        private static double EstimateTextWidthInDwgUnits(string text, double dwgTextHeight)
-        {
-            if (string.IsNullOrEmpty(text) || dwgTextHeight <= 0.0)
-                return 0.0;
-
-            // Conservative fallback: characters * height * factor
-            double byChars = text.Length * dwgTextHeight * CharWidthFactor;
-
-            double byGdi = 0.0;
-            try
-            {
-                lock (_measureLock)
-                {
-                    if (_measureBmp == null)
-                    {
-                        _measureBmp = new Bitmap(1, 1);
-                        _measureG = Graphics.FromImage(_measureBmp);
-                        _measureG.TextRenderingHint = TextRenderingHint.AntiAlias;
-                    }
-
-                    // Large pixel font gives stable ratios
-                    using (var font = new Font(MeasureFontFamily, 100f, FontStyle.Regular, GraphicsUnit.Pixel))
-                    using (var fmt = (StringFormat)StringFormat.GenericTypographic.Clone())
-                    {
-                        fmt.FormatFlags |= StringFormatFlags.MeasureTrailingSpaces;
-
-                        // Measure in pixels
-                        var size = _measureG.MeasureString(text, font, int.MaxValue, fmt);
-
-                        float h = size.Height;
-                        if (h > 0.001f)
-                        {
-                            // Convert by ratio: width/height * desired dwg height
-                            double ratio = size.Width / h;
-                            byGdi = ratio * dwgTextHeight;
-                        }
-                    }
-                }
-            }
-            catch
-            {
-                // ignore; we will fall back to byChars
-                byGdi = 0.0;
-            }
-
-            double w = Math.Max(byChars, byGdi);
-            return w * WidthSafetyFactor;
-        }
-
-        // --------------------------------------------------------------------
-        // 3) SAFE MERGING + COLLISION RESISTANCE + LOGGING
-        // --------------------------------------------------------------------
         private sealed class CombinedPart
         {
             public string FileName;
+            public string FolderName;
             public string FullPath;
+
             public double ThicknessMm;
             public int Quantity;
 
-            // Hash used to avoid merging different DWGs that share filename/thickness
-            public string HashHex;
-
-            public HashSet<string> SourceFolders = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            public string MaterialRaw;
+            public string MaterialType; // normalized: STEEL/ALUMINUM/STAINLESS/OTHER
+            public string MaterialTag;  // safe: STEEL, ALUMINUM, ...
         }
 
-        public static void Combine(string mainFolder)
+        public static void Combine(string mainFolder, bool showUi)
         {
-            var log = new List<string>();
-
-            void Log(string message)
+            if (string.IsNullOrWhiteSpace(mainFolder) || !Directory.Exists(mainFolder))
             {
-                log.Add($"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] {message}");
-            }
-
-            if (string.IsNullOrEmpty(mainFolder) || !Directory.Exists(mainFolder))
-            {
-                MessageBox.Show("The selected folder does not exist.", "Combine DWG",
-                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                if (showUi) MessageBox.Show("Folder does not exist.", "Combine DWG", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 return;
             }
 
-            string[] subFolders;
-            try
-            {
-                subFolders = Directory.GetDirectories(mainFolder, "*", SearchOption.TopDirectoryOnly);
-            }
-            catch (Exception ex)
-            {
-                MessageBox.Show("Failed to enumerate subfolders:\r\n\r\n" + ex.Message,
-                    "Combine DWG",
-                    MessageBoxButtons.OK,
-                    MessageBoxIcon.Error);
-                return;
-            }
-
+            var subFolders = Directory.GetDirectories(mainFolder, "*", SearchOption.TopDirectoryOnly);
             if (subFolders.Length == 0)
             {
-                MessageBox.Show("The selected folder does not contain any subfolders.",
-                    "Combine DWG",
-                    MessageBoxButtons.OK,
-                    MessageBoxIcon.Information);
+                if (showUi) MessageBox.Show("No job subfolders found.", "Combine DWG", MessageBoxButtons.OK, MessageBoxIcon.Information);
                 return;
             }
 
-            // Merge key strategy:
-            // - If hash exists: FileName + Thickness + Hash => merge only identical geometry
-            // - If missing/unreadable: FileName + Thickness + Folder => do NOT merge across jobs
+            // key includes material type (normalized)
             var combined = new Dictionary<string, CombinedPart>(StringComparer.OrdinalIgnoreCase);
-
-            int rowsRead = 0;
-            int missingDwgCount = 0;
 
             foreach (string sub in subFolders)
             {
+                string folderName = Path.GetFileName(sub);
+                if (string.IsNullOrWhiteSpace(folderName)) folderName = "Job";
+
                 string csvPath = Path.Combine(sub, "parts.csv");
                 if (!File.Exists(csvPath))
                     continue;
 
-                string folderName = Path.GetFileName(sub);
-
                 string[] lines;
-                try
-                {
-                    lines = File.ReadAllLines(csvPath);
-                }
-                catch (Exception ex)
-                {
-                    Log($"Failed to read CSV: '{csvPath}' => {ex.Message}");
-                    continue;
-                }
+                try { lines = File.ReadAllLines(csvPath); }
+                catch { continue; }
 
-                if (lines.Length <= 1)
+                if (lines.Length < 2)
                     continue;
 
                 for (int i = 1; i < lines.Length; i++)
                 {
-                    string line = lines[i];
+                    string line = lines[i].Trim();
                     if (string.IsNullOrWhiteSpace(line))
                         continue;
 
-                    string[] cols = line.Split(',');
+                    var cols = SplitCsvSimple(line);
                     if (cols.Length < 3)
-                    {
-                        Log($"Bad CSV row (needs 3 columns): '{csvPath}' line {i + 1}: {line}");
-                        continue;
-                    }
-
-                    string fileName = (cols[0] ?? "").Trim();
-                    if (string.IsNullOrEmpty(fileName))
                         continue;
 
-                    if (!double.TryParse((cols[1] ?? "").Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out double tMm))
-                    {
-                        Log($"Bad thickness value: '{csvPath}' line {i + 1}: {line}");
+                    string fileName = cols[0].Trim().Trim('"');
+                    if (string.IsNullOrWhiteSpace(fileName))
                         continue;
-                    }
 
-                    if (!int.TryParse((cols[2] ?? "").Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out int qty))
-                    {
-                        Log($"Bad quantity value: '{csvPath}' line {i + 1}: {line}");
+                    if (!double.TryParse(cols[1].Trim().Trim('"'), NumberStyles.Float, CultureInfo.InvariantCulture, out double thicknessMm))
                         continue;
-                    }
 
-                    rowsRead++;
+                    if (!int.TryParse(cols[2].Trim().Trim('"'), NumberStyles.Integer, CultureInfo.InvariantCulture, out int qty))
+                        qty = 1;
+
+                    // raw from CSV col4 if exists, else try parse from filename __MAT_
+                    string materialRaw = cols.Length >= 4 ? cols[3].Trim().Trim('"') : null;
+                    if (string.IsNullOrWhiteSpace(materialRaw))
+                        materialRaw = MaterialTypeNormalizer.TryParseMaterialFromFileName(fileName) ?? "UNKNOWN";
+
+                    string materialType = MaterialTypeNormalizer.NormalizeToType(materialRaw);
+                    string materialTag = MaterialTypeNormalizer.MakeSafeTag(materialType);
 
                     string fullPath = Path.Combine(sub, fileName);
+                    if (!File.Exists(fullPath))
+                        continue;
 
-                    string hashHex = null;
-                    if (File.Exists(fullPath))
-                    {
-                        hashHex = TryComputeSha256Hex(fullPath);
-                        if (string.IsNullOrWhiteSpace(hashHex))
-                            Log($"Failed to hash DWG (will not cross-merge): '{fullPath}'");
-                    }
-                    else
-                    {
-                        missingDwgCount++;
-                        Log($"Missing DWG referenced by CSV: '{fullPath}'");
-                    }
+                    string key = MakeKey(fileName, thicknessMm, materialTag, folderName);
 
-                    string key = MakeKey(fileName, tMm, hashHex, folderName);
-
-                    if (!combined.TryGetValue(key, out CombinedPart part))
+                    if (!combined.TryGetValue(key, out var existing))
                     {
-                        part = new CombinedPart
+                        combined[key] = new CombinedPart
                         {
                             FileName = fileName,
+                            FolderName = folderName,
                             FullPath = fullPath,
-                            ThicknessMm = tMm,
-                            Quantity = 0,
-                            HashHex = hashHex
+                            ThicknessMm = thicknessMm,
+                            Quantity = Math.Max(1, qty),
+                            MaterialRaw = materialRaw,
+                            MaterialType = materialType,
+                            MaterialTag = materialTag
                         };
-                        part.SourceFolders.Add(folderName);
-
-                        combined.Add(key, part);
                     }
                     else
                     {
-                        // Prefer existing file if stored path is missing
-                        if (!File.Exists(part.FullPath) && File.Exists(fullPath))
-                            part.FullPath = fullPath;
-
-                        part.SourceFolders.Add(folderName);
+                        existing.Quantity += Math.Max(1, qty);
                     }
-
-                    part.Quantity += qty;
                 }
             }
 
             if (combined.Count == 0)
             {
-                MessageBox.Show("No parts.csv files with data were found in any subfolder.",
-                    "Combine DWG",
-                    MessageBoxButtons.OK,
-                    MessageBoxIcon.Information);
-                WriteLogIfAny(mainFolder, log);
+                if (showUi) MessageBox.Show("No valid parts.csv entries were found.", "Combine DWG", MessageBoxButtons.OK, MessageBoxIcon.Information);
                 return;
             }
 
             var list = combined.Values
                 .OrderBy(p => p.ThicknessMm)
+                .ThenBy(p => p.MaterialTag, StringComparer.OrdinalIgnoreCase)
                 .ThenBy(p => p.FileName, StringComparer.OrdinalIgnoreCase)
                 .ToList();
 
-            // Summary CSV
+            // all_parts.csv now includes MaterialRaw + MaterialType (extra column at end)
             string allCsvPath = Path.Combine(mainFolder, "all_parts.csv");
-            var outLines = new List<string> { "FileName,PlateThickness_mm,Quantity,Folder" };
+            var outLines = new List<string> { "FileName,PlateThickness_mm,Quantity,Folder,Material,MaterialType" };
 
             foreach (var p in list)
             {
-                string folders = string.Join(";", p.SourceFolders.OrderBy(x => x, StringComparer.OrdinalIgnoreCase));
-
                 outLines.Add(string.Format(CultureInfo.InvariantCulture,
-                    "{0},{1},{2},{3}",
+                    "{0},{1},{2},{3},{4},{5}",
                     EscapeCsv(p.FileName),
                     p.ThicknessMm.ToString("0.###", CultureInfo.InvariantCulture),
                     p.Quantity,
-                    EscapeCsv(folders)));
+                    EscapeCsv(p.FolderName),
+                    EscapeCsv(p.MaterialRaw),
+                    EscapeCsv(p.MaterialType)));
             }
 
-            try { File.WriteAllLines(allCsvPath, outLines); }
-            catch (Exception ex) { Log($"Failed to write summary CSV '{allCsvPath}': {ex.Message}"); }
+            try { File.WriteAllLines(allCsvPath, outLines, Encoding.UTF8); } catch { }
 
-            // Create per-thickness DWGs
-            CreatePerThicknessDwgs(mainFolder, list, Log);
+            CreatePerThicknessDwgs(mainFolder, list);
 
-            // Log if needed
-            string logPath = WriteLogIfAny(mainFolder, log);
-
-            MessageBox.Show(
-                "DWG combination finished.\r\n\r\n" +
-                "Rows read from CSVs: " + rowsRead + Environment.NewLine +
-                "Unique parts: " + list.Count + Environment.NewLine +
-                "Missing DWGs referenced by CSV: " + missingDwgCount + Environment.NewLine +
-                "Summary CSV: " + allCsvPath +
-                (string.IsNullOrEmpty(logPath) ? "" : (Environment.NewLine + "Log: " + logPath)),
-                "Combine DWG",
-                MessageBoxButtons.OK,
-                MessageBoxIcon.Information);
-        }
-
-        private static string WriteLogIfAny(string mainFolder, List<string> log)
-        {
-            if (log == null || log.Count == 0)
-                return null;
-
-            string logPath = Path.Combine(mainFolder, "combine_log.txt");
-            try
+            if (showUi)
             {
-                File.WriteAllLines(logPath, log);
-                return logPath;
-            }
-            catch
-            {
-                return null;
+                MessageBox.Show(
+                    "DWG combination finished.\r\n\r\n" +
+                    "Unique part-lines: " + list.Count + "\r\n" +
+                    "Summary CSV: " + allCsvPath,
+                    "Combine DWG",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Information);
             }
         }
 
-        private static string MakeKey(string fileName, double thicknessMm, string hashHex, string folderName)
+        private static string MakeKey(string fileName, double thicknessMm, string materialTag, string folderName)
         {
-            string f = (fileName ?? "").Trim().ToUpperInvariant();
-            string t = thicknessMm.ToString("0.###", CultureInfo.InvariantCulture);
-
-            if (!string.IsNullOrWhiteSpace(hashHex))
-                return f + "|" + t + "|" + hashHex.Trim().ToUpperInvariant();
-
-            return f + "|" + t + "|" + (folderName ?? "").Trim().ToUpperInvariant();
-        }
-
-        private static string TryComputeSha256Hex(string filePath)
-        {
-            try
-            {
-                using (var sha = SHA256.Create())
-                using (var fs = File.OpenRead(filePath))
-                {
-                    byte[] hash = sha.ComputeHash(fs);
-                    return BytesToHex(hash);
-                }
-            }
-            catch
-            {
-                return null;
-            }
-        }
-
-        private static string BytesToHex(byte[] bytes)
-        {
-            if (bytes == null || bytes.Length == 0)
-                return null;
-
-            var sb = new StringBuilder(bytes.Length * 2);
-            for (int i = 0; i < bytes.Length; i++)
-                sb.Append(bytes[i].ToString("x2", CultureInfo.InvariantCulture));
-
-            return sb.ToString();
+            return (fileName ?? "").Trim().ToUpperInvariant() + "|" +
+                   thicknessMm.ToString("0.###", CultureInfo.InvariantCulture) + "|" +
+                   (materialTag ?? "OTHER").Trim().ToUpperInvariant() + "|" +
+                   (folderName ?? "JOB").Trim().ToUpperInvariant();
         }
 
         private static string EscapeCsv(string value)
         {
-            if (value == null)
-                return "";
-
+            if (value == null) return "";
             bool mustQuote = value.Contains(",") || value.Contains("\"") || value.Contains("\r") || value.Contains("\n");
-            if (!mustQuote)
-                return value;
-
-            string escaped = value.Replace("\"", "\"\"");
-            return "\"" + escaped + "\"";
+            if (!mustQuote) return value;
+            return "\"" + value.Replace("\"", "\"\"") + "\"";
         }
 
-        /// <summary>
-        /// Block name: P_{name}[_H{hash8}]_Q{qty}
-        /// Keep _Q{qty} at end so LaserCut parsing still works.
-        /// </summary>
-        private static string MakePlateBlockName(string fileName, string hashHex, int quantity)
+        private static string[] SplitCsvSimple(string line)
         {
-            string baseName = Path.GetFileNameWithoutExtension(fileName);
-            if (string.IsNullOrEmpty(baseName))
-                baseName = "Part";
+            var cols = new List<string>();
+            var sb = new StringBuilder();
+            bool inQ = false;
+
+            foreach (char c in line)
+            {
+                if (c == '"')
+                {
+                    inQ = !inQ;
+                    sb.Append(c);
+                    continue;
+                }
+
+                if (c == ',' && !inQ)
+                {
+                    cols.Add(sb.ToString());
+                    sb.Clear();
+                    continue;
+                }
+
+                sb.Append(c);
+            }
+
+            cols.Add(sb.ToString());
+            return cols.ToArray();
+        }
+
+        private static string ComputeFileHash8(string path)
+        {
+            try
+            {
+                using (var sha = System.Security.Cryptography.SHA256.Create())
+                using (var fs = File.OpenRead(path))
+                {
+                    byte[] h = sha.ComputeHash(fs);
+                    return BitConverter.ToString(h, 0, 4).Replace("-", ""); // 8 hex chars
+                }
+            }
+            catch
+            {
+                return _rnd.Next(0, int.MaxValue).ToString("X8", CultureInfo.InvariantCulture);
+            }
+        }
+
+        // Bright/distinct ACI indices (good on black background)
+        private static readonly byte[] GoodAci = new byte[]
+        {
+            1, 2, 3, 4, 5, 6, 10, 11, 12, 13, 14, 20, 21, 30, 31, 40, 50, 60, 70, 90,
+            100, 110, 120, 130, 140, 150, 160, 170, 180, 190, 200, 210, 220, 230, 240, 250
+        };
+
+        /// <summary>
+        /// Block name format used by LaserCut:
+        /// P_<PartName>__MAT_<MaterialTypeTag>__H<hash8>_Q<qty>
+        /// Quantity MUST remain "_Q{n}" at end.
+        /// </summary>
+        private static string MakePlateBlockName(string fileName, string materialTypeTag, string hash8, int quantity)
+        {
+            string baseName = Path.GetFileNameWithoutExtension(fileName) ?? "Part";
+
+            // If file already has __MAT_ tag, remove it to avoid duplication
+            int matIdx = baseName.LastIndexOf("__MAT_", StringComparison.OrdinalIgnoreCase);
+            if (matIdx >= 0)
+                baseName = baseName.Substring(0, matIdx);
 
             var sb = new StringBuilder();
             foreach (char c in baseName)
                 sb.Append(char.IsLetterOrDigit(c) ? c : '_');
 
-            string safe = sb.Length > 0 ? sb.ToString() : "Part";
+            string safePart = sb.Length > 0 ? sb.ToString() : "Part";
+            string safeMat = string.IsNullOrWhiteSpace(materialTypeTag) ? "OTHER" : materialTypeTag.Trim().ToUpperInvariant();
+            string safeHash = string.IsNullOrWhiteSpace(hash8) ? "00000000" : hash8.Trim();
             int q = Math.Max(1, quantity);
 
-            string h = null;
-            if (!string.IsNullOrWhiteSpace(hashHex))
-            {
-                string hh = hashHex.Trim();
-                h = hh.Length <= 8 ? hh : hh.Substring(0, 8);
-            }
-
-            if (!string.IsNullOrEmpty(h))
-                return string.Format(CultureInfo.InvariantCulture, "P_{0}_H{1}_Q{2}", safe, h, q);
-
-            return string.Format(CultureInfo.InvariantCulture, "P_{0}_Q{1}", safe, q);
+            return $"P_{safePart}__MAT_{safeMat}__H{safeHash}_Q{q}";
         }
 
-        private static bool BlockRecordExists(CadDocument doc, string blockName)
+        private static string EnsureUniqueBlockName(CadDocument doc, string name)
         {
-            if (doc == null || string.IsNullOrWhiteSpace(blockName))
-                return false;
+            if (doc == null || string.IsNullOrWhiteSpace(name)) return name;
 
-            try
+            string candidate = name;
+            int n = 1;
+
+            while (doc.BlockRecords.Contains(candidate))
             {
-                var _ = doc.BlockRecords[blockName];
-                return true;
+                candidate = name + "__" + n.ToString(CultureInfo.InvariantCulture);
+                n++;
             }
-            catch
-            {
-                return false;
-            }
+
+            return candidate;
         }
 
-        private static string EnsureUniqueBlockName(CadDocument doc, string desiredName)
+        private const double TextWidthFactor = 1.0;
+        private static double EstimateTextWidth(string text, double textHeight)
         {
-            if (doc == null || string.IsNullOrWhiteSpace(desiredName))
-                return desiredName;
-
-            if (!BlockRecordExists(doc, desiredName))
-                return desiredName;
-
-            // Insert suffix before _Q so qty stays parseable
-            int qIdx = desiredName.LastIndexOf("_Q", StringComparison.OrdinalIgnoreCase);
-            string left = qIdx >= 0 ? desiredName.Substring(0, qIdx) : desiredName;
-            string right = qIdx >= 0 ? desiredName.Substring(qIdx) : "";
-
-            for (int i = 2; i < 9999; i++)
-            {
-                string candidate = left + "_D" + i.ToString(CultureInfo.InvariantCulture) + right;
-                if (!BlockRecordExists(doc, candidate))
-                    return candidate;
-            }
-
-            return left + "_D" + Guid.NewGuid().ToString("N").Substring(0, 6) + right;
+            if (string.IsNullOrEmpty(text) || textHeight <= 0.0) return 0.0;
+            return text.Length * textHeight * TextWidthFactor;
         }
 
-        private static void CreatePerThicknessDwgs(string mainFolder, List<CombinedPart> parts, Action<string> log)
+        private static void CreatePerThicknessDwgs(string mainFolder, List<CombinedPart> parts)
         {
-            var groups = parts
-                .GroupBy(p => p.ThicknessMm)
-                .OrderBy(g => g.Key);
+            var thicknessGroups = parts.GroupBy(p => p.ThicknessMm).OrderBy(g => g.Key);
 
-            foreach (var g in groups)
+            foreach (var g in thicknessGroups)
             {
-                // Fresh color sequence per output DWG
-                RefillVisibleColorQueue();
-
                 double thickness = g.Key;
                 string thicknessText = thickness.ToString("0.###", CultureInfo.InvariantCulture);
                 string fileSafeThickness = thicknessText.Replace('.', '_').Replace(',', '_');
@@ -584,9 +426,12 @@ namespace SW2026RibbonAddin.Commands
                 string outPath = Path.Combine(mainFolder, $"thickness_{fileSafeThickness}.dwg");
 
                 var doc = new CadDocument();
+                BlockRecord modelSpace = doc.BlockRecords["*Model_Space"];
 
                 double cursorX = 0.0;
                 const double marginX = 50.0;
+
+                int colorIndex = 0;
 
                 foreach (var part in g)
                 {
@@ -599,30 +444,26 @@ namespace SW2026RibbonAddin.Commands
                         using (var reader = new DwgReader(part.FullPath))
                             srcDoc = reader.Read();
                     }
-                    catch (Exception ex)
+                    catch
                     {
-                        log?.Invoke($"DWG read failed: '{part.FullPath}' => {ex.Message}");
                         continue;
                     }
 
                     BlockRecord srcModel;
-                    try
-                    {
-                        srcModel = srcDoc.BlockRecords["*Model_Space"];
-                    }
-                    catch (Exception ex)
-                    {
-                        log?.Invoke($"DWG missing *Model_Space: '{part.FullPath}' => {ex.Message}");
-                        continue;
-                    }
+                    try { srcModel = srcDoc.BlockRecords["*Model_Space"]; }
+                    catch { continue; }
 
-                    string desiredName = MakePlateBlockName(part.FileName, part.HashHex, part.Quantity);
-                    string blockName = EnsureUniqueBlockName(doc, desiredName);
+                    string hash8 = ComputeFileHash8(part.FullPath);
+
+                    string blockName = MakePlateBlockName(part.FileName, part.MaterialTag, hash8, part.Quantity);
+                    blockName = EnsureUniqueBlockName(doc, blockName);
 
                     var block = new BlockRecord(blockName);
                     doc.BlockRecords.Add(block);
 
-                    var blockColor = NextVisibleColor();
+                    byte aci = GoodAci[colorIndex % GoodAci.Length];
+                    colorIndex++;
+                    var blockColor = new AcadColor(aci);
 
                     foreach (var ent in srcModel.Entities)
                     {
@@ -666,72 +507,51 @@ namespace SW2026RibbonAddin.Commands
                     double blockWidth = maxX - minX;
                     if (blockWidth <= 0.0) blockWidth = 1.0;
 
-                    // labels
+                    // text under plate
                     double textHeight = 20.0;
-
                     double baselineY = 0.0;
                     double gapPlateToFirst = 8.0;
                     double gapBetweenLines = 10.0;
 
                     double textY1 = baselineY - textHeight - gapPlateToFirst;
                     double textY2 = textY1 - textHeight - gapBetweenLines;
+                    double textY3 = textY2 - textHeight - gapBetweenLines;
 
                     string label1 = $"Plate: {thicknessText} mm";
                     string label2 = $"Qty: {part.Quantity}";
+                    string label3 = $"MatType: {part.MaterialType}";
 
-                    double textWidth1 = EstimateTextWidthInDwgUnits(label1, textHeight);
-                    double textWidth2 = EstimateTextWidthInDwgUnits(label2, textHeight);
-                    double maxTextWidth = Math.Max(textWidth1, textWidth2);
+                    double w1 = EstimateTextWidth(label1, textHeight);
+                    double w2 = EstimateTextWidth(label2, textHeight);
+                    double w3 = EstimateTextWidth(label3, textHeight);
+                    double maxTextWidth = Math.Max(w1, Math.Max(w2, w3));
 
-                    // Bigger side padding to guarantee separation on black background + wide fonts
-                    double extraTextSidePadding = textHeight * SidePaddingFactor;
+                    double extraPad = textHeight;
+                    double colWidth = maxTextWidth > blockWidth ? maxTextWidth + 2 * extraPad : blockWidth;
 
-                    double columnWidth = Math.Max(blockWidth, maxTextWidth + 2.0 * extraTextSidePadding);
-                    double columnCenterX = cursorX + columnWidth / 2.0;
-
-                    // place block centered
+                    double colCenterX = cursorX + colWidth / 2.0;
                     double blockCenterLocalX = (minX + maxX) * 0.5;
-                    double insertX = columnCenterX - blockCenterLocalX;
+
+                    double insertX = colCenterX - blockCenterLocalX;
                     double insertY = -minY;
 
-                    doc.Entities.Add(new Insert(block)
+                    modelSpace.Entities.Add(new Insert(block)
                     {
-                        InsertPoint = new XYZ(insertX, insertY, 0.0),
-                        XScale = 1.0,
-                        YScale = 1.0,
-                        ZScale = 1.0
+                        InsertPoint = new XYZ(insertX, insertY, 0),
+                        XScale = 1,
+                        YScale = 1,
+                        ZScale = 1
                     });
 
-                    // center labels
-                    double text1InsertX = columnCenterX - textWidth1 / 2.0;
-                    double text2InsertX = columnCenterX - textWidth2 / 2.0;
+                    modelSpace.Entities.Add(new MText { Value = label1, InsertPoint = new XYZ(colCenterX - w1 / 2.0, textY1, 0), Height = textHeight });
+                    modelSpace.Entities.Add(new MText { Value = label2, InsertPoint = new XYZ(colCenterX - w2 / 2.0, textY2, 0), Height = textHeight });
+                    modelSpace.Entities.Add(new MText { Value = label3, InsertPoint = new XYZ(colCenterX - w3 / 2.0, textY3, 0), Height = textHeight });
 
-                    doc.Entities.Add(new MText
-                    {
-                        Value = label1,
-                        InsertPoint = new XYZ(text1InsertX, textY1, 0.0),
-                        Height = textHeight
-                    });
-
-                    doc.Entities.Add(new MText
-                    {
-                        Value = label2,
-                        InsertPoint = new XYZ(text2InsertX, textY2, 0.0),
-                        Height = textHeight
-                    });
-
-                    cursorX += columnWidth + marginX;
+                    cursorX += colWidth + marginX;
                 }
 
-                try
-                {
-                    using (var writer = new DwgWriter(outPath, doc))
-                        writer.Write();
-                }
-                catch (Exception ex)
-                {
-                    log?.Invoke($"DWG write failed: '{outPath}' => {ex.Message}");
-                }
+                using (var writer = new DwgWriter(outPath, doc))
+                    writer.Write();
             }
         }
     }

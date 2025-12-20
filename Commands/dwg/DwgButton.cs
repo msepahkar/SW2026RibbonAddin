@@ -3,6 +3,8 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
 using System.IO;
+using System.Linq;
+using System.Reflection;
 using System.Windows.Forms;
 using SolidWorks.Interop.sldworks;
 using SolidWorks.Interop.swconst;
@@ -10,23 +12,9 @@ using SW2026RibbonAddin.Forms;
 
 namespace SW2026RibbonAddin.Commands
 {
-    /// <summary>
-    /// DWG export button:
-    /// - For a sheet-metal part (single-body or multi-body): exports one DWG per flat pattern
-    ///   (per sheet-metal body) into a new folder.
-    /// - For an assembly: exports one DWG per flat pattern for each unique sheet-metal part
-    ///   (recursively through sub-assemblies).
-    /// - Uses FolderBrowserDialog to pick a MAIN folder, then creates a subfolder named
-    ///   after the active document (must NOT already exist).
-    /// - Writes a CSV inside that subfolder with columns:
-    ///   FileName,PlateThickness_mm,Quantity.
-    /// </summary>
     internal sealed class DwgButton : IMehdiRibbonButton
     {
-        // Default number of assemblies if user just clicks OK without changes
         private const int DefaultAssemblyQuantity = 1;
-
-        // Filled from the dialog every time the DWG command runs
         private int _assemblyQuantity = DefaultAssemblyQuantity;
 
         public string Id => "DWG";
@@ -64,22 +52,18 @@ namespace SW2026RibbonAddin.Commands
                 return;
             }
 
-
-            // Ask for number of assemblies (used to scale CSV quantities)
             using (var dlg = new AssemblyQuantityForm(_assemblyQuantity))
             {
                 if (dlg.ShowDialog() != DialogResult.OK)
-                    return; // user cancelled
+                    return;
 
                 _assemblyQuantity = dlg.AssemblyQuantity;
             }
 
-            // Let user pick the MAIN folder (standard folder dialog)
             string mainFolder = SelectMainFolder(model);
             if (string.IsNullOrEmpty(mainFolder))
-                return; // user cancelled
+                return;
 
-            // Create subfolder named after the active document
             string baseName = GetDocumentBaseName(model);
             string jobFolder = Path.Combine(mainFolder, baseName);
 
@@ -105,19 +89,14 @@ namespace SW2026RibbonAddin.Commands
                 return;
             }
 
-            // Remember original active doc so we can restore it
             string originalKey = GetActiveDocKey(swApp);
 
             try
             {
                 if (isPart)
-                {
                     RunForSinglePart(swApp, model, jobFolder);
-                }
                 else
-                {
                     RunForAssembly(swApp, (IAssemblyDoc)model, jobFolder);
-                }
             }
             finally
             {
@@ -127,24 +106,18 @@ namespace SW2026RibbonAddin.Commands
 
         public int GetEnableState(AddinContext context)
         {
-            // Enable only for Part/Assembly (since the command requires those doc types anyway)
             try
             {
-                var model = context.ActiveModel;
-                if (model == null)
-                    return AddinContext.Disable;
-
-                int docType = model.GetType();
-                bool isPart = docType == (int)swDocumentTypes_e.swDocPART;
-                bool isAsm = docType == (int)swDocumentTypes_e.swDocASSEMBLY;
-
-                return (isPart || isAsm) ? AddinContext.Enable : AddinContext.Disable;
+                return context.ActiveModel != null
+                    ? AddinContext.Enable
+                    : AddinContext.Disable;
             }
             catch
             {
                 return AddinContext.Disable;
             }
         }
+
         // ------------------------------------------------------------------
         //  Single part
         // ------------------------------------------------------------------
@@ -160,15 +133,17 @@ namespace SW2026RibbonAddin.Commands
             string modelPath = model.GetPathName();
             if (string.IsNullOrEmpty(modelPath))
             {
-                MessageBox.Show(
-                    "Save the part before exporting to DWG.",
-                    "DWG Export");
+                MessageBox.Show("Save the part before exporting to DWG.", "DWG Export");
                 return;
             }
 
+            string material = GetSolidWorksMaterialName(model);
+            if (string.IsNullOrWhiteSpace(material))
+                material = "UNKNOWN";
+
             var csvLines = new List<string>
             {
-                "FileName,PlateThickness_mm,Quantity"
+                "FileName,PlateThickness_mm,Quantity,Material"
             };
 
             var dwgFileNames = new List<string>();
@@ -182,8 +157,13 @@ namespace SW2026RibbonAddin.Commands
 
             foreach (string dwgName in dwgFileNames)
             {
-                csvLines.Add(
-                    $"{dwgName},{thicknessMm.ToString("0.###", CultureInfo.InvariantCulture)},{_assemblyQuantity}");
+                csvLines.Add(string.Format(
+                    CultureInfo.InvariantCulture,
+                    "{0},{1},{2},{3}",
+                    EscapeCsv(dwgName),
+                    thicknessMm.ToString("0.###", CultureInfo.InvariantCulture),
+                    _assemblyQuantity,
+                    EscapeCsv(material)));
             }
 
             string csvPath = Path.Combine(jobFolder, "parts.csv");
@@ -209,11 +189,7 @@ namespace SW2026RibbonAddin.Commands
                 return;
             }
 
-            try
-            {
-                asm.ResolveAllLightWeightComponents(true);
-            }
-            catch { }
+            try { asm.ResolveAllLightWeightComponents(true); } catch { }
 
             var usage = CollectSheetMetalUsage(asm);
             if (usage.Count == 0)
@@ -224,7 +200,7 @@ namespace SW2026RibbonAddin.Commands
 
             var csvLines = new List<string>
             {
-                "FileName,PlateThickness_mm,Quantity"
+                "FileName,PlateThickness_mm,Quantity,Material"
             };
 
             int exported = 0;
@@ -238,8 +214,9 @@ namespace SW2026RibbonAddin.Commands
 
                 try
                 {
-                    // Activate the part document – ExportToDWG2 works reliably only on active docs
                     int actErr = 0;
+
+                    // ✅ FIX: ActivateDoc3 takes 4 args in your interop
                     swApp.ActivateDoc3(
                         partPath,
                         false,
@@ -252,6 +229,10 @@ namespace SW2026RibbonAddin.Commands
                         failed++;
                         continue;
                     }
+
+                    string material = GetSolidWorksMaterialName(partModel);
+                    if (string.IsNullOrWhiteSpace(material))
+                        material = "UNKNOWN";
 
                     var dwgFileNames = new List<string>();
                     int failuresForPart = ExportFlatPatternsForPart(partModel, partPath, jobFolder, dwgFileNames);
@@ -267,19 +248,16 @@ namespace SW2026RibbonAddin.Commands
 
                     foreach (string dwgName in dwgFileNames)
                     {
-                        csvLines.Add(
-                            $"{dwgName},{thicknessMm.ToString("0.###", CultureInfo.InvariantCulture)},{info.Quantity*_assemblyQuantity}");
+                        csvLines.Add(string.Format(
+                            CultureInfo.InvariantCulture,
+                            "{0},{1},{2},{3}",
+                            EscapeCsv(dwgName),
+                            thicknessMm.ToString("0.###", CultureInfo.InvariantCulture),
+                            info.Quantity * _assemblyQuantity,
+                            EscapeCsv(material)));
                     }
 
-                    // Close the part we opened for export (without saving)
-                    try
-                    {
-                        swApp.CloseDoc(partPath);
-                    }
-                    catch
-                    {
-                        // ignore close errors
-                    }
+                    try { swApp.CloseDoc(partPath); } catch { }
                 }
                 catch (Exception ex)
                 {
@@ -304,13 +282,6 @@ namespace SW2026RibbonAddin.Commands
         //  Actual DWG export (handles multi-body via flat patterns)
         // ------------------------------------------------------------------
 
-        /// <summary>
-        /// Exports all flat patterns (sheet-metal bodies) in the given part to DWG files.
-        /// For single-body sheet-metal, this produces one DWG (same as before).
-        /// For multi-body sheet-metal, this produces one DWG per flat pattern.
-        /// Returns the number of failed bodies; successful DWG file names are added
-        /// to <paramref name="dwgFileNames"/>.
-        /// </summary>
         private static int ExportFlatPatternsForPart(
             IModelDoc2 partModel,
             string modelPath,
@@ -329,7 +300,6 @@ namespace SW2026RibbonAddin.Commands
 
             var flatPatterns = GetFlatPatternFeatures(partModel);
 
-            // If no flat patterns found, fall back to a single export
             if (flatPatterns.Count == 0)
             {
                 string baseName = Path.GetFileNameWithoutExtension(modelPath);
@@ -362,8 +332,7 @@ namespace SW2026RibbonAddin.Commands
                     continue;
 
                 string suffix = null;
-                try { suffix = flatFeat.Name; }
-                catch { }
+                try { suffix = flatFeat.Name; } catch { }
 
                 if (string.IsNullOrWhiteSpace(suffix))
                     suffix = idx.ToString(CultureInfo.InvariantCulture);
@@ -383,13 +352,9 @@ namespace SW2026RibbonAddin.Commands
 
                 bool ok = ExportFlatPatternSelected(partDoc, modelPath, flatFeat, outPath);
                 if (ok)
-                {
                     dwgFileNames.Add(finalName);
-                }
                 else
-                {
                     failures++;
-                }
 
                 idx++;
             }
@@ -402,20 +367,18 @@ namespace SW2026RibbonAddin.Commands
             try
             {
                 const int action = (int)swExportToDWG_e.swExportToDWG_ExportSheetMetal;
-                const int sheetMetalOptions = 1; // geometry only – no bend lines, no sketches
+                const int sheetMetalOptions = 1;
 
-                bool ok = partDoc.ExportToDWG2(
+                return partDoc.ExportToDWG2(
                     outFile,
                     modelPath,
                     action,
-                    true,       // single file
-                    null,       // alignment
-                    false,      // flip X
-                    false,      // flip Y
+                    true,
+                    null,
+                    false,
+                    false,
                     sheetMetalOptions,
-                    null);      // views
-
-                return ok;
+                    null);
             }
             catch (Exception ex)
             {
@@ -431,25 +394,22 @@ namespace SW2026RibbonAddin.Commands
                 if (flatPatternFeat == null)
                     return false;
 
-                bool selOk = flatPatternFeat.Select2(false, -1);
-                if (!selOk)
+                if (!flatPatternFeat.Select2(false, -1))
                     return false;
 
                 const int action = (int)swExportToDWG_e.swExportToDWG_ExportSheetMetal;
-                const int sheetMetalOptions = 1; // geometry only
+                const int sheetMetalOptions = 1;
 
-                bool ok = partDoc.ExportToDWG2(
+                return partDoc.ExportToDWG2(
                     outFile,
                     modelPath,
                     action,
-                    true,       // single file
-                    null,       // alignment
-                    false,      // flip X
-                    false,      // flip Y
+                    true,
+                    null,
+                    false,
+                    false,
                     sheetMetalOptions,
-                    null);      // views
-
-                return ok;
+                    null);
             }
             catch (Exception ex)
             {
@@ -465,16 +425,14 @@ namespace SW2026RibbonAddin.Commands
                 return result;
 
             Feature feat = null;
-            try { feat = model.FirstFeature() as Feature; }
-            catch { }
+            try { feat = model.FirstFeature() as Feature; } catch { }
 
             while (feat != null)
             {
                 CollectFlatPatternsRecursive(feat, result);
 
                 Feature next = null;
-                try { next = feat.GetNextFeature() as Feature; }
-                catch { }
+                try { next = feat.GetNextFeature() as Feature; } catch { }
                 feat = next;
             }
 
@@ -490,23 +448,19 @@ namespace SW2026RibbonAddin.Commands
             {
                 string typeName = feat.GetTypeName2();
                 if (string.Equals(typeName, "FlatPattern", StringComparison.OrdinalIgnoreCase))
-                {
                     result.Add(feat);
-                }
             }
             catch { }
 
             Feature sub = null;
-            try { sub = feat.GetFirstSubFeature() as Feature; }
-            catch { }
+            try { sub = feat.GetFirstSubFeature() as Feature; } catch { }
 
             while (sub != null)
             {
                 CollectFlatPatternsRecursive(sub, result);
 
                 Feature next = null;
-                try { next = sub.GetNextSubFeature() as Feature; }
-                catch { }
+                try { next = sub.GetNextSubFeature() as Feature; } catch { }
                 sub = next;
             }
         }
@@ -547,8 +501,7 @@ namespace SW2026RibbonAddin.Commands
             while (feat != null)
             {
                 string typeName = "";
-                try { typeName = feat.GetTypeName2(); }
-                catch { }
+                try { typeName = feat.GetTypeName2(); } catch { }
 
                 if (!string.IsNullOrEmpty(typeName) &&
                     typeName.IndexOf("SheetMetal", StringComparison.OrdinalIgnoreCase) >= 0)
@@ -557,14 +510,13 @@ namespace SW2026RibbonAddin.Commands
                     {
                         var data = feat.GetDefinition() as SheetMetalFeatureData;
                         if (data != null)
-                            return data.Thickness; // meters
+                            return data.Thickness;
                     }
                     catch { }
                 }
 
                 object nextObj = null;
-                try { nextObj = feat.GetNextFeature(); }
-                catch { }
+                try { nextObj = feat.GetNextFeature(); } catch { }
                 feat = nextObj as Feature;
             }
 
@@ -577,18 +529,13 @@ namespace SW2026RibbonAddin.Commands
             public int Quantity;
         }
 
-        /// <summary>
-        /// Builds: part path -> usage info (thickness, quantity of that part in assembly).
-        /// Only parts that contain sheet-metal features are included.
-        /// </summary>
         private static Dictionary<string, SheetMetalUsageInfo> CollectSheetMetalUsage(IAssemblyDoc asm)
         {
             var result = new Dictionary<string, SheetMetalUsageInfo>(StringComparer.OrdinalIgnoreCase);
             if (asm == null) return result;
 
             object compsObj = null;
-            try { compsObj = asm.GetComponents(false); } // all levels
-            catch { }
+            try { compsObj = asm.GetComponents(false); } catch { }
 
             var comps = compsObj as object[];
             if (comps == null) return result;
@@ -599,15 +546,13 @@ namespace SW2026RibbonAddin.Commands
                 if (comp == null || comp.IsSuppressed()) continue;
 
                 IModelDoc2 refModel = null;
-                try { refModel = comp.GetModelDoc2() as IModelDoc2; }
-                catch { }
+                try { refModel = comp.GetModelDoc2() as IModelDoc2; } catch { }
 
                 if (refModel == null || refModel.GetType() != (int)swDocumentTypes_e.swDocPART)
                     continue;
 
                 string path = null;
-                try { path = refModel.GetPathName(); }
-                catch { }
+                try { path = refModel.GetPathName(); } catch { }
 
                 if (string.IsNullOrWhiteSpace(path))
                     continue;
@@ -632,6 +577,65 @@ namespace SW2026RibbonAddin.Commands
         }
 
         // ------------------------------------------------------------------
+        //  Material from SolidWorks (AISI 304 etc.)
+        // ------------------------------------------------------------------
+
+        private static string GetSolidWorksMaterialName(IModelDoc2 model)
+        {
+            if (model == null) return null;
+
+            string cfg = "";
+            try { cfg = model.ConfigurationManager?.ActiveConfiguration?.Name ?? ""; } catch { cfg = ""; }
+
+            string m = TryInvokeGetMaterialPropertyName2(model.Extension, cfg);
+            if (!string.IsNullOrWhiteSpace(m)) return m.Trim();
+
+            m = TryInvokeGetMaterialPropertyName2(model, cfg);
+            if (!string.IsNullOrWhiteSpace(m)) return m.Trim();
+
+            return null;
+        }
+
+        private static string TryInvokeGetMaterialPropertyName2(object target, string cfg)
+        {
+            if (target == null) return null;
+
+            try
+            {
+                var t = target.GetType();
+                var methods = t.GetMethods(BindingFlags.Instance | BindingFlags.Public)
+                               .Where(x => x.Name == "GetMaterialPropertyName2")
+                               .ToList();
+
+                foreach (var mi in methods)
+                {
+                    var ps = mi.GetParameters();
+
+                    if (ps.Length == 3 && ps[0].ParameterType == typeof(string))
+                    {
+                        object[] args = new object[] { cfg ?? "", null, null };
+                        mi.Invoke(target, args);
+
+                        string mat = args[2] as string;
+                        if (!string.IsNullOrWhiteSpace(mat)) return mat;
+
+                        mat = args[1] as string;
+                        if (!string.IsNullOrWhiteSpace(mat)) return mat;
+                    }
+
+                    if (ps.Length == 1 && ps[0].ParameterType == typeof(string) && mi.ReturnType == typeof(string))
+                    {
+                        var ret = mi.Invoke(target, new object[] { cfg ?? "" }) as string;
+                        if (!string.IsNullOrWhiteSpace(ret)) return ret;
+                    }
+                }
+            }
+            catch { }
+
+            return null;
+        }
+
+        // ------------------------------------------------------------------
         //  Folder selection + CSV + active-doc helpers
         // ------------------------------------------------------------------
 
@@ -644,10 +648,7 @@ namespace SW2026RibbonAddin.Commands
                 if (!string.IsNullOrEmpty(path))
                     initialDir = Path.GetDirectoryName(path);
             }
-            catch
-            {
-                // ignore, fall back to default
-            }
+            catch { }
 
             using (var dlg = new FolderBrowserDialog())
             {
@@ -692,14 +693,16 @@ namespace SW2026RibbonAddin.Commands
 
         private static void TryWriteCsv(string csvPath, List<string> lines)
         {
-            try
-            {
-                File.WriteAllLines(csvPath, lines);
-            }
-            catch (Exception ex)
-            {
-                Debug.WriteLine("CSV write failed for " + csvPath + ": " + ex);
-            }
+            try { File.WriteAllLines(csvPath, lines); }
+            catch (Exception ex) { Debug.WriteLine("CSV write failed for " + csvPath + ": " + ex); }
+        }
+
+        private static string EscapeCsv(string value)
+        {
+            if (value == null) return "";
+            bool mustQuote = value.Contains(",") || value.Contains("\"") || value.Contains("\r") || value.Contains("\n");
+            if (!mustQuote) return value;
+            return "\"" + value.Replace("\"", "\"\"") + "\"";
         }
 
         private static string GetActiveDocKey(ISldWorks swApp)

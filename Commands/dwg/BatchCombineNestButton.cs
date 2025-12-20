@@ -7,22 +7,14 @@ using System.Windows.Forms;
 
 namespace SW2026RibbonAddin.Commands
 {
-    /// <summary>
-    /// Step 7: One-click workflow after exports exist:
-    /// - Pick MAIN folder
-    /// - Combine DWGs (calls DwgBatchCombiner.Combine)
-    /// - Nest all thickness_*.dwg (silent) using ONE options form
-    /// - Write ONE summary file + show ONE message box
-    /// </summary>
     internal sealed class BatchCombineNestButton : IMehdiRibbonButton
     {
         public string Id => "BatchCombineNest";
 
         public string DisplayName => "Batch\nNest";
-        public string Tooltip => "Combine + nest all thickness DWGs in a main folder (one run).";
-        public string Hint => "Combine and nest all";
+        public string Tooltip => "Combine + nest all thickness_*.dwg in the selected main folder.";
+        public string Hint => "Batch combine + nest";
 
-        // Reuse existing icons to avoid adding resources
         public string SmallIconFile => "combine_dwg_20.png";
         public string LargeIconFile => "combine_dwg_32.png";
 
@@ -37,11 +29,10 @@ namespace SW2026RibbonAddin.Commands
             if (string.IsNullOrEmpty(mainFolder))
                 return;
 
-            // Let user choose whether to run Combine first (keeps your “opinion” in the workflow)
             var choice = MessageBox.Show(
                 "Run Combine DWG first?\r\n\r\n" +
-                "Yes  = Combine + Nest all thickness files\r\n" +
-                "No   = Only Nest existing thickness files\r\n" +
+                "Yes  = Combine + Nest\r\n" +
+                "No   = Nest only existing thickness_*.dwg\r\n" +
                 "Cancel = Stop",
                 "Batch Nest",
                 MessageBoxButtons.YesNoCancel,
@@ -54,17 +45,16 @@ namespace SW2026RibbonAddin.Commands
             {
                 try
                 {
-                    DwgBatchCombiner.Combine(mainFolder);
+                    DwgBatchCombiner.Combine(mainFolder, showUi: false);
                 }
                 catch (Exception ex)
                 {
-                    MessageBox.Show("Combine failed:\r\n\r\n" + ex.Message, "Batch Nest",
+                    MessageBox.Show("Combine DWG failed:\r\n\r\n" + ex.Message, "Batch Nest",
                         MessageBoxButtons.OK, MessageBoxIcon.Error);
                     return;
                 }
             }
 
-            // Find thickness DWGs (skip already-nested outputs)
             var thicknessFiles = Directory.GetFiles(mainFolder, "thickness_*.dwg", SearchOption.TopDirectoryOnly)
                 .Where(p =>
                 {
@@ -76,53 +66,38 @@ namespace SW2026RibbonAddin.Commands
 
             if (thicknessFiles.Count == 0)
             {
-                MessageBox.Show("No thickness_*.dwg files were found in the selected folder.", "Batch Nest",
+                MessageBox.Show("No thickness_*.dwg files found in this folder.", "Batch Nest",
                     MessageBoxButtons.OK, MessageBoxIcon.Information);
                 return;
             }
 
-            double sheetWidth;
-            double sheetHeight;
-            RotationMode rotationMode;
-            int anyAngleStepDeg;
-            bool writeReportCsv;
-
+            LaserCutRunSettings settings;
             using (var dlg = new LaserCutOptionsForm())
             {
                 dlg.Text = "Batch nest options (applies to ALL thickness files)";
                 if (dlg.ShowDialog() != DialogResult.OK)
                     return;
 
-                sheetWidth = dlg.SheetWidthMm;
-                sheetHeight = dlg.SheetHeightMm;
-                rotationMode = dlg.RotationMode;
-                anyAngleStepDeg = dlg.AnyAngleStepDeg;
-                writeReportCsv = dlg.WriteReportCsv;
+                settings = dlg.Settings;
             }
 
-            var results = new List<DwgLaserNester.NestResult>();
+            var results = new List<(string thicknessFile, DwgLaserNester.NestRunResult result)>();
             var errors = new List<string>();
 
-            using (var progress = new SimpleBatchProgressForm(thicknessFiles.Count))
+            using (var prog = new SimpleBatchProgressForm(thicknessFiles.Count))
             {
-                progress.Show();
+                prog.Show();
                 Application.DoEvents();
 
                 for (int i = 0; i < thicknessFiles.Count; i++)
                 {
                     string f = thicknessFiles[i];
-                    progress.Step($"Nesting {i + 1} / {thicknessFiles.Count}\r\n{Path.GetFileName(f)}");
+                    prog.Step($"Nesting {i + 1}/{thicknessFiles.Count}\r\n{Path.GetFileName(f)}");
 
                     try
                     {
-                        // Silent mode: no per-file MessageBox
-                        var r = DwgLaserNester.Nest(
-                            f, sheetWidth, sheetHeight,
-                            rotationMode, anyAngleStepDeg,
-                            writeReportCsv,
-                            showUi: false);
-
-                        results.Add(r);
+                        var r = DwgLaserNester.Nest(f, settings, showUi: false);
+                        results.Add((f, r));
                     }
                     catch (Exception ex)
                     {
@@ -130,18 +105,16 @@ namespace SW2026RibbonAddin.Commands
                     }
                 }
 
-                progress.Close();
+                prog.Close();
             }
 
-            // Write summary file
             string summaryPath = Path.Combine(mainFolder, "batch_nest_summary.txt");
             TryWriteSummary(summaryPath, mainFolder, thicknessFiles, results, errors);
 
-            // One final message box
             MessageBox.Show(
                 "Batch nest finished.\r\n\r\n" +
-                $"Thickness files found: {thicknessFiles.Count}\r\n" +
-                $"Nested successfully: {results.Count}\r\n" +
+                $"Thickness files: {thicknessFiles.Count}\r\n" +
+                $"OK: {results.Count}\r\n" +
                 $"Failed: {errors.Count}\r\n\r\n" +
                 $"Summary: {summaryPath}",
                 "Batch Nest",
@@ -155,7 +128,7 @@ namespace SW2026RibbonAddin.Commands
         {
             using (var dlg = new FolderBrowserDialog())
             {
-                dlg.Description = "Select the MAIN folder that contains job subfolders (parts.csv + DWGs)";
+                dlg.Description = "Select MAIN folder (contains job subfolders with parts.csv + DWGs)";
                 dlg.ShowNewFolderButton = false;
 
                 if (dlg.ShowDialog() != DialogResult.OK)
@@ -169,7 +142,7 @@ namespace SW2026RibbonAddin.Commands
             string summaryPath,
             string mainFolder,
             List<string> thicknessFiles,
-            List<DwgLaserNester.NestResult> results,
+            List<(string thicknessFile, DwgLaserNester.NestRunResult result)> results,
             List<string> errors)
         {
             try
@@ -181,29 +154,37 @@ namespace SW2026RibbonAddin.Commands
                 sb.AppendLine();
 
                 sb.AppendLine("=== Results ===");
-                foreach (var r in results.OrderBy(x => x.SourceDwgPath, StringComparer.OrdinalIgnoreCase))
+                foreach (var item in results.OrderBy(x => x.thicknessFile, StringComparer.OrdinalIgnoreCase))
                 {
-                    sb.AppendLine($"Source: {Path.GetFileName(r.SourceDwgPath)}");
-                    sb.AppendLine($"  Sheets: {r.SheetsUsed}");
-                    sb.AppendLine($"  Parts: {r.TotalParts}");
+                    var r = item.result;
+
+                    sb.AppendLine($"Thickness DWG: {Path.GetFileName(item.thicknessFile)}");
+                    sb.AppendLine($"  SeparateByMaterial: {r.Settings.SeparateByMaterial}");
+                    sb.AppendLine($"  OneDwgPerMaterial: {r.Settings.OutputOneDwgPerMaterial}");
+                    sb.AppendLine($"  PerMaterialSheets: {r.Settings.UsePerMaterialSheetPresets}");
                     sb.AppendLine($"  Blocks found/skipped: {r.CandidateBlocks}/{r.SkippedBlocks}");
-                    sb.AppendLine($"  Output: {r.OutputDwgPath}");
-                    if (!string.IsNullOrEmpty(r.ReportCsvPath)) sb.AppendLine($"  Report: {r.ReportCsvPath}");
-                    if (!string.IsNullOrEmpty(r.LogPath)) sb.AppendLine($"  Log: {r.LogPath}");
+
+                    foreach (var o in r.Outputs)
+                    {
+                        sb.AppendLine($"    [{o.MaterialType}] Sheets: {o.SheetsUsed} Parts: {o.TotalParts} Sheet: {o.Sheet}");
+                        sb.AppendLine($"       {o.OutputDwgPath}");
+                    }
+
+                    if (!string.IsNullOrEmpty(r.LogPath))
+                        sb.AppendLine($"  Log: {r.LogPath}");
+
                     sb.AppendLine();
                 }
 
                 if (errors.Count > 0)
                 {
                     sb.AppendLine("=== Errors ===");
-                    foreach (var e in errors)
-                        sb.AppendLine(e);
+                    foreach (var e in errors) sb.AppendLine(e);
                     sb.AppendLine();
                 }
 
-                sb.AppendLine("=== Thickness DWG files scanned ===");
-                foreach (var f in thicknessFiles)
-                    sb.AppendLine(Path.GetFileName(f));
+                sb.AppendLine("=== Thickness DWGs scanned ===");
+                foreach (var f in thicknessFiles) sb.AppendLine(Path.GetFileName(f));
 
                 File.WriteAllText(summaryPath, sb.ToString(), Encoding.UTF8);
             }
@@ -225,7 +206,7 @@ namespace SW2026RibbonAddin.Commands
                 if (maximum <= 0) maximum = 1;
                 _max = maximum;
 
-                Text = "Batch nest...";
+                Text = "Batch nesting...";
                 FormBorderStyle = FormBorderStyle.FixedDialog;
                 StartPosition = FormStartPosition.CenterScreen;
                 MinimizeBox = false;
