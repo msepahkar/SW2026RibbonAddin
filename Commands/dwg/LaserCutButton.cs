@@ -1,28 +1,15 @@
-﻿// Commands\dwg\LaserCutButton.cs
-// DROP-IN: replace the entire file with this one.
-
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Text;
 using System.Windows.Forms;
-using Microsoft.Win32;
-
 using ACadSharp;
 using ACadSharp.Entities;
 using ACadSharp.IO;
 using ACadSharp.Tables;
 using CSMath;
-
-// Avoid WinForms Point/Size ambiguity if you later add ACadSharp Point types
-using WinPoint = System.Drawing.Point;
-using WinSize = System.Drawing.Size;
-using WinContentAlignment = System.Drawing.ContentAlignment;
-
-// Avoid ambiguity with any "Application" symbol
-using WinFormsApp = System.Windows.Forms.Application;
 
 namespace SW2026RibbonAddin.Commands
 {
@@ -30,8 +17,8 @@ namespace SW2026RibbonAddin.Commands
     {
         public string Id => "LaserCut";
 
-        public string DisplayName => "Laser\nCut";
-        public string Tooltip => "Batch-nest thickness_*.dwg into sheets (0/90/180/270). Optional: separate by material + one DWG per material.";
+        public string DisplayName => "Laser\nnesting";
+        public string Tooltip => "Nest combined thickness DWGs into laser sheets (0/90/180/270 rotations).";
         public string Hint => "Laser cut nesting";
 
         public string SmallIconFile => "laser_cut_20.png";
@@ -44,38 +31,9 @@ namespace SW2026RibbonAddin.Commands
 
         public void Execute(AddinContext context)
         {
-            // Pick any thickness_*.dwg -> we will batch process all thickness_*.dwg in the same folder
-            string anyThicknessDwg = SelectAnyThicknessDwg();
-            if (string.IsNullOrEmpty(anyThicknessDwg))
+            string mainFolder = SelectMainFolder();
+            if (string.IsNullOrEmpty(mainFolder))
                 return;
-
-            string folder = Path.GetDirectoryName(anyThicknessDwg) ?? "";
-            if (!Directory.Exists(folder))
-            {
-                MessageBox.Show("Folder does not exist:\r\n" + folder, "Laser Cut", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                return;
-            }
-
-            var inputs = Directory.GetFiles(folder, "thickness_*.dwg", SearchOption.TopDirectoryOnly)
-                .Where(f =>
-                {
-                    string n = Path.GetFileNameWithoutExtension(f) ?? "";
-                    // exclude nested outputs and any accidental re-processing
-                    return n.IndexOf("_nested", StringComparison.OrdinalIgnoreCase) < 0
-                        && n.IndexOf("_nest_log", StringComparison.OrdinalIgnoreCase) < 0;
-                })
-                .OrderBy(f => f, StringComparer.OrdinalIgnoreCase)
-                .ToList();
-
-            if (inputs.Count == 0)
-            {
-                MessageBox.Show(
-                    "No input files found.\r\n\r\nExpected files like:\r\n  thickness_2_5.dwg\r\n\r\nIn folder:\r\n" + folder,
-                    "Laser Cut",
-                    MessageBoxButtons.OK,
-                    MessageBoxIcon.Information);
-                return;
-            }
 
             LaserCutRunSettings settings;
             using (var dlg = new LaserCutOptionsForm())
@@ -86,1517 +44,101 @@ namespace SW2026RibbonAddin.Commands
                 settings = dlg.Settings;
             }
 
-            // Pre-scan to compute total placements (for one global progress bar)
-            int totalOverall = 0;
-            foreach (var f in inputs)
-            {
-                try { totalOverall += Math.Max(0, DwgLaserNester.CountTotalInstances(f)); }
-                catch { }
-            }
-
-            if (totalOverall <= 0)
-            {
-                MessageBox.Show(
-                    "No plate blocks found in any thickness DWG.\r\n\r\nMake sure you ran Combine DWG and the thickness_*.dwg files contain P_* blocks.",
-                    "Laser Cut",
-                    MessageBoxButtons.OK,
-                    MessageBoxIcon.Information);
-                return;
-            }
-
-            int placedOverall = 0;
-
-            var summary = new StringBuilder();
-            summary.AppendLine("BATCH LASER NEST SUMMARY");
-            summary.AppendLine($"Time: {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
-            summary.AppendLine($"Folder: {folder}");
-            summary.AppendLine($"Files: {inputs.Count}");
-            summary.AppendLine();
-            summary.AppendLine($"SeparateByMaterial: {settings.SeparateByMaterial}");
-            summary.AppendLine($"OutputOneDwgPerMaterial: {settings.SeparateByMaterial && settings.OutputOneDwgPerMaterial}");
-            summary.AppendLine($"UsePerMaterialSheetPresets: {settings.UsePerMaterialSheetPresets}");
-            summary.AppendLine($"GlobalSheet: {settings.DefaultSheet}");
-            if (settings.SeparateByMaterial && settings.UsePerMaterialSheetPresets)
-            {
-                summary.AppendLine($"SteelSheet: {settings.SteelSheet}");
-                summary.AppendLine($"AluminumSheet: {settings.AluminumSheet}");
-                summary.AppendLine($"StainlessSheet: {settings.StainlessSheet}");
-                summary.AppendLine($"OtherSheet: {settings.OtherSheet}");
-            }
-            summary.AppendLine();
-            summary.AppendLine("Rotations: 0/90/180/270 (fixed)");
-            summary.AppendLine("Gap+Margin: auto (>= thickness) + 10mm base margin");
-            summary.AppendLine();
-            summary.AppendLine("------------------------------------------------------------");
-            summary.AppendLine();
-
-            var errors = new List<string>();
-
-            using (var progress = new LaserCutProgressForm(totalOverall))
-            {
-                progress.Show();
-                WinFormsApp.DoEvents();
-
-                foreach (var input in inputs)
-                {
-                    string fileName = Path.GetFileName(input) ?? input;
-
-                    try
-                    {
-                        progress.SetStatus("Processing: " + fileName);
-
-                        var res = DwgLaserNester.NestOneFile(
-                            sourceDwgPath: input,
-                            settings: settings,
-                            progress: progress,
-                            placedOverallRef: ref placedOverall,
-                            totalOverall: totalOverall);
-
-                        summary.AppendLine($"SOURCE: {fileName}");
-                        summary.AppendLine($"  Blocks found/skipped: {res.CandidateBlocks}/{res.SkippedBlocks}");
-                        foreach (var o in res.Outputs)
-                        {
-                            summary.AppendLine($"  [{o.MaterialType}] Sheets={o.SheetsUsed} Parts={o.TotalParts} Sheet={o.Sheet}");
-                            summary.AppendLine($"     {Path.GetFileName(o.OutputDwgPath)}");
-                        }
-
-                        if (!string.IsNullOrEmpty(res.LogPath))
-                            summary.AppendLine($"  Log: {Path.GetFileName(res.LogPath)}");
-
-                        summary.AppendLine();
-                    }
-                    catch (Exception ex)
-                    {
-                        string msg = $"FAILED: {fileName} -> {ex.Message}";
-                        errors.Add(msg);
-
-                        summary.AppendLine($"SOURCE: {fileName}");
-                        summary.AppendLine("  ERROR: " + ex.Message);
-                        summary.AppendLine();
-                    }
-                }
-
-                progress.SetStatus("Writing summary...");
-                WinFormsApp.DoEvents();
-            }
-
             try
             {
-                File.WriteAllText(Path.Combine(folder, "batch_nest_summary.txt"), summary.ToString(), Encoding.UTF8);
+                DwgLaserNester.NestFolder(mainFolder, settings, showUi: true);
             }
-            catch { }
-
-            if (errors.Count == 0)
+            catch (Exception ex)
             {
                 MessageBox.Show(
-                    "Batch nesting finished.\r\n\r\n" +
-                    "Summary:\r\n" + Path.Combine(folder, "batch_nest_summary.txt"),
-                    "Laser Cut",
+                    "Laser nesting failed:\r\n\r\n" + ex.Message,
+                    "Laser nesting",
                     MessageBoxButtons.OK,
-                    MessageBoxIcon.Information);
-            }
-            else
-            {
-                MessageBox.Show(
-                    "Batch nesting finished with errors.\r\n\r\n" +
-                    string.Join("\r\n", errors.Take(12)) +
-                    (errors.Count > 12 ? "\r\n..." : "") +
-                    "\r\n\r\nSummary:\r\n" + Path.Combine(folder, "batch_nest_summary.txt"),
-                    "Laser Cut",
-                    MessageBoxButtons.OK,
-                    MessageBoxIcon.Warning);
+                    MessageBoxIcon.Error);
             }
         }
 
-        public int GetEnableState(AddinContext context) => AddinContext.Enable;
-
-        private static string SelectAnyThicknessDwg()
+        public int GetEnableState(AddinContext context)
         {
-            using (var dlg = new OpenFileDialog())
+            return AddinContext.Enable;
+        }
+
+        private static string SelectMainFolder()
+        {
+            using (var dlg = new FolderBrowserDialog())
             {
-                dlg.Title = "Select ANY thickness_*.dwg (batch will process all thickness files in that folder)";
-                dlg.Filter = "DWG files (*.dwg)|*.dwg|All files (*.*)|*.*";
-                dlg.CheckFileExists = true;
-                dlg.Multiselect = false;
+                dlg.Description = "Select folder that contains thickness_*.dwg (combined outputs from Combine DWG)";
+                dlg.ShowNewFolderButton = false;
 
                 if (dlg.ShowDialog() != DialogResult.OK)
                     return null;
 
-                return dlg.FileName;
+                return dlg.SelectedPath;
             }
         }
     }
 
-    internal struct SheetSize
+    internal readonly struct SheetPreset
     {
-        public double W;
-        public double H;
+        public string Name { get; }
+        public double WidthMm { get; }
+        public double HeightMm { get; }
 
-        public SheetSize(double w, double h)
+        public SheetPreset(string name, double widthMm, double heightMm)
         {
-            W = w;
-            H = h;
+            Name = name ?? "";
+            WidthMm = widthMm;
+            HeightMm = heightMm;
         }
 
         public override string ToString()
-            => $"{W.ToString("0.###", CultureInfo.InvariantCulture)} x {H.ToString("0.###", CultureInfo.InvariantCulture)} mm";
+        {
+            return $"{Name} ({WidthMm:0.###} x {HeightMm:0.###} mm)";
+        }
     }
 
     internal sealed class LaserCutRunSettings
     {
-        public bool SeparateByMaterial;
-        public bool OutputOneDwgPerMaterial;
-        public bool UsePerMaterialSheetPresets;
+        public SheetPreset DefaultSheet { get; set; }
 
-        public SheetSize DefaultSheet;
+        // Exact material grouping (no normalization)
+        public bool SeparateByMaterialExact { get; set; } = true;
 
-        public SheetSize SteelSheet;
-        public SheetSize AluminumSheet;
-        public SheetSize StainlessSheet;
-        public SheetSize OtherSheet;
+        // If SeparateByMaterialExact is true, create one output DWG per material string
+        public bool OutputOneDwgPerMaterial { get; set; } = true;
 
-        public SheetSize GetSheetForMaterialType(string materialType)
-        {
-            if (!UsePerMaterialSheetPresets)
-                return DefaultSheet;
+        // Option 2 behavior: keep only this material's source preview (plates + labels) in each output
+        public bool KeepOnlyCurrentMaterialInSourcePreview { get; set; } = true;
 
-            materialType = (materialType ?? "").Trim().ToUpperInvariant();
-
-            if (materialType == MaterialTypeNormalizer.TYPE_STEEL) return SteelSheet;
-            if (materialType == MaterialTypeNormalizer.TYPE_ALUMINUM) return AluminumSheet;
-            if (materialType == MaterialTypeNormalizer.TYPE_STAINLESS) return StainlessSheet;
-
-            return OtherSheet;
-        }
+        // Kept ONLY so older code (like BatchCombineNestButton) doesn't break if it prints these.
+        // With exact materials, these presets are not used.
+        public bool UsePerMaterialSheetPresets { get; set; } = false;
+        public SheetPreset SteelSheet { get; set; }
+        public SheetPreset AluminumSheet { get; set; }
+        public SheetPreset StainlessSheet { get; set; }
+        public SheetPreset OtherSheet { get; set; }
     }
 
-    internal static class DwgLaserNester
-    {
-        // Rotations are fixed: 0/90/180/270
-        private static readonly int[] AllowedAnglesDeg = new[] { 0, 90, 180, 270 };
-
-        internal sealed class MaterialNestResult
-        {
-            public string MaterialType;
-            public SheetSize Sheet;
-            public string OutputDwgPath;
-            public int SheetsUsed;
-            public int TotalParts;
-        }
-
-        internal sealed class NestRunResult
-        {
-            public string SourceDwgPath;
-            public LaserCutRunSettings Settings;
-
-            public List<MaterialNestResult> Outputs = new List<MaterialNestResult>();
-
-            public int CandidateBlocks;
-            public int SkippedBlocks;
-
-            public string LogPath;
-            public int LogLines;
-        }
-
-        private sealed class NestLog
-        {
-            private readonly List<string> _lines = new List<string>();
-            public int Count => _lines.Count;
-
-            public void Info(string msg)
-            {
-                if (string.IsNullOrWhiteSpace(msg)) return;
-                _lines.Add($"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] INFO: {msg}");
-            }
-
-            public void Warn(string msg)
-            {
-                if (string.IsNullOrWhiteSpace(msg)) return;
-                _lines.Add($"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] WARN: {msg}");
-            }
-
-            public void Error(string msg)
-            {
-                if (string.IsNullOrWhiteSpace(msg)) return;
-                _lines.Add($"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] ERROR: {msg}");
-            }
-
-            public string TryWrite(string folder, string baseName)
-            {
-                try
-                {
-                    if (_lines.Count == 0) return null;
-                    string path = Path.Combine(folder ?? "", baseName + "_nest_log.txt");
-                    File.WriteAllLines(path, _lines, Encoding.UTF8);
-                    return path;
-                }
-                catch
-                {
-                    return null;
-                }
-            }
-        }
-
-        private sealed class PartDefinition
-        {
-            public string BlockName;
-            public BlockRecord Block;
-
-            public string MaterialTag;
-            public string MaterialType;
-
-            public double MinX, MinY, MaxX, MaxY;
-            public double Width, Height;
-
-            public int Quantity;
-
-            public readonly Dictionary<int, RotatedBounds> RotatedCache = new Dictionary<int, RotatedBounds>();
-        }
-
-        private struct RotatedBounds
-        {
-            public double MinX, MinY, MaxX, MaxY;
-            public double Width => MaxX - MinX;
-            public double Height => MaxY - MinY;
-        }
-
-        private sealed class FreeRect
-        {
-            public double X, Y, Width, Height;
-        }
-
-        private sealed class SheetState
-        {
-            public int Index;
-            public double OriginX, OriginY;
-            public int PlacedCount;
-            public double UsedArea;
-            public List<FreeRect> FreeRects = new List<FreeRect>();
-        }
-
-        public static int CountTotalInstances(string sourceDwgPath)
-        {
-            if (string.IsNullOrWhiteSpace(sourceDwgPath) || !File.Exists(sourceDwgPath))
-                return 0;
-
-            CadDocument doc;
-            using (var reader = new DwgReader(sourceDwgPath))
-                doc = reader.Read();
-
-            int candidate, skipped;
-            var parts = LoadPartDefinitions(doc, null, out candidate, out skipped).ToList();
-            return parts.Sum(p => Math.Max(1, p.Quantity));
-        }
-
-        public static NestRunResult NestOneFile(
-            string sourceDwgPath,
-            LaserCutRunSettings settings,
-            LaserCutProgressForm progress,
-            ref int placedOverallRef,
-            int totalOverall)
-        {
-            if (settings == null)
-                throw new ArgumentNullException(nameof(settings));
-
-            if (string.IsNullOrWhiteSpace(sourceDwgPath) || !File.Exists(sourceDwgPath))
-                throw new FileNotFoundException("DWG not found.", sourceDwgPath);
-
-            var log = new NestLog();
-
-            string dir = Path.GetDirectoryName(sourceDwgPath) ?? "";
-            string baseName = Path.GetFileNameWithoutExtension(sourceDwgPath) ?? "thickness";
-
-            CadDocument srcDoc;
-            using (var reader = new DwgReader(sourceDwgPath))
-                srcDoc = reader.Read();
-
-            int candidateBlocks, skippedBlocks;
-            var srcParts = LoadPartDefinitions(srcDoc, log, out candidateBlocks, out skippedBlocks).ToList();
-
-            var runResult = new NestRunResult
-            {
-                SourceDwgPath = sourceDwgPath,
-                Settings = settings,
-                CandidateBlocks = candidateBlocks,
-                SkippedBlocks = skippedBlocks
-            };
-
-            if (srcParts.Count == 0)
-            {
-                log.Warn("No P_* blocks found. Is this a combined thickness DWG from Combine DWG?");
-                runResult.LogPath = log.TryWrite(dir, baseName);
-                runResult.LogLines = log.Count;
-                return runResult;
-            }
-
-            List<IGrouping<string, PartDefinition>> groups;
-
-            if (settings.SeparateByMaterial)
-            {
-                groups = srcParts
-                    .GroupBy(p => p.MaterialType ?? MaterialTypeNormalizer.TYPE_OTHER, StringComparer.OrdinalIgnoreCase)
-                    .OrderBy(g => MaterialTypeNormalizer.SortKey(g.Key))
-                    .ToList();
-            }
-            else
-            {
-                groups = new List<IGrouping<string, PartDefinition>>
-                {
-                    new SingleGrouping<string, PartDefinition>("ALL", srcParts)
-                };
-            }
-
-            foreach (var g in groups)
-            {
-                string matType = g.Key;
-                SheetSize sheet = settings.GetSheetForMaterialType(matType);
-
-                bool outputPerMaterial = settings.SeparateByMaterial && settings.OutputOneDwgPerMaterial;
-                string safeMat = MakeSafeFilePart(matType);
-
-                string outPath =
-                    outputPerMaterial
-                        ? Path.Combine(dir, $"{baseName}_nested_{safeMat}.dwg")
-                        : Path.Combine(dir, $"{baseName}_nested.dwg");
-
-                CadDocument outDoc;
-                using (var reader = new DwgReader(sourceDwgPath))
-                    outDoc = reader.Read();
-
-                var modelSpace = outDoc.BlockRecords["*Model_Space"];
-
-                object layerSource = EnsureLayer(outDoc, "SOURCE");
-                object layerSheet = EnsureLayer(outDoc, "SHEET");
-                object layerParts = EnsureLayer(outDoc, "PARTS");
-                object layerLabels = EnsureLayer(outDoc, "LABELS");
-
-                // Option 2: filter SOURCE preview to only this material, but KEEP the labels
-                if (settings.SeparateByMaterial && !string.Equals(matType, "ALL", StringComparison.OrdinalIgnoreCase))
-                {
-                    FilterSourcePreviewToMaterial(modelSpace, matType, log);
-                }
-
-                foreach (var ent in modelSpace.Entities)
-                    SetEntityLayer(ent, layerSource, "SOURCE");
-
-                var srcExt = GetEntityExtents(modelSpace.Entities);
-                double baseOriginX = srcExt.HasValue ? srcExt.Value.MinX : 0.0;
-                double baseOriginY = srcExt.HasValue ? (srcExt.Value.MaxY + 200.0) : 0.0;
-
-                int dummy1, dummy2;
-                var outPartsAll = LoadPartDefinitions(outDoc, log, out dummy1, out dummy2).ToList();
-
-                var outParts = settings.SeparateByMaterial
-                    ? outPartsAll.Where(p => string.Equals(p.MaterialType, matType, StringComparison.OrdinalIgnoreCase)).ToList()
-                    : outPartsAll;
-
-                if (outParts.Count == 0)
-                {
-                    log.Warn($"No parts for group '{matType}'. Skipping output.");
-                    continue;
-                }
-
-                int sheetsUsed;
-                int totalParts;
-
-                NestIntoDocument(
-                    sourceDwgPath,
-                    outDoc,
-                    modelSpace,
-                    outParts,
-                    sheet,
-                    baseOriginX,
-                    baseOriginY,
-                    matType,
-                    log,
-                    progress,
-                    ref placedOverallRef,
-                    totalOverall,
-                    layerSheet,
-                    layerParts,
-                    layerLabels,
-                    out sheetsUsed,
-                    out totalParts);
-
-                using (var writer = new DwgWriter(outPath, outDoc))
-                    writer.Write();
-
-                runResult.Outputs.Add(new MaterialNestResult
-                {
-                    MaterialType = matType,
-                    Sheet = sheet,
-                    OutputDwgPath = outPath,
-                    SheetsUsed = sheetsUsed,
-                    TotalParts = totalParts
-                });
-
-                if (!outputPerMaterial)
-                    break;
-            }
-
-            runResult.LogPath = log.TryWrite(dir, baseName);
-            runResult.LogLines = log.Count;
-            return runResult;
-        }
-
-        // ---------------- SOURCE filter (Option 2) ----------------
-        // NOTE: We keep only MText labels (Combine writes labels as MText).
-        // We DO NOT reference ACadSharp.Entities.Text because your ACadSharp build doesn't have it.
-
-        private static void FilterSourcePreviewToMaterial(BlockRecord modelSpace, string materialType, NestLog log)
-        {
-            if (modelSpace?.Entities == null || modelSpace.Entities.Count == 0)
-                return;
-
-            var ents = modelSpace.Entities.ToList();
-
-            var keepInsert = new HashSet<Insert>();
-            var keepBoxes = new List<(double MinX, double MaxX, double MinY)>();
-
-            foreach (var e in ents)
-            {
-                if (!(e is Insert ins))
-                    continue;
-
-                string blockName = TryGetInsertBlockName(ins);
-                if (!IsPlateBlock(blockName))
-                    continue;
-
-                string tag = ParseMaterialTagFromBlockName(blockName);
-                string type = MaterialTypeNormalizer.NormalizeToType((tag ?? "").Replace('_', ' '));
-
-                if (!string.Equals(type, materialType, StringComparison.OrdinalIgnoreCase))
-                    continue;
-
-                keepInsert.Add(ins);
-
-                if (TryGetBoundingBox2D(ins, out double minX, out double maxX, out double minY))
-                    keepBoxes.Add((minX, maxX, minY));
-            }
-
-            // IMPORTANT: if nothing matched, do NOT wipe preview
-            if (keepInsert.Count == 0)
-            {
-                log.Warn($"SOURCE filter: no matching inserts for material '{materialType}'. Preview left unchanged (likely missing __MAT_ tags).");
-                return;
-            }
-
-            const double padX = 800.0;  // allow long labels
-            const double below = 300.0;
-            const double above = 120.0;
-
-            bool haveBoxes = keepBoxes.Count > 0;
-
-            bool IsLabelNearAnyKeptInsert(double x, double y)
-            {
-                if (!haveBoxes)
-                {
-                    // fallback: keep labels that are below the plates region
-                    return y < 200.0;
-                }
-
-                foreach (var b in keepBoxes)
-                {
-                    if (x >= (b.MinX - padX) && x <= (b.MaxX + padX) &&
-                        y >= (b.MinY - below) && y <= (b.MinY + above))
-                        return true;
-                }
-                return false;
-            }
-
-            var kept = new List<Entity>();
-
-            foreach (var e in ents)
-            {
-                if (e == null)
-                    continue;
-
-                if (e is Insert ins)
-                {
-                    if (keepInsert.Contains(ins))
-                        kept.Add(e);
-                    continue;
-                }
-
-                if (e is MText)
-                {
-                    if (TryGetEntityXY(e, out double x, out double y) && IsLabelNearAnyKeptInsert(x, y))
-                        kept.Add(e);
-                    continue;
-                }
-
-                // Remove everything else from SOURCE preview
-            }
-
-            modelSpace.Entities.Clear();
-            foreach (var e in kept)
-                modelSpace.Entities.Add(e);
-
-            log.Info($"SOURCE filter for '{materialType}': kept {kept.Count} entities (inserts={keepInsert.Count}).");
-        }
-
-        private static bool IsPlateBlock(string blockName)
-        {
-            return !string.IsNullOrWhiteSpace(blockName) &&
-                   blockName.StartsWith("P_", StringComparison.OrdinalIgnoreCase);
-        }
-
-        private static bool TryGetBoundingBox2D(Entity ent, out double minX, out double maxX, out double minY)
-        {
-            minX = maxX = minY = 0.0;
-
-            if (ent == null)
-                return false;
-
-            try
-            {
-                var bb = ent.GetBoundingBox();
-                minX = bb.Min.X;
-                maxX = bb.Max.X;
-                minY = bb.Min.Y;
-                return true;
-            }
-            catch
-            {
-                return false;
-            }
-        }
-
-        private static bool TryGetEntityXY(Entity ent, out double x, out double y)
-        {
-            x = y = 0.0;
-
-            try
-            {
-                if (ent is MText mt)
-                {
-                    x = mt.InsertPoint.X;
-                    y = mt.InsertPoint.Y;
-                    return true;
-                }
-            }
-            catch { }
-
-            // Reflection fallback
-            try
-            {
-                var t = ent.GetType();
-                var p = t.GetProperty("InsertPoint") ?? t.GetProperty("Position");
-                if (p != null)
-                {
-                    var v = p.GetValue(ent, null);
-                    if (v is XYZ xyz)
-                    {
-                        x = xyz.X;
-                        y = xyz.Y;
-                        return true;
-                    }
-                }
-            }
-            catch { }
-
-            return false;
-        }
-
-        private static string TryGetInsertBlockName(Insert ins)
-        {
-            if (ins == null) return null;
-
-            try
-            {
-                var pBlock = ins.GetType().GetProperty("Block");
-                var blockObj = pBlock?.GetValue(ins);
-                if (blockObj != null)
-                {
-                    var pName = blockObj.GetType().GetProperty("Name");
-                    var name = pName?.GetValue(blockObj) as string;
-                    if (!string.IsNullOrWhiteSpace(name))
-                        return name;
-                }
-            }
-            catch { }
-
-            try
-            {
-                var p = ins.GetType().GetProperty("BlockName");
-                var v = p?.GetValue(ins) as string;
-                if (!string.IsNullOrWhiteSpace(v)) return v;
-            }
-            catch { }
-
-            return null;
-        }
-
-        private static string ParseMaterialTagFromBlockName(string blockName)
-        {
-            if (string.IsNullOrWhiteSpace(blockName)) return "UNKNOWN";
-
-            const string token = "__MAT_";
-            int idx = blockName.IndexOf(token, StringComparison.OrdinalIgnoreCase);
-            if (idx < 0) return "UNKNOWN";
-
-            int start = idx + token.Length;
-            if (start >= blockName.Length) return "UNKNOWN";
-
-            int end = blockName.IndexOf("__", start, StringComparison.OrdinalIgnoreCase);
-            if (end < 0) end = blockName.LastIndexOf("_Q", StringComparison.OrdinalIgnoreCase);
-            if (end < 0 || end <= start) end = blockName.Length;
-
-            string tag = blockName.Substring(start, end - start).Trim();
-            return string.IsNullOrWhiteSpace(tag) ? "UNKNOWN" : tag;
-        }
-
-        // ---------------- nesting core ----------------
-
-        private struct Extents2D
-        {
-            public double MinX, MinY, MaxX, MaxY;
-        }
-
-        private static Extents2D? GetEntityExtents(IEnumerable<Entity> entities)
-        {
-            double minX = double.MaxValue, minY = double.MaxValue, maxX = double.MinValue, maxY = double.MinValue;
-            bool any = false;
-
-            foreach (var ent in entities)
-            {
-                if (ent == null) continue;
-                try
-                {
-                    var bb = ent.GetBoundingBox();
-                    var bmin = bb.Min;
-                    var bmax = bb.Max;
-
-                    if (bmin.X < minX) minX = bmin.X;
-                    if (bmin.Y < minY) minY = bmin.Y;
-                    if (bmax.X > maxX) maxX = bmax.X;
-                    if (bmax.Y > maxY) maxY = bmax.Y;
-
-                    any = true;
-                }
-                catch { }
-            }
-
-            if (!any) return null;
-            return new Extents2D { MinX = minX, MinY = minY, MaxX = maxX, MaxY = maxY };
-        }
-
-        private static double? TryParseThicknessFromFilename(string sourceDwgPath)
-        {
-            try
-            {
-                string name = Path.GetFileNameWithoutExtension(sourceDwgPath) ?? "";
-                if (!name.StartsWith("thickness_", StringComparison.OrdinalIgnoreCase))
-                    return null;
-
-                string t = name.Substring("thickness_".Length);
-                t = t.Replace('_', '.');
-
-                if (double.TryParse(t, NumberStyles.Float, CultureInfo.InvariantCulture, out double mm) && mm > 0 && mm < 500)
-                    return mm;
-            }
-            catch { }
-            return null;
-        }
-
-        private static void NestIntoDocument(
-            string sourceDwgPath,
-            CadDocument doc,
-            BlockRecord modelSpace,
-            List<PartDefinition> parts,
-            SheetSize sheet,
-            double baseOriginX,
-            double baseOriginY,
-            string materialType,
-            NestLog log,
-            LaserCutProgressForm progress,
-            ref int placedOverall,
-            int totalOverall,
-            object layerSheet,
-            object layerParts,
-            object layerLabels,
-            out int sheetsUsed,
-            out int totalParts)
-        {
-            double sheetMargin = 10.0;
-            double partGap = 5.0;
-
-            double? thicknessMm = TryParseThicknessFromFilename(sourceDwgPath);
-            if (thicknessMm.HasValue && thicknessMm.Value > 0)
-            {
-                if (thicknessMm.Value > sheetMargin) sheetMargin = thicknessMm.Value;
-                if (thicknessMm.Value > partGap) partGap = thicknessMm.Value;
-            }
-
-            double placementMargin = sheetMargin + 2 * partGap;
-
-            double usableW = sheet.W - 2 * placementMargin;
-            double usableH = sheet.H - 2 * placementMargin;
-            if (usableW <= 0 || usableH <= 0)
-                throw new InvalidOperationException("Sheet is too small after margins/gap.");
-
-            totalParts = parts.Sum(p => Math.Max(1, p.Quantity));
-
-            foreach (var p in parts)
-            {
-                bool fits = false;
-                foreach (int a in AllowedAnglesDeg)
-                {
-                    var rb = GetRotatedBounds(p, a);
-                    if (rb.Width + partGap <= usableW + 1e-9 && rb.Height + partGap <= usableH + 1e-9)
-                    {
-                        fits = true;
-                        break;
-                    }
-                }
-                if (!fits)
-                    throw new InvalidOperationException($"Part '{p.BlockName}' cannot fit into the selected sheet size.");
-            }
-
-            var instances = new List<PartDefinition>();
-            foreach (var p in parts)
-            {
-                int q = Math.Max(1, p.Quantity);
-                for (int i = 0; i < q; i++)
-                    instances.Add(p);
-            }
-
-            instances.Sort((a, b) => (b.Width * b.Height).CompareTo(a.Width * a.Height));
-
-            AddGroupLabel(modelSpace, baseOriginX, baseOriginY, sheet, sheetMargin, materialType, layerLabels);
-
-            double sheetGapX = 80.0;
-
-            var sheets = new List<SheetState>();
-
-            SheetState NewSheet()
-            {
-                int idx = sheets.Count + 1;
-                var s = new SheetState
-                {
-                    Index = idx,
-                    OriginX = baseOriginX + (idx - 1) * (sheet.W + sheetGapX),
-                    OriginY = baseOriginY
-                };
-
-                DrawSheetOutline(s, sheet, modelSpace, layerSheet);
-
-                s.FreeRects.Add(new FreeRect
-                {
-                    X = placementMargin,
-                    Y = placementMargin,
-                    Width = sheet.W - 2 * placementMargin,
-                    Height = sheet.H - 2 * placementMargin
-                });
-
-                sheets.Add(s);
-                return s;
-            }
-
-            var curSheet = NewSheet();
-
-            foreach (var inst in instances)
-            {
-                while (true)
-                {
-                    if (TryPlaceOnSheet(curSheet, inst, partGap, modelSpace, layerParts, ref placedOverall, totalOverall, progress))
-                        break;
-
-                    curSheet = NewSheet();
-                }
-            }
-
-            double usableArea = usableW * usableH;
-            foreach (var s in sheets)
-            {
-                double fillPct = usableArea > 1e-9 ? (s.UsedArea / usableArea) * 100.0 : 0.0;
-                AddSheetLabel(modelSpace, s, sheet, sheetMargin, fillPct, layerLabels);
-            }
-
-            sheetsUsed = sheets.Count;
-        }
-
-        private static bool TryPlaceOnSheet(
-            SheetState sheet,
-            PartDefinition part,
-            double partGap,
-            BlockRecord modelSpace,
-            object layerParts,
-            ref int placedOverall,
-            int totalOverall,
-            LaserCutProgressForm progress)
-        {
-            if (sheet.FreeRects.Count == 0)
-                return false;
-
-            const double eps = 1e-9;
-
-            int bestRectIndex = -1;
-            int bestAngle = 0;
-            RotatedBounds bestBounds = default;
-
-            double bestShortSideFit = double.MaxValue;
-            double bestLongSideFit = double.MaxValue;
-            double bestAreaFit = double.MaxValue;
-
-            for (int i = 0; i < sheet.FreeRects.Count; i++)
-            {
-                var fr = sheet.FreeRects[i];
-
-                foreach (int ang in AllowedAnglesDeg)
-                {
-                    var rb = GetRotatedBounds(part, ang);
-
-                    double usedW = rb.Width + partGap;
-                    double usedH = rb.Height + partGap;
-
-                    if (usedW > fr.Width + eps || usedH > fr.Height + eps)
-                        continue;
-
-                    double leftoverH = fr.Width - usedW;
-                    double leftoverV = fr.Height - usedH;
-
-                    double shortFit = Math.Min(leftoverH, leftoverV);
-                    double longFit = Math.Max(leftoverH, leftoverV);
-                    double areaFit = fr.Width * fr.Height - usedW * usedH;
-
-                    if (shortFit < bestShortSideFit - eps ||
-                        (Math.Abs(shortFit - bestShortSideFit) < eps && longFit < bestLongSideFit - eps) ||
-                        (Math.Abs(shortFit - bestShortSideFit) < eps && Math.Abs(longFit - bestLongSideFit) < eps && areaFit < bestAreaFit - eps))
-                    {
-                        bestShortSideFit = shortFit;
-                        bestLongSideFit = longFit;
-                        bestAreaFit = areaFit;
-
-                        bestRectIndex = i;
-                        bestAngle = ang;
-                        bestBounds = rb;
-                    }
-                }
-            }
-
-            if (bestRectIndex < 0)
-                return false;
-
-            var chosen = sheet.FreeRects[bestRectIndex];
-
-            double usedX = chosen.X;
-            double usedY = chosen.Y;
-
-            double partMinLocalX = usedX + partGap * 0.5;
-            double partMinLocalY = usedY + partGap * 0.5;
-
-            double worldMinX = sheet.OriginX + partMinLocalX;
-            double worldMinY = sheet.OriginY + partMinLocalY;
-
-            double insertX = worldMinX - bestBounds.MinX;
-            double insertY = worldMinY - bestBounds.MinY;
-
-            double rotRad = bestAngle * Math.PI / 180.0;
-
-            var insert = new Insert(part.Block)
-            {
-                InsertPoint = new XYZ(insertX, insertY, 0.0),
-                XScale = 1.0,
-                YScale = 1.0,
-                ZScale = 1.0,
-                Rotation = rotRad
-            };
-
-            SetEntityLayer(insert, layerParts, "PARTS");
-            modelSpace.Entities.Add(insert);
-
-            sheet.PlacedCount++;
-            sheet.UsedArea += bestBounds.Width * bestBounds.Height;
-
-            var usedRect = new FreeRect
-            {
-                X = usedX,
-                Y = usedY,
-                Width = bestBounds.Width + partGap,
-                Height = bestBounds.Height + partGap
-            };
-
-            SubtractUsedRect(sheet, usedRect);
-
-            placedOverall++;
-            progress?.Step($"Placed {placedOverall}/{totalOverall}");
-
-            return true;
-        }
-
-        private static void SubtractUsedRect(SheetState sheet, FreeRect used)
-        {
-            const double eps = 1e-9;
-            const double minSize = 1.0;
-
-            var newFree = new List<FreeRect>();
-
-            double usedRight = used.X + used.Width;
-            double usedTop = used.Y + used.Height;
-
-            foreach (var fr in sheet.FreeRects)
-            {
-                if (!Intersects(fr, used))
-                {
-                    newFree.Add(fr);
-                    continue;
-                }
-
-                double frRight = fr.X + fr.Width;
-                double frTop = fr.Y + fr.Height;
-
-                if (used.X > fr.X + eps)
-                    newFree.Add(new FreeRect { X = fr.X, Y = fr.Y, Width = used.X - fr.X, Height = fr.Height });
-
-                if (usedRight < frRight - eps)
-                    newFree.Add(new FreeRect { X = usedRight, Y = fr.Y, Width = frRight - usedRight, Height = fr.Height });
-
-                if (used.Y > fr.Y + eps)
-                    newFree.Add(new FreeRect { X = fr.X, Y = fr.Y, Width = fr.Width, Height = used.Y - fr.Y });
-
-                if (usedTop < frTop - eps)
-                    newFree.Add(new FreeRect { X = fr.X, Y = usedTop, Width = fr.Width, Height = frTop - usedTop });
-            }
-
-            sheet.FreeRects = newFree.Where(r => r.Width > minSize && r.Height > minSize).ToList();
-
-            PruneContained(sheet.FreeRects);
-            MergeAdjacent(sheet.FreeRects);
-        }
-
-        private static bool Intersects(FreeRect a, FreeRect b)
-        {
-            return !(a.X + a.Width <= b.X ||
-                     b.X + b.Width <= a.X ||
-                     a.Y + a.Height <= b.Y ||
-                     b.Y + b.Height <= a.Y);
-        }
-
-        private static void PruneContained(List<FreeRect> rects)
-        {
-            const double eps = 1e-9;
-
-            for (int i = rects.Count - 1; i >= 0; i--)
-            {
-                var a = rects[i];
-                for (int j = 0; j < rects.Count; j++)
-                {
-                    if (i == j) continue;
-
-                    var b = rects[j];
-
-                    bool contained =
-                        a.X >= b.X - eps &&
-                        a.Y >= b.Y - eps &&
-                        a.X + a.Width <= b.X + b.Width + eps &&
-                        a.Y + a.Height <= b.Y + b.Height + eps;
-
-                    if (contained)
-                    {
-                        rects.RemoveAt(i);
-                        break;
-                    }
-                }
-            }
-        }
-
-        private static void MergeAdjacent(List<FreeRect> rects)
-        {
-            const double eps = 1e-9;
-            bool changed;
-
-            do
-            {
-                changed = false;
-
-                for (int i = 0; i < rects.Count && !changed; i++)
-                {
-                    for (int j = i + 1; j < rects.Count && !changed; j++)
-                    {
-                        var a = rects[i];
-                        var b = rects[j];
-
-                        bool sameX = Math.Abs(a.X - b.X) < eps && Math.Abs(a.Width - b.Width) < eps;
-                        if (sameX)
-                        {
-                            if (Math.Abs(a.Y + a.Height - b.Y) < eps)
-                            {
-                                rects[i] = new FreeRect { X = a.X, Y = a.Y, Width = a.Width, Height = a.Height + b.Height };
-                                rects.RemoveAt(j);
-                                changed = true;
-                                break;
-                            }
-                            if (Math.Abs(b.Y + b.Height - a.Y) < eps)
-                            {
-                                rects[i] = new FreeRect { X = b.X, Y = b.Y, Width = b.Width, Height = b.Height + a.Height };
-                                rects.RemoveAt(j);
-                                changed = true;
-                                break;
-                            }
-                        }
-
-                        bool sameY = Math.Abs(a.Y - b.Y) < eps && Math.Abs(a.Height - b.Height) < eps;
-                        if (sameY)
-                        {
-                            if (Math.Abs(a.X + a.Width - b.X) < eps)
-                            {
-                                rects[i] = new FreeRect { X = a.X, Y = a.Y, Width = a.Width + b.Width, Height = a.Height };
-                                rects.RemoveAt(j);
-                                changed = true;
-                                break;
-                            }
-                            if (Math.Abs(b.X + b.Width - a.X) < eps)
-                            {
-                                rects[i] = new FreeRect { X = b.X, Y = b.Y, Width = b.Width + a.Width, Height = b.Height };
-                                rects.RemoveAt(j);
-                                changed = true;
-                                break;
-                            }
-                        }
-                    }
-                }
-            } while (changed);
-        }
-
-        private static RotatedBounds GetRotatedBounds(PartDefinition part, int angleDeg)
-        {
-            if (part.RotatedCache.TryGetValue(angleDeg, out var cached))
-                return cached;
-
-            double rad = angleDeg * Math.PI / 180.0;
-            double c = Math.Cos(rad);
-            double s = Math.Sin(rad);
-
-            var pts = new[]
-            {
-                new XYZ(part.MinX, part.MinY, 0),
-                new XYZ(part.MinX, part.MaxY, 0),
-                new XYZ(part.MaxX, part.MinY, 0),
-                new XYZ(part.MaxX, part.MaxY, 0),
-            };
-
-            double minX = double.MaxValue, minY = double.MaxValue, maxX = double.MinValue, maxY = double.MinValue;
-
-            foreach (var p in pts)
-            {
-                double xr = p.X * c - p.Y * s;
-                double yr = p.X * s + p.Y * c;
-
-                if (xr < minX) minX = xr;
-                if (yr < minY) minY = yr;
-                if (xr > maxX) maxX = xr;
-                if (yr > maxY) maxY = yr;
-            }
-
-            var rb = new RotatedBounds { MinX = minX, MinY = minY, MaxX = maxX, MaxY = maxY };
-            part.RotatedCache[angleDeg] = rb;
-            return rb;
-        }
-
-        private static void DrawSheetOutline(SheetState sheet, SheetSize sheetSize, BlockRecord modelSpace, object layerSheet)
-        {
-            var bottom = new Line { StartPoint = new XYZ(sheet.OriginX, sheet.OriginY, 0), EndPoint = new XYZ(sheet.OriginX + sheetSize.W, sheet.OriginY, 0) };
-            var right = new Line { StartPoint = new XYZ(sheet.OriginX + sheetSize.W, sheet.OriginY, 0), EndPoint = new XYZ(sheet.OriginX + sheetSize.W, sheet.OriginY + sheetSize.H, 0) };
-            var top = new Line { StartPoint = new XYZ(sheet.OriginX + sheetSize.W, sheet.OriginY + sheetSize.H, 0), EndPoint = new XYZ(sheet.OriginX, sheet.OriginY + sheetSize.H, 0) };
-            var left = new Line { StartPoint = new XYZ(sheet.OriginX, sheet.OriginY + sheetSize.H, 0), EndPoint = new XYZ(sheet.OriginX, sheet.OriginY, 0) };
-
-            SetEntityLayer(bottom, layerSheet, "SHEET");
-            SetEntityLayer(right, layerSheet, "SHEET");
-            SetEntityLayer(top, layerSheet, "SHEET");
-            SetEntityLayer(left, layerSheet, "SHEET");
-
-            modelSpace.Entities.Add(bottom);
-            modelSpace.Entities.Add(right);
-            modelSpace.Entities.Add(top);
-            modelSpace.Entities.Add(left);
-        }
-
-        private static void AddSheetLabel(BlockRecord modelSpace, SheetState sheet, SheetSize sheetSize, double sheetMargin, double fillPercent, object layerLabels)
-        {
-            double x = sheet.OriginX + sheetMargin;
-            double y = sheet.OriginY + sheetSize.H + sheetMargin;
-
-            var mt = new MText
-            {
-                Value = $"Sheet {sheet.Index} | Parts: {sheet.PlacedCount} | Fill: {fillPercent:0.0}%",
-                InsertPoint = new XYZ(x, y, 0),
-                Height = 25.0
-            };
-
-            SetEntityLayer(mt, layerLabels, "LABELS");
-            modelSpace.Entities.Add(mt);
-        }
-
-        private static void AddGroupLabel(BlockRecord modelSpace, double originX, double originY, SheetSize sheetSize, double sheetMargin, string materialType, object layerLabels)
-        {
-            var mt = new MText
-            {
-                Value = $"NESTED MATERIAL: {materialType}",
-                InsertPoint = new XYZ(originX + sheetMargin, originY + sheetSize.H + sheetMargin + 40.0, 0),
-                Height = 35.0
-            };
-
-            SetEntityLayer(mt, layerLabels, "LABELS");
-            modelSpace.Entities.Add(mt);
-        }
-
-        private static IEnumerable<PartDefinition> LoadPartDefinitions(CadDocument doc, NestLog log, out int candidateBlocks, out int skippedBlocks)
-        {
-            candidateBlocks = 0;
-            skippedBlocks = 0;
-
-            var list = new List<PartDefinition>();
-
-            foreach (var br in doc.BlockRecords)
-            {
-                if (string.IsNullOrWhiteSpace(br?.Name))
-                    continue;
-
-                if (br.Name.StartsWith("*", StringComparison.Ordinal))
-                    continue;
-
-                if (!br.Name.StartsWith("P_", StringComparison.OrdinalIgnoreCase))
-                    continue;
-
-                candidateBlocks++;
-
-                int qty = ParseQuantityFromBlockName(br.Name);
-                if (qty <= 0) qty = 1;
-
-                string matTag = ParseMaterialTagFromBlockName(br.Name);
-                string matType = MaterialTypeNormalizer.NormalizeToType((matTag ?? "").Replace('_', ' '));
-
-                if (br.Entities == null || br.Entities.Count == 0)
-                {
-                    skippedBlocks++;
-                    log?.Warn($"Skipped block '{br.Name}' (empty).");
-                    continue;
-                }
-
-                double minX = double.MaxValue, minY = double.MaxValue, maxX = double.MinValue, maxY = double.MinValue;
-
-                foreach (var ent in br.Entities)
-                {
-                    try
-                    {
-                        var bb = ent.GetBoundingBox();
-                        var bmin = bb.Min;
-                        var bmax = bb.Max;
-
-                        if (bmin.X < minX) minX = bmin.X;
-                        if (bmin.Y < minY) minY = bmin.Y;
-                        if (bmax.X > maxX) maxX = bmax.X;
-                        if (bmax.Y > maxY) maxY = bmax.Y;
-                    }
-                    catch { }
-                }
-
-                if (minX == double.MaxValue || maxX == double.MinValue || minY == double.MaxValue || maxY == double.MinValue)
-                {
-                    skippedBlocks++;
-                    log?.Warn($"Skipped block '{br.Name}' (no bbox).");
-                    continue;
-                }
-
-                double w = maxX - minX;
-                double h = maxY - minY;
-                if (w <= 0 || h <= 0)
-                {
-                    skippedBlocks++;
-                    log?.Warn($"Skipped block '{br.Name}' (invalid size {w:0.###} x {h:0.###}).");
-                    continue;
-                }
-
-                list.Add(new PartDefinition
-                {
-                    BlockName = br.Name,
-                    Block = br,
-                    MaterialTag = matTag,
-                    MaterialType = matType,
-                    MinX = minX,
-                    MinY = minY,
-                    MaxX = maxX,
-                    MaxY = maxY,
-                    Width = w,
-                    Height = h,
-                    Quantity = qty
-                });
-            }
-
-            return list;
-        }
-
-        private static int ParseQuantityFromBlockName(string blockName)
-        {
-            if (string.IsNullOrEmpty(blockName)) return 1;
-
-            int idx = blockName.LastIndexOf("_Q", StringComparison.OrdinalIgnoreCase);
-            if (idx < 0 || idx + 2 >= blockName.Length) return 1;
-
-            string s = blockName.Substring(idx + 2);
-            if (int.TryParse(s, NumberStyles.Integer, CultureInfo.InvariantCulture, out int q) && q > 0) return q;
-            return 1;
-        }
-
-        private static string MakeSafeFilePart(string s)
-        {
-            if (string.IsNullOrWhiteSpace(s)) return "OTHER";
-
-            var invalid = Path.GetInvalidFileNameChars();
-            var sb = new StringBuilder(s.Length);
-
-            foreach (char c in s.Trim())
-            {
-                if (invalid.Contains(c)) sb.Append('_');
-                else if (char.IsWhiteSpace(c)) sb.Append('_');
-                else sb.Append(char.ToUpperInvariant(c));
-            }
-
-            string r = sb.ToString().Trim('_');
-            return string.IsNullOrWhiteSpace(r) ? "OTHER" : r;
-        }
-
-        // -------- Layers (best-effort, reflection-safe) --------
-
-        private static object EnsureLayer(CadDocument doc, string layerName)
-        {
-            if (doc == null || string.IsNullOrWhiteSpace(layerName))
-                return null;
-
-            try
-            {
-                var layersProp = doc.GetType().GetProperty("Layers");
-                var layersObj = layersProp?.GetValue(doc);
-                if (layersObj == null)
-                    return null;
-
-                var indexer = layersObj.GetType().GetProperty("Item", new[] { typeof(string) });
-                if (indexer != null)
-                {
-                    try
-                    {
-                        var existing = indexer.GetValue(layersObj, new object[] { layerName });
-                        if (existing != null)
-                            return existing;
-                    }
-                    catch { }
-                }
-
-                var newLayer = new Layer(layerName);
-
-                var addAny = layersObj.GetType().GetMethods()
-                    .FirstOrDefault(m => m.Name == "Add" && m.GetParameters().Length == 1);
-
-                addAny?.Invoke(layersObj, new object[] { newLayer });
-                return newLayer;
-            }
-            catch
-            {
-                return null;
-            }
-        }
-
-        private static void SetEntityLayer(Entity ent, object layerObj, string layerName)
-        {
-            if (ent == null) return;
-
-            try
-            {
-                var pLayer = ent.GetType().GetProperty("Layer");
-                if (pLayer != null && pLayer.CanWrite)
-                {
-                    if (pLayer.PropertyType == typeof(string))
-                    {
-                        pLayer.SetValue(ent, layerName);
-                        return;
-                    }
-
-                    if (layerObj != null && pLayer.PropertyType.IsInstanceOfType(layerObj))
-                    {
-                        pLayer.SetValue(ent, layerObj);
-                        return;
-                    }
-                }
-
-                var pLayerName = ent.GetType().GetProperty("LayerName");
-                if (pLayerName != null && pLayerName.CanWrite && pLayerName.PropertyType == typeof(string))
-                {
-                    pLayerName.SetValue(ent, layerName);
-                }
-            }
-            catch { }
-        }
-
-        private sealed class SingleGrouping<TKey, TElement> : IGrouping<TKey, TElement>
-        {
-            private readonly IEnumerable<TElement> _elements;
-            public TKey Key { get; }
-
-            public SingleGrouping(TKey key, IEnumerable<TElement> elements)
-            {
-                Key = key;
-                _elements = elements ?? Enumerable.Empty<TElement>();
-            }
-
-            public IEnumerator<TElement> GetEnumerator() => _elements.GetEnumerator();
-            System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator() => GetEnumerator();
-        }
-    }
-
-    // ---------------- Material normalization ----------------
-    internal static class MaterialTypeNormalizer
-    {
-        public const string TYPE_STEEL = "STEEL";
-        public const string TYPE_ALUMINUM = "ALUMINUM";
-        public const string TYPE_STAINLESS = "STAINLESS";
-        public const string TYPE_OTHER = "OTHER";
-
-        public static string NormalizeToType(string materialRawOrTag)
-        {
-            if (string.IsNullOrWhiteSpace(materialRawOrTag))
-                return TYPE_OTHER;
-
-            string s = materialRawOrTag.Trim().Replace('_', ' ').ToUpperInvariant();
-            while (s.Contains("  ")) s = s.Replace("  ", " ");
-
-            // Stainless first
-            if (ContainsAny(s,
-                "STAINLESS", "INOX", "SUS",
-                "AISI 304", "AISI304", "SS304", "SS 304", "304",
-                "AISI 316", "AISI316", "SS316", "SS 316", "316",
-                "1.4301", "1.4401", "1.4404", "1.4571",
-                "A2", "A4"))
-                return TYPE_STAINLESS;
-
-            if (ContainsAny(s,
-                "ALUMIN", "ALUMINUM", "ALU", "AL ",
-                "6061", "6082", "7075", "5052", "5083"))
-                return TYPE_ALUMINUM;
-
-            if (ContainsAny(s,
-                "STEEL", "S235", "S355", "ST37", "ST52", "A36", "C45", "CK45"))
-                return TYPE_STEEL;
-
-            return TYPE_OTHER;
-        }
-
-        public static int SortKey(string type)
-        {
-            type = (type ?? "").Trim().ToUpperInvariant();
-            if (type == TYPE_STEEL) return 1;
-            if (type == TYPE_ALUMINUM) return 2;
-            if (type == TYPE_STAINLESS) return 3;
-            return 4;
-        }
-
-        private static bool ContainsAny(string s, params string[] keys)
-        {
-            foreach (var k in keys)
-            {
-                if (string.IsNullOrWhiteSpace(k)) continue;
-                if (s.Contains(k)) return true;
-            }
-            return false;
-        }
-    }
-
-    // ---------------- UI (Options) ----------------
     internal sealed class LaserCutOptionsForm : Form
     {
-        private sealed class SheetPreset
+        private readonly ComboBox _preset;
+        private readonly NumericUpDown _w;
+        private readonly NumericUpDown _h;
+
+        private readonly CheckBox _sepMat;
+        private readonly CheckBox _oneDwgPerMat;
+        private readonly CheckBox _filterPreview;
+
+        private readonly Button _ok;
+        private readonly Button _cancel;
+
+        private readonly List<SheetPreset> _presets = new List<SheetPreset>
         {
-            public string Name;
-            public SheetSize Size;
-            public bool IsCustom;
-            public override string ToString() => Name;
-        }
-
-        private static class UiSettings
-        {
-            private const string RegPath = @"Software\SW2026RibbonAddin\LaserCut";
-
-            public static int LoadInt(string name, int def)
-            {
-                try
-                {
-                    using (var k = Registry.CurrentUser.OpenSubKey(RegPath, false))
-                    {
-                        object v = k?.GetValue(name);
-                        if (v == null) return def;
-                        if (v is int i) return i;
-                        if (int.TryParse(v.ToString(), out i)) return i;
-                    }
-                }
-                catch { }
-                return def;
-            }
-
-            public static double LoadDouble(string name, double def)
-            {
-                try
-                {
-                    using (var k = Registry.CurrentUser.OpenSubKey(RegPath, false))
-                    {
-                        object v = k?.GetValue(name);
-                        if (v == null) return def;
-                        if (double.TryParse(v.ToString(), NumberStyles.Float, CultureInfo.InvariantCulture, out double d)) return d;
-                    }
-                }
-                catch { }
-                return def;
-            }
-
-            public static bool LoadBool(string name, bool def)
-            {
-                try
-                {
-                    using (var k = Registry.CurrentUser.OpenSubKey(RegPath, false))
-                    {
-                        object v = k?.GetValue(name);
-                        if (v == null) return def;
-                        if (v is int i) return i != 0;
-                        if (bool.TryParse(v.ToString(), out bool b)) return b;
-                    }
-                }
-                catch { }
-                return def;
-            }
-
-            public static void Save(Dictionary<string, object> values)
-            {
-                try
-                {
-                    using (var k = Registry.CurrentUser.CreateSubKey(RegPath))
-                    {
-                        foreach (var kvp in values)
-                        {
-                            if (kvp.Value is int i) k.SetValue(kvp.Key, i, RegistryValueKind.DWord);
-                            else if (kvp.Value is bool b) k.SetValue(kvp.Key, b ? 1 : 0, RegistryValueKind.DWord);
-                            else if (kvp.Value is double d) k.SetValue(kvp.Key, d.ToString(CultureInfo.InvariantCulture), RegistryValueKind.String);
-                            else if (kvp.Value is string s) k.SetValue(kvp.Key, s, RegistryValueKind.String);
-                        }
-                    }
-                }
-                catch { }
-            }
-        }
-
-        private readonly List<SheetPreset> _presets;
-        private readonly List<SheetPreset> _materialPresets;
-
-        private readonly ComboBox _cmbGlobalPreset;
-        private readonly TextBox _txtW;
-        private readonly TextBox _txtH;
-
-        private readonly CheckBox _chkSeparate;
-        private readonly CheckBox _chkOneDwgPerMaterial;
-        private readonly CheckBox _chkUsePerMaterialSheets;
-
-        private readonly ComboBox _cmbSteel;
-        private readonly ComboBox _cmbAlu;
-        private readonly ComboBox _cmbStainless;
-        private readonly ComboBox _cmbOther;
+            new SheetPreset("1500 x 3000 mm", 3000, 1500),
+            new SheetPreset("1250 x 2500 mm", 2500, 1250),
+            new SheetPreset("1000 x 2000 mm", 2000, 1000),
+            new SheetPreset("Custom", 3000, 1500),
+        };
 
         public LaserCutRunSettings Settings { get; private set; }
 
@@ -1604,359 +146,1021 @@ namespace SW2026RibbonAddin.Commands
         {
             Text = "Batch nest options (applies to ALL thickness files)";
             FormBorderStyle = FormBorderStyle.FixedDialog;
-            StartPosition = FormStartPosition.CenterScreen;
-            MinimizeBox = false;
+            StartPosition = FormStartPosition.CenterParent;
             MaximizeBox = false;
+            MinimizeBox = false;
             ShowInTaskbar = false;
+            Width = 560;
+            Height = 270;
 
-            ClientSize = new WinSize(580, 390);
-
-            _presets = new List<SheetPreset>
+            var lblPreset = new Label { Left = 12, Top = 16, Width = 170, Text = "Global sheet preset:" };
+            _preset = new ComboBox
             {
-                new SheetPreset { Name = "1500 x 3000 mm", Size = new SheetSize(3000, 1500), IsCustom = false },
-                new SheetPreset { Name = "1250 x 2500 mm", Size = new SheetSize(2500, 1250), IsCustom = false },
-                new SheetPreset { Name = "1000 x 2000 mm", Size = new SheetSize(2000, 1000), IsCustom = false },
-                new SheetPreset { Name = "2000 x 4000 mm", Size = new SheetSize(4000, 2000), IsCustom = false },
-                new SheetPreset { Name = "Custom...", Size = new SheetSize(3000, 1500), IsCustom = true },
-            };
-
-            _materialPresets = _presets.Where(p => !p.IsCustom).ToList();
-
-            Controls.Add(new Label { AutoSize = true, Text = "Global sheet preset:", Location = new WinPoint(12, 18) });
-
-            _cmbGlobalPreset = new ComboBox
-            {
-                Location = new WinPoint(170, 14),
-                Width = 260,
+                Left = 190,
+                Top = 12,
+                Width = 330,
                 DropDownStyle = ComboBoxStyle.DropDownList
             };
-            _cmbGlobalPreset.Items.AddRange(_presets.Cast<object>().ToArray());
-            _cmbGlobalPreset.SelectedIndexChanged += (s, e) => ApplyGlobalPresetToFields();
-            Controls.Add(_cmbGlobalPreset);
+            foreach (var p in _presets)
+                _preset.Items.Add(p.ToString());
+            _preset.SelectedIndex = 0;
+            _preset.SelectedIndexChanged += (_, __) => ApplyPresetToNumeric();
 
-            Controls.Add(new Label { AutoSize = true, Text = "Width (mm):", Location = new WinPoint(12, 54) });
-            _txtW = new TextBox { Location = new WinPoint(170, 50), Width = 120 };
-            Controls.Add(_txtW);
-
-            Controls.Add(new Label { AutoSize = true, Text = "Height (mm):", Location = new WinPoint(12, 88) });
-            _txtH = new TextBox { Location = new WinPoint(170, 84), Width = 120 };
-            Controls.Add(_txtH);
-
-            _chkSeparate = new CheckBox
+            var lblW = new Label { Left = 12, Top = 52, Width = 170, Text = "Width (mm):" };
+            _w = new NumericUpDown
             {
-                AutoSize = true,
-                Text = "Separate nests by material type (STEEL / ALUMINUM / STAINLESS / OTHER)",
-                Location = new WinPoint(12, 124)
+                Left = 190,
+                Top = 48,
+                Width = 120,
+                DecimalPlaces = 1,
+                Minimum = 100,
+                Maximum = 200000,
+                Value = 3000
             };
-            _chkSeparate.CheckedChanged += (s, e) => UpdateMaterialUiEnabled();
-            Controls.Add(_chkSeparate);
 
-            _chkOneDwgPerMaterial = new CheckBox
+            var lblH = new Label { Left = 320, Top = 52, Width = 80, Text = "Height:" };
+            _h = new NumericUpDown
             {
-                AutoSize = true,
-                Text = "Output one DWG per material type",
-                Location = new WinPoint(32, 152)
+                Left = 400,
+                Top = 48,
+                Width = 120,
+                DecimalPlaces = 1,
+                Minimum = 100,
+                Maximum = 200000,
+                Value = 1500
             };
-            Controls.Add(_chkOneDwgPerMaterial);
 
-            _chkUsePerMaterialSheets = new CheckBox
+            _sepMat = new CheckBox
             {
-                AutoSize = true,
-                Text = "Use per-material sheet presets",
-                Location = new WinPoint(32, 178)
+                Left = 12,
+                Top = 86,
+                Width = 520,
+                Text = "Separate nests by EXACT SolidWorks material name (no normalization / no translation)",
+                Checked = true
             };
-            _chkUsePerMaterialSheets.CheckedChanged += (s, e) => UpdateMaterialUiEnabled();
-            Controls.Add(_chkUsePerMaterialSheets);
-
-            var grp = new GroupBox
+            _sepMat.CheckedChanged += (_, __) =>
             {
-                Text = "Per-material sheet preset (when enabled)",
-                Location = new WinPoint(12, 210),
-                Size = new WinSize(556, 90)
+                _oneDwgPerMat.Enabled = _sepMat.Checked;
+                _filterPreview.Enabled = _sepMat.Checked;
+                if (!_sepMat.Checked)
+                {
+                    _oneDwgPerMat.Checked = false;
+                    _filterPreview.Checked = false;
+                }
+                else
+                {
+                    _oneDwgPerMat.Checked = true;
+                    _filterPreview.Checked = true;
+                }
             };
-            Controls.Add(grp);
 
-            grp.Controls.Add(new Label { AutoSize = true, Text = "Steel:", Location = new WinPoint(12, 28) });
-            _cmbSteel = MakeMaterialCombo();
-            _cmbSteel.Location = new WinPoint(60, 24);
-            grp.Controls.Add(_cmbSteel);
+            _oneDwgPerMat = new CheckBox
+            {
+                Left = 32,
+                Top = 112,
+                Width = 520,
+                Text = "Output one nested DWG per material name",
+                Checked = true
+            };
 
-            grp.Controls.Add(new Label { AutoSize = true, Text = "Alu:", Location = new WinPoint(220, 28) });
-            _cmbAlu = MakeMaterialCombo();
-            _cmbAlu.Location = new WinPoint(250, 24);
-            grp.Controls.Add(_cmbAlu);
-
-            grp.Controls.Add(new Label { AutoSize = true, Text = "SS:", Location = new WinPoint(410, 28) });
-            _cmbStainless = MakeMaterialCombo();
-            _cmbStainless.Location = new WinPoint(440, 24);
-            grp.Controls.Add(_cmbStainless);
-
-            grp.Controls.Add(new Label { AutoSize = true, Text = "Other:", Location = new WinPoint(12, 58) });
-            _cmbOther = MakeMaterialCombo();
-            _cmbOther.Location = new WinPoint(60, 54);
-            grp.Controls.Add(_cmbOther);
-
-            var bottom = new Panel { Dock = DockStyle.Bottom, Height = 54 };
-            Controls.Add(bottom);
+            _filterPreview = new CheckBox
+            {
+                Left = 32,
+                Top = 136,
+                Width = 520,
+                Text = "Keep only that material's source preview (plates + labels) in each output (Option 2)",
+                Checked = true
+            };
 
             var note = new Label
             {
-                AutoSize = false,
-                Location = new WinPoint(12, 8),
-                Size = new WinSize(360, 40),
-                Text = "Note: rotations are always 0/90/180/270.\r\nGap+margin are auto (>= thickness)."
-            };
-            note.Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Top;
-            bottom.Controls.Add(note);
-
-            var btnOk = new Button { Text = "OK", Width = 85, Height = 28 };
-            btnOk.Anchor = AnchorStyles.Right | AnchorStyles.Top;
-            btnOk.Location = new WinPoint(bottom.Width - 190, 12);
-            btnOk.Click += Ok_Click;
-            bottom.Controls.Add(btnOk);
-
-            var btnCancel = new Button { Text = "Cancel", Width = 85, Height = 28, DialogResult = DialogResult.Cancel };
-            btnCancel.Anchor = AnchorStyles.Right | AnchorStyles.Top;
-            btnCancel.Location = new WinPoint(bottom.Width - 95, 12);
-            bottom.Controls.Add(btnCancel);
-
-            bottom.Resize += (s, e) =>
-            {
-                btnOk.Location = new WinPoint(bottom.Width - 190, 12);
-                btnCancel.Location = new WinPoint(bottom.Width - 95, 12);
-                note.Size = new WinSize(Math.Max(100, bottom.Width - 210), 40);
+                Left = 12,
+                Top = 162,
+                Width = 520,
+                Text = "Note: rotations are always 0/90/180/270. Gap+margin are auto (>= thickness)."
             };
 
-            AcceptButton = btnOk;
-            CancelButton = btnCancel;
+            _ok = new Button { Text = "OK", Left = 360, Width = 75, Top = 190, DialogResult = DialogResult.OK };
+            _cancel = new Button { Text = "Cancel", Left = 445, Width = 75, Top = 190, DialogResult = DialogResult.Cancel };
 
-            int globalIdx = UiSettings.LoadInt("GlobalPresetIndex", 0);
-            if (globalIdx < 0 || globalIdx >= _presets.Count) globalIdx = 0;
+            AcceptButton = _ok;
+            CancelButton = _cancel;
 
-            double customW = UiSettings.LoadDouble("CustomW", 3000);
-            double customH = UiSettings.LoadDouble("CustomH", 1500);
+            Controls.Add(lblPreset);
+            Controls.Add(_preset);
+            Controls.Add(lblW);
+            Controls.Add(_w);
+            Controls.Add(lblH);
+            Controls.Add(_h);
 
-            bool separate = UiSettings.LoadBool("SeparateByMaterial", true);
-            bool onePerMat = UiSettings.LoadBool("OneDwgPerMaterial", true);
-            bool perMatSheets = UiSettings.LoadBool("UsePerMaterialSheets", true);
+            Controls.Add(_sepMat);
+            Controls.Add(_oneDwgPerMat);
+            Controls.Add(_filterPreview);
+            Controls.Add(note);
 
-            _cmbGlobalPreset.SelectedIndex = globalIdx;
+            Controls.Add(_ok);
+            Controls.Add(_cancel);
 
-            _txtW.Text = customW.ToString("0.###", CultureInfo.InvariantCulture);
-            _txtH.Text = customH.ToString("0.###", CultureInfo.InvariantCulture);
+            ApplyPresetToNumeric();
 
-            _chkSeparate.Checked = separate;
-            _chkOneDwgPerMaterial.Checked = onePerMat;
-            _chkUsePerMaterialSheets.Checked = perMatSheets;
-
-            int steelIdx = Clamp(UiSettings.LoadInt("SteelPresetIndex", 0), 0, _materialPresets.Count - 1);
-            int aluIdx = Clamp(UiSettings.LoadInt("AluPresetIndex", 1), 0, _materialPresets.Count - 1);
-            int ssIdx = Clamp(UiSettings.LoadInt("StainlessPresetIndex", 0), 0, _materialPresets.Count - 1);
-            int otherIdx = Clamp(UiSettings.LoadInt("OtherPresetIndex", 0), 0, _materialPresets.Count - 1);
-
-            _cmbSteel.SelectedIndex = steelIdx;
-            _cmbAlu.SelectedIndex = aluIdx;
-            _cmbStainless.SelectedIndex = ssIdx;
-            _cmbOther.SelectedIndex = otherIdx;
-
-            ApplyGlobalPresetToFields();
-            UpdateMaterialUiEnabled();
-        }
-
-        private ComboBox MakeMaterialCombo()
-        {
-            var cmb = new ComboBox
+            // Build settings on OK
+            _ok.Click += (_, __) =>
             {
-                Width = 130,
-                DropDownStyle = ComboBoxStyle.DropDownList
-            };
-            cmb.Items.AddRange(_materialPresets.Cast<object>().ToArray());
-            return cmb;
-        }
+                var chosen = _presets[Math.Max(0, _preset.SelectedIndex)];
+                var final = new SheetPreset(
+                    chosen.Name == "Custom" ? "Custom" : chosen.Name,
+                    (double)_w.Value,
+                    (double)_h.Value);
 
-        private static int Clamp(int v, int lo, int hi)
-        {
-            if (v < lo) return lo;
-            if (v > hi) return hi;
-            return v;
-        }
-
-        private void ApplyGlobalPresetToFields()
-        {
-            if (!(_cmbGlobalPreset.SelectedItem is SheetPreset p))
-                return;
-
-            if (!p.IsCustom)
-            {
-                _txtW.Text = p.Size.W.ToString("0.###", CultureInfo.InvariantCulture);
-                _txtH.Text = p.Size.H.ToString("0.###", CultureInfo.InvariantCulture);
-                _txtW.Enabled = false;
-                _txtH.Enabled = false;
-            }
-            else
-            {
-                _txtW.Enabled = true;
-                _txtH.Enabled = true;
-            }
-        }
-
-        private void UpdateMaterialUiEnabled()
-        {
-            bool sep = _chkSeparate.Checked;
-
-            _chkOneDwgPerMaterial.Enabled = sep;
-            _chkUsePerMaterialSheets.Enabled = sep;
-
-            bool enablePresets = sep && _chkUsePerMaterialSheets.Checked;
-
-            _cmbSteel.Enabled = enablePresets;
-            _cmbAlu.Enabled = enablePresets;
-            _cmbStainless.Enabled = enablePresets;
-            _cmbOther.Enabled = enablePresets;
-        }
-
-        private void Ok_Click(object sender, EventArgs e)
-        {
-            if (!(_cmbGlobalPreset.SelectedItem is SheetPreset globalPreset))
-                return;
-
-            SheetSize globalSize;
-
-            if (!globalPreset.IsCustom)
-            {
-                globalSize = globalPreset.Size;
-            }
-            else
-            {
-                if (!double.TryParse(_txtW.Text.Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out double w) || w <= 0)
+                Settings = new LaserCutRunSettings
                 {
-                    MessageBox.Show(this, "Enter a valid positive width (mm).", "Laser Cut", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                    _txtW.Focus(); _txtW.SelectAll();
-                    return;
-                }
-                if (!double.TryParse(_txtH.Text.Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out double h) || h <= 0)
-                {
-                    MessageBox.Show(this, "Enter a valid positive height (mm).", "Laser Cut", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                    _txtH.Focus(); _txtH.SelectAll();
-                    return;
-                }
-                globalSize = new SheetSize(w, h);
+                    DefaultSheet = final,
+                    SeparateByMaterialExact = _sepMat.Checked,
+                    OutputOneDwgPerMaterial = _sepMat.Checked && _oneDwgPerMat.Checked,
+                    KeepOnlyCurrentMaterialInSourcePreview = _sepMat.Checked && _filterPreview.Checked,
+
+                    // compatibility fields:
+                    UsePerMaterialSheetPresets = false
+                };
+            };
+        }
+
+        private void ApplyPresetToNumeric()
+        {
+            int idx = Math.Max(0, _preset.SelectedIndex);
+            var p = _presets[idx];
+
+            if (!p.Name.Equals("Custom", StringComparison.OrdinalIgnoreCase))
+            {
+                _w.Value = (decimal)p.WidthMm;
+                _h.Value = (decimal)p.HeightMm;
             }
-
-            bool sep = _chkSeparate.Checked;
-            bool onePerMat = sep && _chkOneDwgPerMaterial.Checked;
-            bool perMatSheets = sep && _chkUsePerMaterialSheets.Checked;
-
-            SheetSize steel = _materialPresets[_cmbSteel.SelectedIndex].Size;
-            SheetSize alu = _materialPresets[_cmbAlu.SelectedIndex].Size;
-            SheetSize ss = _materialPresets[_cmbStainless.SelectedIndex].Size;
-            SheetSize other = _materialPresets[_cmbOther.SelectedIndex].Size;
-
-            Settings = new LaserCutRunSettings
-            {
-                SeparateByMaterial = sep,
-                OutputOneDwgPerMaterial = onePerMat,
-                UsePerMaterialSheetPresets = perMatSheets,
-
-                DefaultSheet = globalSize,
-
-                SteelSheet = steel,
-                AluminumSheet = alu,
-                StainlessSheet = ss,
-                OtherSheet = other
-            };
-
-            var values = new Dictionary<string, object>
-            {
-                ["GlobalPresetIndex"] = _cmbGlobalPreset.SelectedIndex,
-                ["CustomW"] = globalSize.W,
-                ["CustomH"] = globalSize.H,
-
-                ["SeparateByMaterial"] = sep,
-                ["OneDwgPerMaterial"] = onePerMat,
-                ["UsePerMaterialSheets"] = perMatSheets,
-
-                ["SteelPresetIndex"] = _cmbSteel.SelectedIndex,
-                ["AluPresetIndex"] = _cmbAlu.SelectedIndex,
-                ["StainlessPresetIndex"] = _cmbStainless.SelectedIndex,
-                ["OtherPresetIndex"] = _cmbOther.SelectedIndex
-            };
-
-            UiSettings.Save(values);
-
-            DialogResult = DialogResult.OK;
-            Close();
         }
     }
 
-    // ---------------- UI (Progress) ----------------
     internal sealed class LaserCutProgressForm : Form
     {
-        private readonly ProgressBar _progressBar;
+        private readonly ProgressBar _bar;
         private readonly Label _label;
-        private readonly int _maximum;
-        private int _current;
+        private int _total;
+        private int _done;
 
-        public LaserCutProgressForm(int maximum)
+        public LaserCutProgressForm(int total)
         {
-            if (maximum <= 0) maximum = 1;
-            _maximum = maximum;
+            _total = Math.Max(1, total);
 
-            Text = "Laser nesting...";
+            Text = "Nesting...";
             FormBorderStyle = FormBorderStyle.FixedDialog;
             StartPosition = FormStartPosition.CenterScreen;
-            MinimizeBox = false;
             MaximizeBox = false;
+            MinimizeBox = false;
             ShowInTaskbar = false;
-            ClientSize = new WinSize(520, 95);
+            Width = 520;
+            Height = 130;
 
-            _label = new Label
-            {
-                AutoSize = false,
-                Text = "Preparing...",
-                TextAlign = WinContentAlignment.MiddleLeft,
-                Location = new WinPoint(12, 9),
-                Size = new WinSize(496, 22)
-            };
+            _label = new Label { Left = 12, Top = 12, Width = 480, Text = "Starting..." };
+            _bar = new ProgressBar { Left = 12, Top = 40, Width = 480, Height = 20, Minimum = 0, Maximum = _total, Value = 0 };
+
             Controls.Add(_label);
-
-            _progressBar = new ProgressBar
-            {
-                Location = new WinPoint(12, 40),
-                Size = new WinSize(496, 20),
-                Minimum = 0,
-                Maximum = _maximum,
-                Value = 0
-            };
-            Controls.Add(_progressBar);
+            Controls.Add(_bar);
         }
 
-        public void SetStatus(string statusText)
+        public void Step(string message)
         {
-            if (!IsHandleCreated) return;
-            if (!string.IsNullOrEmpty(statusText))
-                _label.Text = statusText;
+            _done++;
+            if (_done > _total) _done = _total;
 
-            _label.Refresh();
-            WinFormsApp.DoEvents();
+            _label.Text = message ?? "";
+            _bar.Value = _done;
+
+            // keep UI responsive
+            System.Windows.Forms.Application.DoEvents();
+        }
+    }
+
+    internal static class DwgLaserNester
+    {
+        internal sealed class NestRunResult
+        {
+            public string ThicknessFile;
+            public string MaterialExact;
+            public string OutputDwg;
+            public int SheetsUsed;
+            public int TotalParts;
         }
 
-        public void Step(string statusText)
+        private sealed class PartDefinition
         {
-            if (!IsHandleCreated) return;
+            public BlockRecord Block;
+            public string BlockName;
 
-            if (!string.IsNullOrEmpty(statusText))
-                _label.Text = statusText;
+            public string MaterialExact;
 
-            if (_current < _maximum)
+            public double MinX;
+            public double MinY;
+            public double MaxX;
+            public double MaxY;
+
+            public double Width;
+            public double Height;
+
+            public int Quantity;
+        }
+
+        private sealed class SheetState
+        {
+            public int Index;
+            public double OriginX;
+            public double OriginY;
+            public List<FreeRect> FreeRects = new List<FreeRect>();
+        }
+
+        private sealed class FreeRect
+        {
+            public double X;
+            public double Y;
+            public double Width;
+            public double Height;
+        }
+
+        public static void NestFolder(string mainFolder, LaserCutRunSettings settings, bool showUi = true)
+        {
+            if (settings.DefaultSheet.WidthMm <= 0 || settings.DefaultSheet.HeightMm <= 0)
+                throw new ArgumentException("Sheet width/height must be positive.");
+
+            if (string.IsNullOrWhiteSpace(mainFolder) || !Directory.Exists(mainFolder))
+                throw new DirectoryNotFoundException("Folder not found: " + mainFolder);
+
+            // Only take the combined thickness outputs, not already nested results
+            var thicknessFiles = Directory.GetFiles(mainFolder, "thickness_*.dwg", SearchOption.TopDirectoryOnly)
+                .Where(f =>
+                {
+                    string n = Path.GetFileNameWithoutExtension(f) ?? "";
+                    return !n.Contains("_nested", StringComparison.OrdinalIgnoreCase)
+                           && !n.Contains("_nest_", StringComparison.OrdinalIgnoreCase);
+                })
+                .OrderBy(f => f, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            if (thicknessFiles.Count == 0)
             {
-                _current++;
-                _progressBar.Value = _current;
+                if (showUi)
+                {
+                    MessageBox.Show(
+                        "No thickness_*.dwg files found in this folder.\r\n" +
+                        "Run Combine DWG first (it creates thickness_*.dwg).",
+                        "Laser nesting",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Information);
+                }
+                return;
             }
 
-            _progressBar.Refresh();
-            _label.Refresh();
-            WinFormsApp.DoEvents();
+            var batchSummary = new StringBuilder();
+            batchSummary.AppendLine("Batch nesting summary");
+            batchSummary.AppendLine("Folder: " + mainFolder);
+            batchSummary.AppendLine("Sheet: " + settings.DefaultSheet);
+            batchSummary.AppendLine("SeparateByMaterialExact: " + settings.SeparateByMaterialExact);
+            batchSummary.AppendLine("OutputOneDwgPerMaterial: " + settings.OutputOneDwgPerMaterial);
+            batchSummary.AppendLine("KeepOnlyCurrentMaterialInSourcePreview: " + settings.KeepOnlyCurrentMaterialInSourcePreview);
+            batchSummary.AppendLine(new string('-', 60));
+
+            foreach (var thicknessFile in thicknessFiles)
+            {
+                var results = NestThicknessFile(thicknessFile, settings);
+
+                batchSummary.AppendLine(Path.GetFileName(thicknessFile));
+                foreach (var r in results)
+                {
+                    batchSummary.AppendLine($"  Material: {r.MaterialExact}");
+                    batchSummary.AppendLine($"  SheetsUsed: {r.SheetsUsed}, Parts: {r.TotalParts}");
+                    batchSummary.AppendLine($"  Output: {Path.GetFileName(r.OutputDwg)}");
+                }
+                batchSummary.AppendLine(new string('-', 60));
+            }
+
+            string summaryPath = Path.Combine(mainFolder, "batch_nest_summary.txt");
+            File.WriteAllText(summaryPath, batchSummary.ToString(), Encoding.UTF8);
+
+            if (showUi)
+            {
+                MessageBox.Show(
+                    "Batch nesting finished.\r\n\r\nSummary:\r\n" + summaryPath,
+                    "Laser nesting",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Information);
+            }
+        }
+
+        // Back-compat overloads (in case some other button calls these)
+        public static void Nest(string sourceDwgPath, double sheetWidth, double sheetHeight)
+        {
+            var settings = new LaserCutRunSettings
+            {
+                DefaultSheet = new SheetPreset("Custom", sheetWidth, sheetHeight),
+                SeparateByMaterialExact = false,
+                OutputOneDwgPerMaterial = false,
+                KeepOnlyCurrentMaterialInSourcePreview = false
+            };
+
+            NestThicknessFile(sourceDwgPath, settings);
+        }
+
+        public static List<NestRunResult> Nest(string thicknessFile, LaserCutRunSettings settings)
+        {
+            return NestThicknessFile(thicknessFile, settings);
+        }
+
+        public static List<NestRunResult> NestThicknessFile(string sourceDwgPath, LaserCutRunSettings settings)
+        {
+            if (!File.Exists(sourceDwgPath))
+                throw new FileNotFoundException("DWG file not found.", sourceDwgPath);
+
+            // First pass: read once to find materials + quantities
+            CadDocument doc0;
+            using (var reader = new DwgReader(sourceDwgPath))
+                doc0 = reader.Read();
+
+            var defs0 = LoadPartDefinitions(doc0).ToList();
+            if (defs0.Count == 0)
+                throw new InvalidOperationException("No plate blocks (P_*_Q#) found in: " + sourceDwgPath);
+
+            var groups = BuildGroups(defs0, settings);
+
+            var results = new List<NestRunResult>();
+
+            foreach (var grp in groups)
+            {
+                string materialKey = grp.Key;
+                string materialLabel = grp.Value; // exact (pretty) label
+
+                // Re-read fresh doc for each output (so outputs don't overlap each other)
+                CadDocument doc;
+                using (var reader = new DwgReader(sourceDwgPath))
+                    doc = reader.Read();
+
+                var defs = LoadPartDefinitions(doc)
+                    .Where(d => MaterialNameCodec.Normalize(d.MaterialExact)
+                        .Equals(materialKey, StringComparison.OrdinalIgnoreCase))
+                    .ToList();
+
+                int totalInstances = defs.Sum(d => d.Quantity);
+                if (totalInstances <= 0)
+                    continue;
+
+                // Determine auto gap+margin (>= thickness)
+                double thicknessMm = TryGetPlateThicknessFromFileName(sourceDwgPath) ?? 0.0;
+
+                double partGap = 3.0;
+                if (thicknessMm > partGap)
+                    partGap = thicknessMm;
+
+                double sheetMargin = 10.0;
+                if (thicknessMm > sheetMargin)
+                    sheetMargin = thicknessMm;
+
+                double placementMargin = sheetMargin + 2.0 * partGap;
+
+                double sheetWidth = settings.DefaultSheet.WidthMm;
+                double sheetHeight = settings.DefaultSheet.HeightMm;
+
+                // Validate fit
+                double usableWidth = sheetWidth - 2 * placementMargin;
+                double usableHeight = sheetHeight - 2 * placementMargin;
+
+                foreach (var d in defs)
+                {
+                    if (d.Width > usableWidth || d.Height > usableHeight)
+                    {
+                        throw new InvalidOperationException(
+                            $"Part '{d.BlockName}' ({d.Width:0.##} x {d.Height:0.##} mm) " +
+                            $"does not fit inside sheet {sheetWidth:0.##} x {sheetHeight:0.##} mm " +
+                            $"with margin {placementMargin:0.##} mm.");
+                    }
+                }
+
+                // Option 2: keep only that material’s source preview
+                if (settings.SeparateByMaterialExact &&
+                    settings.OutputOneDwgPerMaterial &&
+                    settings.KeepOnlyCurrentMaterialInSourcePreview)
+                {
+                    FilterSourcePreviewToTheseBlocks(doc, defs.Select(d => d.BlockName).ToHashSet(StringComparer.OrdinalIgnoreCase));
+                }
+
+                // Expand instances
+                var instances = new List<PartDefinition>(totalInstances);
+                foreach (var d in defs)
+                {
+                    for (int i = 0; i < d.Quantity; i++)
+                        instances.Add(d);
+                }
+
+                // Sort biggest first
+                instances.Sort((a, b) =>
+                {
+                    double areaA = a.Width * a.Height;
+                    double areaB = b.Width * b.Height;
+                    return areaB.CompareTo(areaA);
+                });
+
+                var modelSpace = doc.BlockRecords["*Model_Space"];
+
+                // Compute extents of remaining source preview
+                GetModelSpaceExtents(doc, out double origMinX, out double origMinY, out double origMaxX, out double origMaxY);
+
+                // Place sheets ABOVE source preview
+                double baseSheetOriginY = origMaxY + 200.0;
+                double baseSheetOriginX = origMinX;
+
+                using (var progress = new LaserCutProgressForm(totalInstances))
+                {
+                    progress.Show();
+                    System.Windows.Forms.Application.DoEvents();
+
+                    int sheetCount = NestFreeRectangles(
+                        instances,
+                        modelSpace,
+                        sheetWidth,
+                        sheetHeight,
+                        placementMargin,
+                        sheetGap: 50.0,
+                        partGap,
+                        baseSheetOriginX,
+                        baseSheetOriginY,
+                        progress,
+                        totalInstances,
+                        materialLabel);
+
+                    // Write output
+                    string dir = Path.GetDirectoryName(sourceDwgPath) ?? "";
+                    string nameNoExt = Path.GetFileNameWithoutExtension(sourceDwgPath) ?? "thickness";
+
+                    string outPath;
+
+                    if (settings.SeparateByMaterialExact && settings.OutputOneDwgPerMaterial)
+                    {
+                        string safeMat = MaterialNameCodec.MakeSafeFileToken(materialLabel);
+                        outPath = Path.Combine(dir, $"{nameNoExt}_nested_{safeMat}.dwg");
+                    }
+                    else
+                    {
+                        outPath = Path.Combine(dir, $"{nameNoExt}_nested.dwg");
+                    }
+
+                    using (var writer = new DwgWriter(outPath, doc))
+                        writer.Write();
+
+                    // Write a small log next to output
+                    string logPath = Path.Combine(dir, $"{nameNoExt}_nest_log.txt");
+                    AppendNestLog(logPath, sourceDwgPath, materialLabel, sheetWidth, sheetHeight, thicknessMm, partGap, sheetCount, totalInstances, outPath);
+
+                    results.Add(new NestRunResult
+                    {
+                        ThicknessFile = sourceDwgPath,
+                        MaterialExact = materialLabel,
+                        OutputDwg = outPath,
+                        SheetsUsed = sheetCount,
+                        TotalParts = totalInstances
+                    });
+
+                    progress.Close();
+                }
+            }
+
+            return results;
+        }
+
+        private static void AppendNestLog(
+            string logPath,
+            string thicknessFile,
+            string material,
+            double sheetW,
+            double sheetH,
+            double thicknessMm,
+            double gapMm,
+            int sheets,
+            int parts,
+            string outDwg)
+        {
+            try
+            {
+                var sb = new StringBuilder();
+                sb.AppendLine("Nest run:");
+                sb.AppendLine("  Thickness file: " + Path.GetFileName(thicknessFile));
+                sb.AppendLine("  Material: " + material);
+                sb.AppendLine($"  Sheet: {sheetW:0.###} x {sheetH:0.###} mm");
+                sb.AppendLine($"  Thickness(mm): {thicknessMm:0.###}");
+                sb.AppendLine($"  Gap(mm): {gapMm:0.###}  (auto >= thickness)");
+                sb.AppendLine($"  Sheets used: {sheets}");
+                sb.AppendLine($"  Total parts: {parts}");
+                sb.AppendLine("  Output: " + Path.GetFileName(outDwg));
+                sb.AppendLine(new string('-', 60));
+
+                File.AppendAllText(logPath, sb.ToString(), Encoding.UTF8);
+            }
+            catch
+            {
+                // ignore logging failures
+            }
+        }
+
+        private static Dictionary<string, string> BuildGroups(List<PartDefinition> defs, LaserCutRunSettings settings)
+        {
+            // key = normalized string used for grouping (case-insensitive compare)
+            // value = the exact (pretty) label we will show / use in outputs
+            var groups = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+            if (!settings.SeparateByMaterialExact || !settings.OutputOneDwgPerMaterial)
+            {
+                groups["ALL"] = "ALL";
+                return groups;
+            }
+
+            foreach (var d in defs)
+            {
+                string mat = MaterialNameCodec.Normalize(d.MaterialExact);
+                if (!groups.ContainsKey(mat))
+                    groups[mat] = mat;
+            }
+
+            if (groups.Count == 0)
+                groups["UNKNOWN"] = "UNKNOWN";
+
+            return groups;
+        }
+
+        private static double? TryGetPlateThicknessFromFileName(string sourceDwgPath)
+        {
+            if (string.IsNullOrWhiteSpace(sourceDwgPath))
+                return null;
+
+            string fileName = Path.GetFileNameWithoutExtension(sourceDwgPath);
+            if (string.IsNullOrWhiteSpace(fileName))
+                return null;
+
+            const string prefix = "thickness_";
+            int idx = fileName.IndexOf(prefix, StringComparison.OrdinalIgnoreCase);
+            if (idx < 0)
+                return null;
+
+            string token = fileName.Substring(idx + prefix.Length);
+            if (string.IsNullOrWhiteSpace(token))
+                return null;
+
+            token = token.Replace('_', '.');
+
+            if (double.TryParse(token, NumberStyles.Float, CultureInfo.InvariantCulture, out double value) &&
+                value > 0.0 && value < 1000.0)
+            {
+                return value;
+            }
+
+            return null;
+        }
+
+        private static IEnumerable<PartDefinition> LoadPartDefinitions(CadDocument doc)
+        {
+            if (doc == null)
+                yield break;
+
+            foreach (var br in doc.BlockRecords)
+            {
+                var block = br;
+                if (block == null)
+                    continue;
+
+                string name = block.Name ?? "";
+                if (!name.StartsWith("P_", StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                int qIndex = name.LastIndexOf("_Q", StringComparison.OrdinalIgnoreCase);
+                if (qIndex < 0)
+                    continue;
+
+                int qty = 1;
+                string qtyToken = name.Substring(qIndex + 2);
+                if (!int.TryParse(qtyToken, NumberStyles.Integer, CultureInfo.InvariantCulture, out qty))
+                    qty = 1;
+
+                // material exact from token in block name
+                string material = "UNKNOWN";
+                MaterialNameCodec.TryExtractFromBlockName(name, out material);
+
+                // bbox of entities inside the block (local coords)
+                double minX = double.MaxValue, minY = double.MaxValue;
+                double maxX = double.MinValue, maxY = double.MinValue;
+
+                foreach (var ent in block.Entities)
+                {
+                    try
+                    {
+                        var bb = ent.GetBoundingBox();
+                        XYZ bbMin = bb.Min;
+                        XYZ bbMax = bb.Max;
+
+                        if (bbMin.X < minX) minX = bbMin.X;
+                        if (bbMin.Y < minY) minY = bbMin.Y;
+                        if (bbMax.X > maxX) maxX = bbMax.X;
+                        if (bbMax.Y > maxY) maxY = bbMax.Y;
+                    }
+                    catch
+                    {
+                        // ignore entities without bbox
+                    }
+                }
+
+                if (minX == double.MaxValue || maxX == double.MinValue)
+                    continue;
+
+                double w = maxX - minX;
+                double h = maxY - minY;
+
+                if (w <= 0.0 || h <= 0.0)
+                    continue;
+
+                yield return new PartDefinition
+                {
+                    Block = block,
+                    BlockName = name,
+                    MaterialExact = material,
+                    MinX = minX,
+                    MinY = minY,
+                    MaxX = maxX,
+                    MaxY = maxY,
+                    Width = w,
+                    Height = h,
+                    Quantity = Math.Max(1, qty)
+                };
+            }
+        }
+
+        private static void FilterSourcePreviewToTheseBlocks(CadDocument doc, HashSet<string> keepBlockNames)
+        {
+            if (doc == null || keepBlockNames == null || keepBlockNames.Count == 0)
+                return;
+
+            BlockRecord modelSpace;
+            try
+            {
+                modelSpace = doc.BlockRecords["*Model_Space"];
+            }
+            catch
+            {
+                return;
+            }
+
+            // Remove inserts of plate blocks that are NOT in the keep set.
+            // Keep MTexts only if their X falls near any kept insert bbox.
+            var allInserts = modelSpace.Entities.OfType<Insert>().ToList();
+
+            // Build world X-ranges for kept inserts
+            var keepXRanges = new List<(double minX, double maxX)>();
+
+            foreach (var ins in allInserts)
+            {
+                var blk = ins?.Block;
+                if (blk == null) continue;
+
+                string bn = blk.Name ?? "";
+                if (!bn.StartsWith("P_", StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                if (!keepBlockNames.Contains(bn))
+                    continue;
+
+                // Combined layout inserts are non-rotated; bbox in world = insert + local bbox
+                // We approximate by using the block's bbox:
+                var def = LoadPartDefinitions(doc).FirstOrDefault(d => d.BlockName.Equals(bn, StringComparison.OrdinalIgnoreCase));
+                if (def == null) continue;
+
+                double ix = ins.InsertPoint.X;
+                double minX = ix + def.MinX;
+                double maxX = ix + def.MaxX;
+                if (minX > maxX) { var t = minX; minX = maxX; maxX = t; }
+
+                keepXRanges.Add((minX, maxX));
+            }
+
+            // Pad so we keep labels that are slightly wider than geometry
+            const double pad = 80.0;
+
+            bool IsNearKeptX(double x)
+            {
+                foreach (var r in keepXRanges)
+                {
+                    if (x >= r.minX - pad && x <= r.maxX + pad)
+                        return true;
+                }
+                return false;
+            }
+
+            var toRemove = new List<Entity>();
+
+            foreach (var ent in modelSpace.Entities)
+            {
+                if (ent is Insert ins)
+                {
+                    var blk = ins.Block;
+                    if (blk == null) continue;
+
+                    string bn = blk.Name ?? "";
+                    if (bn.StartsWith("P_", StringComparison.OrdinalIgnoreCase) && !keepBlockNames.Contains(bn))
+                        toRemove.Add(ent);
+                }
+            }
+
+            foreach (var ent in modelSpace.Entities)
+            {
+                if (ent is MText mt)
+                {
+                    double x = mt.InsertPoint.X;
+                    if (!IsNearKeptX(x))
+                        toRemove.Add(ent);
+                }
+            }
+
+            foreach (var ent in toRemove.Distinct())
+            {
+                try { modelSpace.Entities.Remove(ent); } catch { }
+            }
+        }
+
+        private static void GetModelSpaceExtents(CadDocument doc, out double minX, out double minY, out double maxX, out double maxY)
+        {
+            minX = double.MaxValue;
+            minY = double.MaxValue;
+            maxX = double.MinValue;
+            maxY = double.MinValue;
+
+            BlockRecord modelSpace;
+            try
+            {
+                modelSpace = doc.BlockRecords["*Model_Space"];
+            }
+            catch
+            {
+                minX = minY = maxX = maxY = 0.0;
+                return;
+            }
+
+            foreach (var ent in modelSpace.Entities)
+            {
+                try
+                {
+                    var bb = ent.GetBoundingBox();
+                    XYZ a = bb.Min;
+                    XYZ b = bb.Max;
+
+                    if (a.X < minX) minX = a.X;
+                    if (a.Y < minY) minY = a.Y;
+                    if (b.X > maxX) maxX = b.X;
+                    if (b.Y > maxY) maxY = b.Y;
+                }
+                catch
+                {
+                    // ignore
+                }
+            }
+
+            if (minX == double.MaxValue || maxX == double.MinValue)
+            {
+                minX = minY = maxX = maxY = 0.0;
+            }
+        }
+
+        private static int NestFreeRectangles(
+            List<PartDefinition> instances,
+            BlockRecord modelSpace,
+            double sheetWidth,
+            double sheetHeight,
+            double placementMargin,
+            double sheetGap,
+            double partGap,
+            double startOriginX,
+            double baseOriginY,
+            LaserCutProgressForm progress,
+            int totalInstances,
+            string materialLabel)
+        {
+            var sheets = new List<SheetState>();
+
+            SheetState NewSheet()
+            {
+                var sheet = new SheetState
+                {
+                    Index = sheets.Count + 1,
+                    OriginX = startOriginX + sheets.Count * (sheetWidth + sheetGap),
+                    OriginY = baseOriginY
+                };
+
+                sheets.Add(sheet);
+                DrawSheetOutline(sheet, sheetWidth, sheetHeight, modelSpace, materialLabel);
+
+                sheet.FreeRects.Add(new FreeRect
+                {
+                    X = placementMargin,
+                    Y = placementMargin,
+                    Width = sheetWidth - 2 * placementMargin,
+                    Height = sheetHeight - 2 * placementMargin
+                });
+
+                return sheet;
+            }
+
+            int placed = 0;
+            var sheetState = NewSheet();
+
+            foreach (var inst in instances)
+            {
+                while (true)
+                {
+                    if (TryPlaceOnSheet(sheetState, inst, partGap, modelSpace, ref placed, totalInstances, progress))
+                        break;
+
+                    sheetState = NewSheet();
+                }
+            }
+
+            return sheets.Count;
+        }
+
+        private static bool TryPlaceOnSheet(
+            SheetState sheet,
+            PartDefinition part,
+            double partGap,
+            BlockRecord modelSpace,
+            ref int placed,
+            int totalInstances,
+            LaserCutProgressForm progress)
+        {
+            if (sheet.FreeRects.Count == 0)
+                return false;
+
+            int bestIndex = -1;
+            bool bestRot90 = false;
+            double bestShortSideFit = double.MaxValue;
+            double bestLongSideFit = double.MaxValue;
+
+            for (int i = 0; i < sheet.FreeRects.Count; i++)
+            {
+                var fr = sheet.FreeRects[i];
+
+                Evaluate(fr, part.Width, part.Height, false, i);
+                Evaluate(fr, part.Height, part.Width, true, i);
+            }
+
+            if (bestIndex < 0)
+                return false;
+
+            var chosen = sheet.FreeRects[bestIndex];
+            bool rot90 = bestRot90;
+
+            double w = rot90 ? part.Height : part.Width;
+            double h = rot90 ? part.Width : part.Height;
+
+            double placeW = w + partGap;
+            double placeH = h + partGap;
+
+            double desiredMinLocalX = chosen.X + partGap * 0.5;
+            double desiredMinLocalY = chosen.Y + partGap * 0.5;
+
+            double insertXWorld;
+            double insertYWorld;
+            double rotationRad;
+
+            if (!rot90)
+            {
+                double worldMinX = sheet.OriginX + desiredMinLocalX;
+                double worldMinY = sheet.OriginY + desiredMinLocalY;
+
+                insertXWorld = worldMinX - part.MinX;
+                insertYWorld = worldMinY - part.MinY;
+
+                // 0 or 180 are equivalent for packing; we keep 0.
+                rotationRad = 0.0;
+            }
+            else
+            {
+                // 90° rotation around insert point:
+                // rotate (x,y)->(-y,x).
+                // bounding min after rotation about origin: (-MaxY, MinX)
+                double worldMinX = sheet.OriginX + desiredMinLocalX;
+                double worldMinY = sheet.OriginY + desiredMinLocalY;
+
+                insertXWorld = worldMinX + part.MaxY;
+                insertYWorld = worldMinY - part.MinX;
+
+                // 90 or 270 are equivalent for packing; we keep 90.
+                rotationRad = Math.PI / 2.0;
+            }
+
+            var insert = new Insert(part.Block)
+            {
+                InsertPoint = new XYZ(insertXWorld, insertYWorld, 0.0),
+                XScale = 1.0,
+                YScale = 1.0,
+                ZScale = 1.0,
+                Rotation = rotationRad
+            };
+            modelSpace.Entities.Add(insert);
+
+            SplitFreeRect(sheet, bestIndex, chosen, placeW, placeH);
+
+            placed++;
+            progress.Step($"Placed {placed} / {totalInstances} ...");
+
+            return true;
+
+            void Evaluate(FreeRect fr, double wc, double hc, bool candidateRot90, int rectIndex)
+            {
+                double pw = wc + partGap;
+                double ph = hc + partGap;
+
+                if (pw > fr.Width || ph > fr.Height)
+                    return;
+
+                double leftoverHoriz = fr.Width - pw;
+                double leftoverVert = fr.Height - ph;
+
+                double shortSideFit = Math.Min(leftoverHoriz, leftoverVert);
+                double longSideFit = Math.Max(leftoverHoriz, leftoverVert);
+
+                if (shortSideFit < bestShortSideFit ||
+                    (Math.Abs(shortSideFit - bestShortSideFit) < 1e-9 && longSideFit < bestLongSideFit))
+                {
+                    bestShortSideFit = shortSideFit;
+                    bestLongSideFit = longSideFit;
+                    bestIndex = rectIndex;
+                    bestRot90 = candidateRot90;
+                }
+            }
+        }
+
+        private static void SplitFreeRect(SheetState sheet, int rectIndex, FreeRect usedRect, double usedWidth, double usedHeight)
+        {
+            sheet.FreeRects.RemoveAt(rectIndex);
+
+            const double minSize = 1.0;
+
+            double rightWidth = usedRect.Width - usedWidth;
+            if (rightWidth > minSize)
+            {
+                sheet.FreeRects.Add(new FreeRect
+                {
+                    X = usedRect.X + usedWidth,
+                    Y = usedRect.Y,
+                    Width = rightWidth,
+                    Height = usedRect.Height
+                });
+            }
+
+            double topHeight = usedRect.Height - usedHeight;
+            if (topHeight > minSize)
+            {
+                sheet.FreeRects.Add(new FreeRect
+                {
+                    X = usedRect.X,
+                    Y = usedRect.Y + usedHeight,
+                    Width = usedWidth,
+                    Height = topHeight
+                });
+            }
+        }
+
+        private static void DrawSheetOutline(SheetState sheet, double sheetWidth, double sheetHeight, BlockRecord modelSpace, string materialLabel)
+        {
+            // Border
+            modelSpace.Entities.Add(new Line
+            {
+                StartPoint = new XYZ(sheet.OriginX, sheet.OriginY, 0.0),
+                EndPoint = new XYZ(sheet.OriginX + sheetWidth, sheet.OriginY, 0.0)
+            });
+            modelSpace.Entities.Add(new Line
+            {
+                StartPoint = new XYZ(sheet.OriginX + sheetWidth, sheet.OriginY, 0.0),
+                EndPoint = new XYZ(sheet.OriginX + sheetWidth, sheet.OriginY + sheetHeight, 0.0)
+            });
+            modelSpace.Entities.Add(new Line
+            {
+                StartPoint = new XYZ(sheet.OriginX + sheetWidth, sheet.OriginY + sheetHeight, 0.0),
+                EndPoint = new XYZ(sheet.OriginX, sheet.OriginY + sheetHeight, 0.0)
+            });
+            modelSpace.Entities.Add(new Line
+            {
+                StartPoint = new XYZ(sheet.OriginX, sheet.OriginY + sheetHeight, 0.0),
+                EndPoint = new XYZ(sheet.OriginX, sheet.OriginY, 0.0)
+            });
+
+            // Title (material)
+            if (!string.IsNullOrWhiteSpace(materialLabel) && !materialLabel.Equals("ALL", StringComparison.OrdinalIgnoreCase))
+            {
+                modelSpace.Entities.Add(new MText
+                {
+                    Value = $"Material: {materialLabel}",
+                    InsertPoint = new XYZ(sheet.OriginX + 10.0, sheet.OriginY + sheetHeight + 15.0, 0.0),
+                    Height = 20.0
+                });
+            }
         }
     }
 }

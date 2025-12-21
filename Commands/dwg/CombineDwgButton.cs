@@ -9,7 +9,7 @@ using ACadSharp;
 using ACadSharp.Entities;
 using ACadSharp.IO;
 using ACadSharp.Tables;
-using CSMath;
+using CSMath; // XYZ, BoundingBox, etc.
 
 namespace SW2026RibbonAddin.Commands
 {
@@ -37,7 +37,7 @@ namespace SW2026RibbonAddin.Commands
 
             try
             {
-                DwgBatchCombiner.Combine(mainFolder);
+                DwgBatchCombiner.Combine(mainFolder, showUi: true);
             }
             catch (Exception ex)
             {
@@ -49,7 +49,11 @@ namespace SW2026RibbonAddin.Commands
             }
         }
 
-        public int GetEnableState(AddinContext context) => AddinContext.Enable;
+        public int GetEnableState(AddinContext context)
+        {
+            // Independent of active SW document
+            return AddinContext.Enable;
+        }
 
         private static string SelectMainFolder()
         {
@@ -70,12 +74,8 @@ namespace SW2026RibbonAddin.Commands
     {
         private static readonly Random _random = new Random();
 
-        // Bright ACI colors (good on black background)
-        private static readonly byte[] _brightAci = new byte[] { 1, 2, 3, 4, 5, 6, 7 };
-
-        // ✅ FIX: byte, not int
-        private static byte _lastAci = 0;
-        private static bool _hasLastAci = false;
+        // AutoCAD ACI indices that are very visible on black background
+        private static readonly byte[] VisibleAciColors = { 1, 2, 3, 4, 5, 6, 7 };
 
         private sealed class CombinedPart
         {
@@ -84,18 +84,26 @@ namespace SW2026RibbonAddin.Commands
             public string FullPath;
             public double ThicknessMm;
             public int Quantity;
-
-            public string MaterialRaw;
-            public string MaterialTag;
+            public string MaterialExact; // EXACT string from SolidWorks (no normalization)
         }
 
-        public static void Combine(string mainFolder)
+        internal sealed class CombineRunResult
+        {
+            public int UniqueParts;
+            public string AllCsvPath;
+            public List<string> ThicknessDwgs = new List<string>();
+        }
+
+        public static CombineRunResult Combine(string mainFolder, bool showUi = true)
         {
             if (string.IsNullOrEmpty(mainFolder) || !Directory.Exists(mainFolder))
             {
-                MessageBox.Show("The selected folder does not exist.", "Combine DWG",
-                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                return;
+                if (showUi)
+                {
+                    MessageBox.Show("The selected folder does not exist.", "Combine DWG",
+                        MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                }
+                return new CombineRunResult();
             }
 
             string[] subFolders;
@@ -105,22 +113,32 @@ namespace SW2026RibbonAddin.Commands
             }
             catch (Exception ex)
             {
-                MessageBox.Show("Failed to enumerate subfolders:\r\n\r\n" + ex.Message,
-                    "Combine DWG",
-                    MessageBoxButtons.OK, MessageBoxIcon.Error);
-                return;
+                if (showUi)
+                {
+                    MessageBox.Show("Failed to enumerate subfolders:\r\n\r\n" + ex.Message,
+                        "Combine DWG",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Error);
+                }
+                return new CombineRunResult();
             }
 
             if (subFolders.Length == 0)
             {
-                MessageBox.Show("The selected folder does not contain any subfolders.",
-                    "Combine DWG",
-                    MessageBoxButtons.OK, MessageBoxIcon.Information);
-                return;
+                if (showUi)
+                {
+                    MessageBox.Show("The selected folder does not contain any subfolders.",
+                        "Combine DWG",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Information);
+                }
+                return new CombineRunResult();
             }
 
+            // Key includes FILE + THICKNESS + MATERIAL (exact string)
             var combined = new Dictionary<string, CombinedPart>(StringComparer.OrdinalIgnoreCase);
 
+            // --- read all parts.csv and merge rows ---
             foreach (string sub in subFolders)
             {
                 string csvPath = Path.Combine(sub, "parts.csv");
@@ -129,40 +147,20 @@ namespace SW2026RibbonAddin.Commands
 
                 string folderName = Path.GetFileName(sub);
 
-                string[] lines;
-                try { lines = File.ReadAllLines(csvPath); }
-                catch { continue; }
-
-                if (lines.Length <= 1)
-                    continue;
-
-                for (int i = 1; i < lines.Length; i++)
+                foreach (var row in ReadPartsCsv(csvPath))
                 {
-                    string line = lines[i];
-                    if (string.IsNullOrWhiteSpace(line))
+                    if (row == null)
                         continue;
 
-                    List<string> cols = ParseCsvLine(line);
-                    if (cols.Count < 3)
+                    string fileName = row.FileName;
+                    double tMm = row.ThicknessMm;
+                    int qty = row.Quantity;
+                    string material = MaterialNameCodec.Normalize(row.MaterialExact);
+
+                    if (string.IsNullOrWhiteSpace(fileName) || tMm <= 0 || qty <= 0)
                         continue;
 
-                    string fileName = (cols[0] ?? "").Trim();
-                    if (string.IsNullOrEmpty(fileName))
-                        continue;
-
-                    if (!double.TryParse((cols[1] ?? "").Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out double tMm))
-                        continue;
-
-                    if (!int.TryParse((cols[2] ?? "").Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out int qty))
-                        continue;
-
-                    string materialRaw = cols.Count >= 4 ? (cols[3] ?? "").Trim() : "UNKNOWN";
-                    if (string.IsNullOrWhiteSpace(materialRaw))
-                        materialRaw = "UNKNOWN";
-
-                    string materialTag = SanitizeMaterialTag(materialRaw);
-
-                    string key = MakeKey(fileName, tMm, materialTag);
+                    string key = MakeKey(fileName, tMm, material);
 
                     if (!combined.TryGetValue(key, out CombinedPart part))
                     {
@@ -173,8 +171,7 @@ namespace SW2026RibbonAddin.Commands
                             FullPath = Path.Combine(sub, fileName),
                             ThicknessMm = tMm,
                             Quantity = 0,
-                            MaterialRaw = materialRaw,
-                            MaterialTag = materialTag
+                            MaterialExact = material
                         };
                         combined.Add(key, part);
                     }
@@ -185,11 +182,14 @@ namespace SW2026RibbonAddin.Commands
 
             if (combined.Count == 0)
             {
-                MessageBox.Show("No parts.csv files with data were found in any subfolder.",
-                    "Combine DWG",
-                    MessageBoxButtons.OK,
-                    MessageBoxIcon.Information);
-                return;
+                if (showUi)
+                {
+                    MessageBox.Show("No parts.csv files with data were found in any subfolder.",
+                        "Combine DWG",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Information);
+                }
+                return new CombineRunResult();
             }
 
             var list = new List<CombinedPart>(combined.Values);
@@ -198,16 +198,17 @@ namespace SW2026RibbonAddin.Commands
                 int cmp = a.ThicknessMm.CompareTo(b.ThicknessMm);
                 if (cmp != 0) return cmp;
 
-                cmp = string.Compare(a.MaterialTag, b.MaterialTag, StringComparison.OrdinalIgnoreCase);
+                cmp = string.Compare(a.MaterialExact, b.MaterialExact, StringComparison.OrdinalIgnoreCase);
                 if (cmp != 0) return cmp;
 
                 return string.Compare(a.FileName, b.FileName, StringComparison.OrdinalIgnoreCase);
             });
 
+            // --- write all_parts.csv in MAIN folder ---
             string allCsvPath = Path.Combine(mainFolder, "all_parts.csv");
             var outLines = new List<string>
             {
-                "FileName,PlateThickness_mm,Quantity,Folder,Material"
+                "FileName,PlateThickness_mm,Quantity,Material,Folder"
             };
 
             foreach (var p in list)
@@ -215,116 +216,175 @@ namespace SW2026RibbonAddin.Commands
                 outLines.Add(string.Format(
                     CultureInfo.InvariantCulture,
                     "{0},{1},{2},{3},{4}",
-                    EscapeCsv(p.FileName),
+                    CsvCell(p.FileName),
                     p.ThicknessMm.ToString("0.###", CultureInfo.InvariantCulture),
                     p.Quantity,
-                    EscapeCsv(p.FolderName),
-                    EscapeCsv(p.MaterialRaw)));
+                    CsvCell(p.MaterialExact),
+                    CsvCell(p.FolderName)));
             }
 
             File.WriteAllLines(allCsvPath, outLines, Encoding.UTF8);
 
-            CreatePerThicknessDwgs(mainFolder, list);
+            // --- create per-thickness DWG files ---
+            var thicknessDwgs = new List<string>();
+            CreatePerThicknessDwgs(mainFolder, list, thicknessDwgs);
 
-            MessageBox.Show(
-                "DWG combination finished.\r\n\r\n" +
-                "Unique parts: " + list.Count + Environment.NewLine +
-                "Summary CSV: " + allCsvPath,
-                "Combine DWG",
-                MessageBoxButtons.OK,
-                MessageBoxIcon.Information);
-        }
-
-        private static string MakeKey(string fileName, double thicknessMm, string materialTag)
-        {
-            string fn = (fileName ?? "").Trim().ToUpperInvariant();
-            string mat = (materialTag ?? "UNKNOWN").Trim().ToUpperInvariant();
-
-            return fn + "|" +
-                   thicknessMm.ToString("0.###", CultureInfo.InvariantCulture) + "|" +
-                   mat;
-        }
-
-        private static string MakePlateBlockName(string fileName, int quantity, string materialTag)
-        {
-            string baseName = Path.GetFileNameWithoutExtension(fileName);
-            if (string.IsNullOrEmpty(baseName))
-                baseName = "Part";
-
-            var sb = new StringBuilder();
-            foreach (char c in baseName)
+            if (showUi)
             {
-                sb.Append(char.IsLetterOrDigit(c) ? c : '_');
+                MessageBox.Show(
+                    "DWG combination finished.\r\n\r\n" +
+                    "Unique parts: " + list.Count + Environment.NewLine +
+                    "Summary CSV: " + allCsvPath,
+                    "Combine DWG",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Information);
             }
 
-            string safePart = sb.Length > 0 ? sb.ToString() : "Part";
-            string safeMat = SanitizeMaterialTag(materialTag);
-
-            int q = Math.Max(1, quantity);
-
-            return string.Format(
-                CultureInfo.InvariantCulture,
-                "P_{0}__MAT_{1}__Q{2}",
-                safePart,
-                safeMat,
-                q);
+            return new CombineRunResult
+            {
+                UniqueParts = list.Count,
+                AllCsvPath = allCsvPath,
+                ThicknessDwgs = thicknessDwgs
+            };
         }
 
-        private static string SanitizeMaterialTag(string materialRaw)
+        private sealed class PartsCsvRow
         {
-            string s = (materialRaw ?? "").Trim();
-            if (string.IsNullOrWhiteSpace(s))
-                s = "UNKNOWN";
+            public string FileName;
+            public double ThicknessMm;
+            public int Quantity;
+            public string MaterialExact;
+        }
 
-            s = s.Replace('_', ' ');
-
-            var sb = new StringBuilder(s.Length);
-            foreach (char c in s.ToUpperInvariant())
+        private static IEnumerable<PartsCsvRow> ReadPartsCsv(string csvPath)
+        {
+            string[] lines;
+            try
             {
-                sb.Append(char.IsLetterOrDigit(c) ? c : '_');
+                lines = File.ReadAllLines(csvPath);
+            }
+            catch
+            {
+                yield break;
             }
 
-            string tag = sb.ToString();
-            while (tag.Contains("__"))
-                tag = tag.Replace("__", "_");
+            if (lines == null || lines.Length <= 1)
+                yield break;
 
-            tag = tag.Trim('_');
-            if (string.IsNullOrWhiteSpace(tag))
-                tag = "UNKNOWN";
-
-            const int maxLen = 32;
-            if (tag.Length > maxLen)
-                tag = tag.Substring(0, maxLen);
-
-            return tag;
-        }
-
-        private static byte PickBrightAci()
-        {
-            if (_brightAci.Length == 0)
-                return 7;
-
-            for (int tries = 0; tries < 10; tries++)
+            // Find header
+            int headerIndex = -1;
+            for (int i = 0; i < lines.Length; i++)
             {
-                byte pick = _brightAci[_random.Next(0, _brightAci.Length)];
-                if (!_hasLastAci || pick != _lastAci || _brightAci.Length == 1)
+                if (!string.IsNullOrWhiteSpace(lines[i]))
                 {
-                    _lastAci = pick;
-                    _hasLastAci = true;
-                    return pick;
+                    headerIndex = i;
+                    break;
                 }
             }
 
-            _lastAci = _brightAci[0];
-            _hasLastAci = true;
-            return _lastAci;
+            if (headerIndex < 0 || headerIndex >= lines.Length - 1)
+                yield break;
+
+            var header = ParseCsvLine(lines[headerIndex]);
+            int idxFile = FindHeaderIndex(header, "FileName", "Filename");
+            int idxThk = FindHeaderIndex(header, "PlateThickness_mm", "Thickness", "PlateThickness");
+            int idxQty = FindHeaderIndex(header, "Quantity", "Qty");
+            int idxMat = FindHeaderIndex(header, "Material");
+
+            // Backwards compatible: if old format (3 cols), assume:
+            // 0=File, 1=Thickness, 2=Qty
+            bool old3Col = (idxFile < 0 || idxThk < 0 || idxQty < 0);
+
+            for (int i = headerIndex + 1; i < lines.Length; i++)
+            {
+                string line = lines[i];
+                if (string.IsNullOrWhiteSpace(line))
+                    continue;
+
+                var cols = ParseCsvLine(line);
+                if (cols.Count < 3)
+                    continue;
+
+                string fileName;
+                string thkStr;
+                string qtyStr;
+                string matStr = "UNKNOWN";
+
+                if (old3Col)
+                {
+                    fileName = SafeGet(cols, 0);
+                    thkStr = SafeGet(cols, 1);
+                    qtyStr = SafeGet(cols, 2);
+
+                    if (cols.Count >= 4)
+                        matStr = SafeGet(cols, 3);
+                }
+                else
+                {
+                    fileName = SafeGet(cols, idxFile);
+                    thkStr = SafeGet(cols, idxThk);
+                    qtyStr = SafeGet(cols, idxQty);
+
+                    if (idxMat >= 0)
+                        matStr = SafeGet(cols, idxMat);
+                }
+
+                if (string.IsNullOrWhiteSpace(fileName))
+                    continue;
+
+                if (!double.TryParse((thkStr ?? "").Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out double tMm))
+                    continue;
+
+                if (!int.TryParse((qtyStr ?? "").Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out int qty))
+                    continue;
+
+                yield return new PartsCsvRow
+                {
+                    FileName = fileName.Trim(),
+                    ThicknessMm = tMm,
+                    Quantity = qty,
+                    MaterialExact = MaterialNameCodec.Normalize(matStr)
+                };
+            }
+        }
+
+        private static int FindHeaderIndex(List<string> header, params string[] candidates)
+        {
+            if (header == null || header.Count == 0)
+                return -1;
+
+            for (int i = 0; i < header.Count; i++)
+            {
+                string h = NormalizeHeader(header[i]);
+                foreach (var c in candidates)
+                {
+                    if (h == NormalizeHeader(c))
+                        return i;
+                }
+            }
+
+            return -1;
+        }
+
+        private static string NormalizeHeader(string s)
+        {
+            s = (s ?? "").Trim();
+            s = s.Replace(" ", "").Replace("-", "").Replace("_", "");
+            return s.ToUpperInvariant();
+        }
+
+        private static string SafeGet(List<string> cols, int idx)
+        {
+            if (cols == null || idx < 0 || idx >= cols.Count)
+                return "";
+            return cols[idx] ?? "";
         }
 
         private static List<string> ParseCsvLine(string line)
         {
-            var cols = new List<string>();
+            var result = new List<string>();
             if (line == null)
-                return cols;
+                return result;
 
             var sb = new StringBuilder();
             bool inQuotes = false;
@@ -337,6 +397,7 @@ namespace SW2026RibbonAddin.Commands
                 {
                     if (c == '"')
                     {
+                        // Escaped quote ""
                         if (i + 1 < line.Length && line[i + 1] == '"')
                         {
                             sb.Append('"');
@@ -354,14 +415,14 @@ namespace SW2026RibbonAddin.Commands
                 }
                 else
                 {
-                    if (c == ',')
-                    {
-                        cols.Add(sb.ToString());
-                        sb.Clear();
-                    }
-                    else if (c == '"')
+                    if (c == '"')
                     {
                         inQuotes = true;
+                    }
+                    else if (c == ',')
+                    {
+                        result.Add(sb.ToString());
+                        sb.Clear();
                     }
                     else
                     {
@@ -370,21 +431,78 @@ namespace SW2026RibbonAddin.Commands
                 }
             }
 
-            cols.Add(sb.ToString());
-            return cols;
+            result.Add(sb.ToString());
+            return result;
         }
 
-        private static string EscapeCsv(string value)
+        private static string MakeKey(string fileName, double thicknessMm, string materialExact)
         {
-            if (value == null) return "";
-            bool mustQuote = value.Contains(",") || value.Contains("\"") || value.Contains("\r") || value.Contains("\n");
-            if (!mustQuote) return value;
-            return "\"" + value.Replace("\"", "\"\"") + "\"";
+            return (fileName ?? "").Trim().ToUpperInvariant() + "|" +
+                   thicknessMm.ToString("0.###", CultureInfo.InvariantCulture) + "|" +
+                   (materialExact ?? "").Trim().ToUpperInvariant();
         }
 
-        private static void CreatePerThicknessDwgs(string mainFolder, List<CombinedPart> parts)
+        /// <summary>
+        /// Block name encodes:
+        /// - part name (sanitized)
+        /// - exact material string (encoded as Base64Url)
+        /// - quantity suffix: _Q{qty}
+        /// </summary>
+        private static string MakePlateBlockName(string fileName, string materialExact, int quantity)
         {
-            var groups = parts.GroupBy(p => p.ThicknessMm).OrderBy(g => g.Key);
+            string baseName = Path.GetFileNameWithoutExtension(fileName);
+            if (string.IsNullOrEmpty(baseName))
+                baseName = "Part";
+
+            // sanitize for block name readability (material stays reversible in token)
+            var sb = new StringBuilder();
+            foreach (char c in baseName)
+            {
+                if (char.IsLetterOrDigit(c))
+                    sb.Append(c);
+                else
+                    sb.Append('_');
+            }
+
+            string safe = sb.Length > 0 ? sb.ToString() : "Part";
+            if (safe.Length > 80) safe = safe.Substring(0, 80);
+
+            int q = Math.Max(1, quantity);
+            string matToken = MaterialNameCodec.Encode(materialExact);
+
+            return string.Format(
+                CultureInfo.InvariantCulture,
+                "P_{0}{1}{2}{3}_Q{4}",
+                safe,
+                MaterialNameCodec.BlockTokenPrefix,
+                matToken,
+                MaterialNameCodec.BlockTokenSuffix,
+                q);
+        }
+
+        private static byte PickVisibleAciColor(byte? avoid = null)
+        {
+            for (int tries = 0; tries < 16; tries++)
+            {
+                byte c = VisibleAciColors[_random.Next(VisibleAciColors.Length)];
+                if (!avoid.HasValue || c != avoid.Value)
+                    return c;
+            }
+
+            return VisibleAciColors[0];
+        }
+
+        /// <summary>
+        /// For each thickness, create thickness_XXX.dwg with all plates of that thickness
+        /// laid out side-by-side:
+        /// - bottoms aligned on Y = 0
+        /// - two text lines beneath each plate
+        /// </summary>
+        private static void CreatePerThicknessDwgs(string mainFolder, List<CombinedPart> parts, List<string> outPaths)
+        {
+            var groups = parts
+                .GroupBy(p => p.ThicknessMm)
+                .OrderBy(g => g.Key);
 
             foreach (var g in groups)
             {
@@ -398,7 +516,9 @@ namespace SW2026RibbonAddin.Commands
                 BlockRecord modelSpace = doc.BlockRecords["*Model_Space"];
 
                 double cursorX = 0.0;
-                const double marginX = 50.0;
+                const double marginX = 50.0; // base margin between plates
+
+                byte? lastColor = null;
 
                 foreach (var part in g)
                 {
@@ -409,7 +529,9 @@ namespace SW2026RibbonAddin.Commands
                     try
                     {
                         using (var reader = new DwgReader(part.FullPath))
+                        {
                             srcDoc = reader.Read();
+                        }
                     }
                     catch
                     {
@@ -417,21 +539,53 @@ namespace SW2026RibbonAddin.Commands
                     }
 
                     BlockRecord srcModel;
-                    try { srcModel = srcDoc.BlockRecords["*Model_Space"]; }
-                    catch { continue; }
+                    try
+                    {
+                        srcModel = srcDoc.BlockRecords["*Model_Space"];
+                    }
+                    catch
+                    {
+                        continue;
+                    }
 
-                    string blockName = MakePlateBlockName(part.FileName, part.Quantity, part.MaterialTag);
-                    var block = new BlockRecord(blockName);
-                    doc.BlockRecords.Add(block);
+                    // Block name includes EXACT material (encoded) + quantity
+                    string baseBlockName = MakePlateBlockName(part.FileName, part.MaterialExact, part.Quantity);
 
-                    var blockColor = new Color(PickBrightAci());
+                    // Ensure block name uniqueness in destination doc
+                    BlockRecord block = null;
+                    string blockName = baseBlockName;
+                    for (int attempt = 0; attempt < 1000; attempt++)
+                    {
+                        try
+                        {
+                            block = new BlockRecord(blockName);
+                            doc.BlockRecords.Add(block);
+                            break;
+                        }
+                        catch
+                        {
+                            blockName = baseBlockName + "_" + (attempt + 1).ToString(CultureInfo.InvariantCulture);
+                            block = null;
+                        }
+                    }
+
+                    if (block == null)
+                        continue;
+
+                    // Pick a visible random ACI color (safe on black)
+                    byte aci = PickVisibleAciColor(lastColor);
+                    lastColor = aci;
+
+                    var blockColor = new Color(aci);
 
                     foreach (var ent in srcModel.Entities)
                     {
-                        if (ent == null) continue;
+                        if (ent == null)
+                            continue;
 
                         var cloned = ent.Clone() as Entity;
-                        if (cloned == null) continue;
+                        if (cloned == null)
+                            continue;
 
                         cloned.Color = blockColor;
                         block.Entities.Add(cloned);
@@ -440,6 +594,7 @@ namespace SW2026RibbonAddin.Commands
                     if (block.Entities.Count == 0)
                         continue;
 
+                    // ---- get bounding box of block geometry (local coords) ----
                     double minX = double.MaxValue;
                     double maxX = double.MinValue;
                     double minY = double.MaxValue;
@@ -456,7 +611,10 @@ namespace SW2026RibbonAddin.Commands
                             if (bbMax.X > maxX) maxX = bbMax.X;
                             if (bbMin.Y < minY) minY = bbMin.Y;
                         }
-                        catch { }
+                        catch
+                        {
+                            // ignore entities that do not support bounding box
+                        }
                     }
 
                     if (minX == double.MaxValue || maxX == double.MinValue)
@@ -467,9 +625,12 @@ namespace SW2026RibbonAddin.Commands
                     }
 
                     double blockWidth = maxX - minX;
-                    if (blockWidth <= 0.0) blockWidth = 1.0;
+                    if (blockWidth <= 0.0)
+                        blockWidth = 1.0;
 
+                    // ---- text under plate ----
                     double textHeight = 20.0;
+
                     double baselineY = 0.0;
                     double gapPlateToFirst = 8.0;
                     double gapBetweenLines = 10.0;
@@ -484,13 +645,14 @@ namespace SW2026RibbonAddin.Commands
                     double textWidth2 = EstimateTextWidth(label2, textHeight);
                     double maxTextWidth = Math.Max(textWidth1, textWidth2);
 
-                    double extraTextSidePadding = textHeight;
-                    double columnWidth = maxTextWidth > blockWidth
-                        ? maxTextWidth + 2.0 * extraTextSidePadding
+                    double extraTextSidePadding = textHeight; // generous side padding
+                    double columnWidth = (maxTextWidth > blockWidth)
+                        ? (maxTextWidth + 2.0 * extraTextSidePadding)
                         : blockWidth;
 
                     double columnCenterX = cursorX + columnWidth / 2.0;
 
+                    // Align block bottom to Y = 0 and center it in the column.
                     double blockCenterLocalX = (minX + maxX) * 0.5;
                     double insertX = columnCenterX - blockCenterLocalX;
                     double insertY = -minY;
@@ -505,6 +667,7 @@ namespace SW2026RibbonAddin.Commands
 
                     modelSpace.Entities.Add(insert);
 
+                    // Center text under plate
                     double plateCenterX = columnCenterX;
 
                     double text1InsertX = plateCenterX - textWidth1 / 2.0;
@@ -531,10 +694,15 @@ namespace SW2026RibbonAddin.Commands
                 }
 
                 using (var writer = new DwgWriter(outPath, doc))
+                {
                     writer.Write();
+                }
+
+                outPaths.Add(outPath);
             }
         }
 
+        // Conservative on purpose so texts won't overlap.
         private const double TextWidthFactor = 1.0;
 
         private static double EstimateTextWidth(string text, double textHeight)
@@ -543,6 +711,141 @@ namespace SW2026RibbonAddin.Commands
                 return 0.0;
 
             return text.Length * textHeight * TextWidthFactor;
+        }
+
+        private static string CsvCell(string s)
+        {
+            if (s == null) return "";
+            s = s.Trim();
+
+            bool needsQuotes =
+                s.Contains(",") ||
+                s.Contains("\"") ||
+                s.Contains("\r") ||
+                s.Contains("\n");
+
+            if (!needsQuotes)
+                return s;
+
+            s = s.Replace("\"", "\"\"");
+            return "\"" + s + "\"";
+        }
+    }
+
+    /// <summary>
+    /// Shared codec:
+    /// - Combiner writes exact SolidWorks material into block name in a reversible safe token
+    /// - Nester reads it back exactly (no normalization / no translation)
+    /// </summary>
+    internal static class MaterialNameCodec
+    {
+        public const string BlockTokenPrefix = "__MATB64_";
+        public const string BlockTokenSuffix = "__";
+
+        public static string Normalize(string material)
+        {
+            material = (material ?? "").Trim();
+            return string.IsNullOrWhiteSpace(material) ? "UNKNOWN" : material;
+        }
+
+        // Base64Url (safe chars for DWG block names)
+        public static string Encode(string material)
+        {
+            material = Normalize(material);
+
+            byte[] bytes = Encoding.UTF8.GetBytes(material);
+            string b64 = Convert.ToBase64String(bytes);
+
+            // base64url: + -> -, / -> _, trim '='
+            b64 = b64.TrimEnd('=').Replace('+', '-').Replace('/', '_');
+            return string.IsNullOrWhiteSpace(b64) ? "VVNLTk9XTg" : b64; // fallback token
+        }
+
+        public static string Decode(string token)
+        {
+            if (string.IsNullOrWhiteSpace(token))
+                return "UNKNOWN";
+
+            try
+            {
+                string s = token.Replace('-', '+').Replace('_', '/');
+                int pad = s.Length % 4;
+                if (pad != 0)
+                    s = s + new string('=', 4 - pad);
+
+                byte[] bytes = Convert.FromBase64String(s);
+                return Normalize(Encoding.UTF8.GetString(bytes));
+            }
+            catch
+            {
+                return "UNKNOWN";
+            }
+        }
+
+        public static bool TryExtractFromBlockName(string blockName, out string materialExact)
+        {
+            materialExact = "UNKNOWN";
+            if (string.IsNullOrWhiteSpace(blockName))
+                return false;
+
+            int p = blockName.IndexOf(BlockTokenPrefix, StringComparison.Ordinal);
+            if (p >= 0)
+            {
+                int start = p + BlockTokenPrefix.Length;
+                int end = blockName.IndexOf(BlockTokenSuffix, start, StringComparison.Ordinal);
+                if (end > start)
+                {
+                    string token = blockName.Substring(start, end - start);
+                    materialExact = Decode(token);
+                    return true;
+                }
+            }
+
+            // Back-compat: old non-b64 token "__MAT_xxx__"
+            const string oldPrefix = "__MAT_";
+            int p2 = blockName.IndexOf(oldPrefix, StringComparison.Ordinal);
+            if (p2 >= 0)
+            {
+                int start = p2 + oldPrefix.Length;
+                int end = blockName.IndexOf("__", start, StringComparison.Ordinal);
+                if (end > start)
+                {
+                    string token = blockName.Substring(start, end - start);
+                    materialExact = Normalize(token.Replace('_', ' '));
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        public static string MakeSafeFileToken(string materialExact, int maxLen = 40)
+        {
+            materialExact = Normalize(materialExact);
+
+            var sb = new StringBuilder(materialExact.Length);
+            foreach (char c in materialExact)
+            {
+                if (char.IsLetterOrDigit(c))
+                    sb.Append(c);
+                else if (char.IsWhiteSpace(c))
+                    sb.Append('_');
+                else
+                    sb.Append('_');
+            }
+
+            string safe = sb.ToString();
+            while (safe.Contains("__"))
+                safe = safe.Replace("__", "_");
+
+            safe = safe.Trim('_');
+            if (string.IsNullOrWhiteSpace(safe))
+                safe = "UNKNOWN";
+
+            if (safe.Length > maxLen)
+                safe = safe.Substring(0, maxLen).Trim('_');
+
+            return safe;
         }
     }
 }
