@@ -93,6 +93,10 @@
     <Compile Include="ArabicNoteCodec.cs" />
     <Compile Include="ArabicTextUtils.cs" />
     <Compile Include="Commands\dwg\BatchCombineNestButton.cs" />
+    <Compile Include="Commands\dwg\LaserCutForms.cs">
+      <SubType>Form</SubType>
+    </Compile>
+    <Compile Include="Commands\dwg\LaserCutSettings.cs" />
     <Compile Include="Commands\farsi\AddFarsiNoteButton.cs" />
     <Compile Include="Commands\general\AddinContext.cs" />
     <Compile Include="Commands\dwg\CombineDwgButton.cs" />
@@ -150,6 +154,9 @@
   </ItemGroup>
   <ItemGroup>
     <None Include="app.config" />
+    <Compile Include="Commands\dwg\DwgLaserNester.Algorithms.cs" />
+    <Compile Include="Commands\dwg\DwgLaserNester.Core.cs" />
+    <Compile Include="Commands\dwg\DwgLaserNester.Geometry.cs" />
     <None Include="packages.config" />
     <None Include="SW2026RibbonAddin.snk" />
   </ItemGroup>
