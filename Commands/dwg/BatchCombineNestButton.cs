@@ -1,4 +1,7 @@
-﻿using System;
+﻿// Commands\dwg\BatchCombineNestButton.cs
+// DROP-IN: replace the entire file with this one.
+
+using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -11,10 +14,11 @@ namespace SW2026RibbonAddin.Commands
     {
         public string Id => "BatchCombineNest";
 
-        public string DisplayName => "Batch\nNest";
-        public string Tooltip => "Combine + nest all thickness_*.dwg in the selected main folder.";
-        public string Hint => "Batch combine + nest";
+        public string DisplayName => "Batch\nCombine+Nest";
+        public string Tooltip => "Runs Combine DWG, then batch nests all thickness_*.dwg (optionally per material).";
+        public string Hint => "Combine + nest in one run";
 
+        // Reuse existing icon(s)
         public string SmallIconFile => "combine_dwg_20.png";
         public string LargeIconFile => "combine_dwg_32.png";
 
@@ -23,228 +27,181 @@ namespace SW2026RibbonAddin.Commands
 
         public bool IsFreeFeature => false;
 
+        public int GetEnableState(AddinContext context) => AddinContext.Enable;
+
         public void Execute(AddinContext context)
         {
             string mainFolder = SelectMainFolder();
-            if (string.IsNullOrEmpty(mainFolder))
+            if (string.IsNullOrWhiteSpace(mainFolder))
                 return;
 
-            var choice = MessageBox.Show(
-                "Run Combine DWG first?\r\n\r\n" +
-                "Yes  = Combine + Nest\r\n" +
-                "No   = Nest only existing thickness_*.dwg\r\n" +
-                "Cancel = Stop",
-                "Batch Nest",
-                MessageBoxButtons.YesNoCancel,
-                MessageBoxIcon.Question);
-
-            if (choice == DialogResult.Cancel)
-                return;
-
-            if (choice == DialogResult.Yes)
+            if (!Directory.Exists(mainFolder))
             {
-                try
-                {
-                    DwgBatchCombiner.Combine(mainFolder, showUi: false);
-                }
-                catch (Exception ex)
-                {
-                    MessageBox.Show("Combine DWG failed:\r\n\r\n" + ex.Message, "Batch Nest",
-                        MessageBoxButtons.OK, MessageBoxIcon.Error);
-                    return;
-                }
+                MessageBox.Show("Folder does not exist:\r\n" + mainFolder, "Batch Combine+Nest",
+                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
             }
 
-            var thicknessFiles = Directory.GetFiles(mainFolder, "thickness_*.dwg", SearchOption.TopDirectoryOnly)
-                .Where(p =>
+            // 1) Combine
+            try
+            {
+                // IMPORTANT: Combine writes all_parts.csv + thickness_*.dwg into mainFolder
+                DwgBatchCombiner.Combine(mainFolder);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show("Combine step failed:\r\n\r\n" + ex.Message, "Batch Combine+Nest",
+                    MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+
+            // 2) Find thickness inputs
+            var inputs = Directory.GetFiles(mainFolder, "thickness_*.dwg", SearchOption.TopDirectoryOnly)
+                .Where(f =>
                 {
-                    string n = Path.GetFileNameWithoutExtension(p) ?? "";
-                    return n.IndexOf("_nested", StringComparison.OrdinalIgnoreCase) < 0;
+                    string n = Path.GetFileNameWithoutExtension(f) ?? "";
+                    return n.IndexOf("_nested", StringComparison.OrdinalIgnoreCase) < 0
+                        && n.IndexOf("_nest_log", StringComparison.OrdinalIgnoreCase) < 0;
                 })
-                .OrderBy(p => p, StringComparer.OrdinalIgnoreCase)
+                .OrderBy(f => f, StringComparer.OrdinalIgnoreCase)
                 .ToList();
 
-            if (thicknessFiles.Count == 0)
+            if (inputs.Count == 0)
             {
-                MessageBox.Show("No thickness_*.dwg files found in this folder.", "Batch Nest",
-                    MessageBoxButtons.OK, MessageBoxIcon.Information);
+                MessageBox.Show("Combine finished, but no thickness_*.dwg files were found in:\r\n" + mainFolder,
+                    "Batch Combine+Nest", MessageBoxButtons.OK, MessageBoxIcon.Information);
                 return;
             }
 
+            // 3) Nest options
             LaserCutRunSettings settings;
             using (var dlg = new LaserCutOptionsForm())
             {
-                dlg.Text = "Batch nest options (applies to ALL thickness files)";
                 if (dlg.ShowDialog() != DialogResult.OK)
                     return;
 
                 settings = dlg.Settings;
             }
 
-            var results = new List<(string thicknessFile, DwgLaserNester.NestRunResult result)>();
+            // 4) Total count for progress
+            int totalOverall = 0;
+            foreach (var f in inputs)
+            {
+                try { totalOverall += Math.Max(0, DwgLaserNester.CountTotalInstances(f)); }
+                catch { }
+            }
+
+            if (totalOverall <= 0)
+            {
+                MessageBox.Show(
+                    "No plate blocks found in any thickness DWG.\r\n\r\n" +
+                    "Check that Combine produced blocks starting with P_ (and ideally with __MAT_...).",
+                    "Batch Combine+Nest",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Information);
+                return;
+            }
+
+            int placedOverall = 0;
+
+            var summary = new StringBuilder();
+            summary.AppendLine("BATCH COMBINE + NEST SUMMARY");
+            summary.AppendLine($"Time: {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
+            summary.AppendLine($"Folder: {mainFolder}");
+            summary.AppendLine($"Thickness files: {inputs.Count}");
+            summary.AppendLine();
+            summary.AppendLine($"SeparateByMaterial: {settings.SeparateByMaterial}");
+            summary.AppendLine($"OutputOneDwgPerMaterial: {settings.SeparateByMaterial && settings.OutputOneDwgPerMaterial}");
+            summary.AppendLine($"UsePerMaterialSheetPresets: {settings.UsePerMaterialSheetPresets}");
+            summary.AppendLine($"GlobalSheet: {settings.DefaultSheet}");
+            summary.AppendLine();
+
             var errors = new List<string>();
 
-            using (var prog = new SimpleBatchProgressForm(thicknessFiles.Count))
+            using (var progress = new LaserCutProgressForm(totalOverall))
             {
-                prog.Show();
+                progress.Show();
                 Application.DoEvents();
 
-                for (int i = 0; i < thicknessFiles.Count; i++)
+                foreach (var input in inputs)
                 {
-                    string f = thicknessFiles[i];
-                    prog.Step($"Nesting {i + 1}/{thicknessFiles.Count}\r\n{Path.GetFileName(f)}");
+                    string fileName = Path.GetFileName(input) ?? input;
 
                     try
                     {
-                        var r = DwgLaserNester.Nest(f, settings, showUi: false);
-                        results.Add((f, r));
+                        progress.SetStatus("Nesting: " + fileName);
+
+                        var res = DwgLaserNester.NestOneFile(
+                            sourceDwgPath: input,
+                            settings: settings,
+                            progress: progress,
+                            placedOverallRef: ref placedOverall,
+                            totalOverall: totalOverall);
+
+                        summary.AppendLine($"SOURCE: {fileName}");
+                        summary.AppendLine($"  Blocks found/skipped: {res.CandidateBlocks}/{res.SkippedBlocks}");
+
+                        foreach (var o in res.Outputs)
+                        {
+                            summary.AppendLine($"  [{o.MaterialType}] Sheets={o.SheetsUsed} Parts={o.TotalParts} Sheet={o.Sheet}");
+                            summary.AppendLine($"     {Path.GetFileName(o.OutputDwgPath)}");
+                        }
+
+                        if (!string.IsNullOrEmpty(res.LogPath))
+                            summary.AppendLine($"  Log: {Path.GetFileName(res.LogPath)}");
+
+                        summary.AppendLine();
                     }
                     catch (Exception ex)
                     {
-                        errors.Add($"{Path.GetFileName(f)} => {ex.Message}");
+                        string msg = $"FAILED: {fileName} -> {ex.Message}";
+                        errors.Add(msg);
+
+                        summary.AppendLine($"SOURCE: {fileName}");
+                        summary.AppendLine("  ERROR: " + ex.Message);
+                        summary.AppendLine();
                     }
                 }
 
-                prog.Close();
+                progress.SetStatus("Writing summary...");
+                Application.DoEvents();
             }
 
-            string summaryPath = Path.Combine(mainFolder, "batch_nest_summary.txt");
-            TryWriteSummary(summaryPath, mainFolder, thicknessFiles, results, errors);
+            string summaryPath = Path.Combine(mainFolder, "batch_combine_nest_summary.txt");
+            try { File.WriteAllText(summaryPath, summary.ToString(), Encoding.UTF8); } catch { }
 
-            MessageBox.Show(
-                "Batch nest finished.\r\n\r\n" +
-                $"Thickness files: {thicknessFiles.Count}\r\n" +
-                $"OK: {results.Count}\r\n" +
-                $"Failed: {errors.Count}\r\n\r\n" +
-                $"Summary: {summaryPath}",
-                "Batch Nest",
-                MessageBoxButtons.OK,
-                errors.Count > 0 ? MessageBoxIcon.Warning : MessageBoxIcon.Information);
+            if (errors.Count == 0)
+            {
+                MessageBox.Show(
+                    "Batch Combine+Nest finished.\r\n\r\nSummary:\r\n" + summaryPath,
+                    "Batch Combine+Nest",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Information);
+            }
+            else
+            {
+                MessageBox.Show(
+                    "Batch Combine+Nest finished with errors.\r\n\r\n" +
+                    string.Join("\r\n", errors.Take(12)) +
+                    (errors.Count > 12 ? "\r\n..." : "") +
+                    "\r\n\r\nSummary:\r\n" + summaryPath,
+                    "Batch Combine+Nest",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Warning);
+            }
         }
-
-        public int GetEnableState(AddinContext context) => AddinContext.Enable;
 
         private static string SelectMainFolder()
         {
             using (var dlg = new FolderBrowserDialog())
             {
-                dlg.Description = "Select MAIN folder (contains job subfolders with parts.csv + DWGs)";
+                dlg.Description = "Select the MAIN folder that contains job subfolders (each with parts.csv + DWGs)";
                 dlg.ShowNewFolderButton = false;
 
                 if (dlg.ShowDialog() != DialogResult.OK)
                     return null;
 
                 return dlg.SelectedPath;
-            }
-        }
-
-        private static void TryWriteSummary(
-            string summaryPath,
-            string mainFolder,
-            List<string> thicknessFiles,
-            List<(string thicknessFile, DwgLaserNester.NestRunResult result)> results,
-            List<string> errors)
-        {
-            try
-            {
-                var sb = new StringBuilder();
-                sb.AppendLine("Batch Nest Summary");
-                sb.AppendLine($"Time: {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
-                sb.AppendLine($"Main folder: {mainFolder}");
-                sb.AppendLine();
-
-                sb.AppendLine("=== Results ===");
-                foreach (var item in results.OrderBy(x => x.thicknessFile, StringComparer.OrdinalIgnoreCase))
-                {
-                    var r = item.result;
-
-                    sb.AppendLine($"Thickness DWG: {Path.GetFileName(item.thicknessFile)}");
-                    sb.AppendLine($"  SeparateByMaterial: {r.Settings.SeparateByMaterial}");
-                    sb.AppendLine($"  OneDwgPerMaterial: {r.Settings.OutputOneDwgPerMaterial}");
-                    sb.AppendLine($"  PerMaterialSheets: {r.Settings.UsePerMaterialSheetPresets}");
-                    sb.AppendLine($"  Blocks found/skipped: {r.CandidateBlocks}/{r.SkippedBlocks}");
-
-                    foreach (var o in r.Outputs)
-                    {
-                        sb.AppendLine($"    [{o.MaterialType}] Sheets: {o.SheetsUsed} Parts: {o.TotalParts} Sheet: {o.Sheet}");
-                        sb.AppendLine($"       {o.OutputDwgPath}");
-                    }
-
-                    if (!string.IsNullOrEmpty(r.LogPath))
-                        sb.AppendLine($"  Log: {r.LogPath}");
-
-                    sb.AppendLine();
-                }
-
-                if (errors.Count > 0)
-                {
-                    sb.AppendLine("=== Errors ===");
-                    foreach (var e in errors) sb.AppendLine(e);
-                    sb.AppendLine();
-                }
-
-                sb.AppendLine("=== Thickness DWGs scanned ===");
-                foreach (var f in thicknessFiles) sb.AppendLine(Path.GetFileName(f));
-
-                File.WriteAllText(summaryPath, sb.ToString(), Encoding.UTF8);
-            }
-            catch
-            {
-                // ignore
-            }
-        }
-
-        private sealed class SimpleBatchProgressForm : Form
-        {
-            private readonly ProgressBar _bar;
-            private readonly Label _label;
-            private readonly int _max;
-            private int _cur;
-
-            public SimpleBatchProgressForm(int maximum)
-            {
-                if (maximum <= 0) maximum = 1;
-                _max = maximum;
-
-                Text = "Batch nesting...";
-                FormBorderStyle = FormBorderStyle.FixedDialog;
-                StartPosition = FormStartPosition.CenterScreen;
-                MinimizeBox = false;
-                MaximizeBox = false;
-                ShowInTaskbar = false;
-                ClientSize = new System.Drawing.Size(420, 110);
-
-                _label = new Label
-                {
-                    AutoSize = false,
-                    Location = new System.Drawing.Point(12, 10),
-                    Size = new System.Drawing.Size(396, 40),
-                    Text = "Starting..."
-                };
-                Controls.Add(_label);
-
-                _bar = new ProgressBar
-                {
-                    Location = new System.Drawing.Point(12, 60),
-                    Size = new System.Drawing.Size(396, 20),
-                    Minimum = 0,
-                    Maximum = _max,
-                    Value = 0
-                };
-                Controls.Add(_bar);
-            }
-
-            public void Step(string text)
-            {
-                _label.Text = text ?? "";
-                if (_cur < _max)
-                {
-                    _cur++;
-                    _bar.Value = _cur;
-                }
-                _bar.Refresh();
-                _label.Refresh();
-                Application.DoEvents();
             }
         }
     }

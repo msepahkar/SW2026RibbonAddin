@@ -3,11 +3,12 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
 using System.IO;
-using System.Linq;
-using System.Reflection;
+using System.Text;
 using System.Windows.Forms;
+
 using SolidWorks.Interop.sldworks;
 using SolidWorks.Interop.swconst;
+
 using SW2026RibbonAddin.Forms;
 
 namespace SW2026RibbonAddin.Commands
@@ -42,7 +43,7 @@ namespace SW2026RibbonAddin.Commands
                 return;
             }
 
-            int docType = model.GetType();
+            int docType = model.GetType(); // SolidWorks doc type (int)
             bool isPart = docType == (int)swDocumentTypes_e.swDocPART;
             bool isAsm = docType == (int)swDocumentTypes_e.swDocASSEMBLY;
 
@@ -108,9 +109,7 @@ namespace SW2026RibbonAddin.Commands
         {
             try
             {
-                return context.ActiveModel != null
-                    ? AddinContext.Enable
-                    : AddinContext.Disable;
+                return context.ActiveModel != null ? AddinContext.Enable : AddinContext.Disable;
             }
             catch
             {
@@ -119,7 +118,7 @@ namespace SW2026RibbonAddin.Commands
         }
 
         // ------------------------------------------------------------------
-        //  Single part
+        // Single Part
         // ------------------------------------------------------------------
 
         private void RunForSinglePart(ISldWorks swApp, IModelDoc2 model, string jobFolder)
@@ -137,9 +136,8 @@ namespace SW2026RibbonAddin.Commands
                 return;
             }
 
-            string material = GetSolidWorksMaterialName(model);
-            if (string.IsNullOrWhiteSpace(material))
-                material = "UNKNOWN";
+            string cfgName = GetBestConfigName(model, null);
+            string material = GetMaterialName(model, cfgName);
 
             var csvLines = new List<string>
             {
@@ -157,13 +155,11 @@ namespace SW2026RibbonAddin.Commands
 
             foreach (string dwgName in dwgFileNames)
             {
-                csvLines.Add(string.Format(
-                    CultureInfo.InvariantCulture,
-                    "{0},{1},{2},{3}",
-                    EscapeCsv(dwgName),
-                    thicknessMm.ToString("0.###", CultureInfo.InvariantCulture),
-                    _assemblyQuantity,
-                    EscapeCsv(material)));
+                csvLines.Add(
+                    $"{CsvCell(dwgName)}," +
+                    $"{thicknessMm.ToString("0.###", CultureInfo.InvariantCulture)}," +
+                    $"{_assemblyQuantity}," +
+                    $"{CsvCell(material)}");
             }
 
             string csvPath = Path.Combine(jobFolder, "parts.csv");
@@ -173,12 +169,13 @@ namespace SW2026RibbonAddin.Commands
                 $"Sheet-metal bodies found: {totalBodies}\r\n" +
                 $"DWG files saved: {exported}\r\n" +
                 $"Failed: {failed}\r\n" +
+                $"Material detected: {material}\r\n" +
                 $"Folder:\r\n{jobFolder}",
                 "DWG Export");
         }
 
         // ------------------------------------------------------------------
-        //  Assembly
+        // Assembly
         // ------------------------------------------------------------------
 
         private void RunForAssembly(ISldWorks swApp, IAssemblyDoc asm, string jobFolder)
@@ -209,14 +206,14 @@ namespace SW2026RibbonAddin.Commands
 
             foreach (var kvp in usage)
             {
-                string partPath = kvp.Key;
-                SheetMetalUsageInfo info = kvp.Value;
+                var info = kvp.Value;
+                string partPath = info.PartPath;
 
                 try
                 {
                     int actErr = 0;
 
-                    // ✅ FIX: ActivateDoc3 takes 4 args in your interop
+                    // SOLIDWORKS interop here is 4-arg ActivateDoc3 (NOT 5)
                     swApp.ActivateDoc3(
                         partPath,
                         false,
@@ -230,9 +227,14 @@ namespace SW2026RibbonAddin.Commands
                         continue;
                     }
 
-                    string material = GetSolidWorksMaterialName(partModel);
-                    if (string.IsNullOrWhiteSpace(material))
-                        material = "UNKNOWN";
+                    if (!string.IsNullOrWhiteSpace(info.ConfigName))
+                    {
+                        try { partModel.ShowConfiguration2(info.ConfigName); } catch { }
+                    }
+
+                    string material = info.Material;
+                    if (string.IsNullOrWhiteSpace(material) || material.Equals("UNKNOWN", StringComparison.OrdinalIgnoreCase))
+                        material = GetMaterialName(partModel, info.ConfigName);
 
                     var dwgFileNames = new List<string>();
                     int failuresForPart = ExportFlatPatternsForPart(partModel, partPath, jobFolder, dwgFileNames);
@@ -248,13 +250,11 @@ namespace SW2026RibbonAddin.Commands
 
                     foreach (string dwgName in dwgFileNames)
                     {
-                        csvLines.Add(string.Format(
-                            CultureInfo.InvariantCulture,
-                            "{0},{1},{2},{3}",
-                            EscapeCsv(dwgName),
-                            thicknessMm.ToString("0.###", CultureInfo.InvariantCulture),
-                            info.Quantity * _assemblyQuantity,
-                            EscapeCsv(material)));
+                        csvLines.Add(
+                            $"{CsvCell(dwgName)}," +
+                            $"{thicknessMm.ToString("0.###", CultureInfo.InvariantCulture)}," +
+                            $"{info.Quantity * _assemblyQuantity}," +
+                            $"{CsvCell(material)}");
                     }
 
                     try { swApp.CloseDoc(partPath); } catch { }
@@ -279,7 +279,7 @@ namespace SW2026RibbonAddin.Commands
         }
 
         // ------------------------------------------------------------------
-        //  Actual DWG export (handles multi-body via flat patterns)
+        // DWG Export (flat patterns)
         // ------------------------------------------------------------------
 
         private static int ExportFlatPatternsForPart(
@@ -367,9 +367,9 @@ namespace SW2026RibbonAddin.Commands
             try
             {
                 const int action = (int)swExportToDWG_e.swExportToDWG_ExportSheetMetal;
-                const int sheetMetalOptions = 1;
+                const int sheetMetalOptions = 1; // geometry only
 
-                return partDoc.ExportToDWG2(
+                bool ok = partDoc.ExportToDWG2(
                     outFile,
                     modelPath,
                     action,
@@ -379,6 +379,8 @@ namespace SW2026RibbonAddin.Commands
                     false,
                     sheetMetalOptions,
                     null);
+
+                return ok;
             }
             catch (Exception ex)
             {
@@ -394,13 +396,14 @@ namespace SW2026RibbonAddin.Commands
                 if (flatPatternFeat == null)
                     return false;
 
-                if (!flatPatternFeat.Select2(false, -1))
+                bool selOk = flatPatternFeat.Select2(false, -1);
+                if (!selOk)
                     return false;
 
                 const int action = (int)swExportToDWG_e.swExportToDWG_ExportSheetMetal;
-                const int sheetMetalOptions = 1;
+                const int sheetMetalOptions = 1; // geometry only
 
-                return partDoc.ExportToDWG2(
+                bool ok = partDoc.ExportToDWG2(
                     outFile,
                     modelPath,
                     action,
@@ -410,6 +413,8 @@ namespace SW2026RibbonAddin.Commands
                     false,
                     sheetMetalOptions,
                     null);
+
+                return ok;
             }
             catch (Exception ex)
             {
@@ -483,7 +488,7 @@ namespace SW2026RibbonAddin.Commands
         }
 
         // ------------------------------------------------------------------
-        //  Sheet-metal detection / usage
+        // Sheet-metal detection / thickness
         // ------------------------------------------------------------------
 
         private static bool TryGetSheetMetalThickness(IModelDoc2 model, out double thicknessMeters)
@@ -515,9 +520,9 @@ namespace SW2026RibbonAddin.Commands
                     catch { }
                 }
 
-                object nextObj = null;
-                try { nextObj = feat.GetNextFeature(); } catch { }
-                feat = nextObj as Feature;
+                Feature next = null;
+                try { next = feat.GetNextFeature() as Feature; } catch { }
+                feat = next;
             }
 
             return 0.0;
@@ -525,6 +530,9 @@ namespace SW2026RibbonAddin.Commands
 
         private sealed class SheetMetalUsageInfo
         {
+            public string PartPath;
+            public string ConfigName;
+            public string Material;
             public double ThicknessMeters;
             public int Quantity;
         }
@@ -547,27 +555,33 @@ namespace SW2026RibbonAddin.Commands
 
                 IModelDoc2 refModel = null;
                 try { refModel = comp.GetModelDoc2() as IModelDoc2; } catch { }
-
                 if (refModel == null || refModel.GetType() != (int)swDocumentTypes_e.swDocPART)
                     continue;
 
                 string path = null;
                 try { path = refModel.GetPathName(); } catch { }
-
                 if (string.IsNullOrWhiteSpace(path))
                     continue;
 
                 if (!TryGetSheetMetalThickness(refModel, out double thicknessMeters))
                     continue;
 
-                if (!result.TryGetValue(path, out var info))
+                string cfgName = GetBestConfigName(refModel, comp);
+                string dictKey = (path ?? "").Trim().ToUpperInvariant() + "||" + (cfgName ?? "").Trim().ToUpperInvariant();
+
+                if (!result.TryGetValue(dictKey, out var info))
                 {
+                    string material = GetMaterialName(refModel, cfgName);
+
                     info = new SheetMetalUsageInfo
                     {
+                        PartPath = path,
+                        ConfigName = cfgName,
+                        Material = material,
                         ThicknessMeters = thicknessMeters,
                         Quantity = 0
                     };
-                    result[path] = info;
+                    result[dictKey] = info;
                 }
 
                 info.Quantity++;
@@ -577,57 +591,209 @@ namespace SW2026RibbonAddin.Commands
         }
 
         // ------------------------------------------------------------------
-        //  Material from SolidWorks (AISI 304 etc.)
+        // Material detection (robust)
         // ------------------------------------------------------------------
 
-        private static string GetSolidWorksMaterialName(IModelDoc2 model)
+        private static string GetBestConfigName(IModelDoc2 model, IComponent2 comp)
         {
-            if (model == null) return null;
+            if (comp != null)
+            {
+                try
+                {
+                    string rc = comp.ReferencedConfiguration;
+                    if (!string.IsNullOrWhiteSpace(rc))
+                        return rc;
+                }
+                catch { }
+            }
 
-            string cfg = "";
-            try { cfg = model.ConfigurationManager?.ActiveConfiguration?.Name ?? ""; } catch { cfg = ""; }
+            try
+            {
+                var cfg = model?.ConfigurationManager?.ActiveConfiguration;
+                if (cfg != null && !string.IsNullOrWhiteSpace(cfg.Name))
+                    return cfg.Name;
+            }
+            catch { }
 
-            string m = TryInvokeGetMaterialPropertyName2(model.Extension, cfg);
-            if (!string.IsNullOrWhiteSpace(m)) return m.Trim();
+            return "";
+        }
 
-            m = TryInvokeGetMaterialPropertyName2(model, cfg);
-            if (!string.IsNullOrWhiteSpace(m)) return m.Trim();
+        private static string GetMaterialName(IModelDoc2 model, string configName)
+        {
+            string mat =
+                TryGetMaterial_FromExtension(model, configName) ??
+                TryGetMaterial_FromMaterialIdName(model) ??
+                TryGetMaterial_FromCustomProps(model, configName) ??
+                TryGetMaterial_FromFirstSolidBody(model, configName);
+
+            if (string.IsNullOrWhiteSpace(mat))
+                return "UNKNOWN";
+
+            mat = mat.Trim();
+            if (mat.Equals("NOT SPECIFIED", StringComparison.OrdinalIgnoreCase))
+                return "UNKNOWN";
+
+            return mat;
+        }
+
+        private static string TryGetMaterial_FromExtension(IModelDoc2 model, string configName)
+        {
+            try
+            {
+                var ext = model?.Extension;
+                if (ext == null) return null;
+
+                // Reflection on interface type is safe
+                var mi = typeof(IModelDocExtension).GetMethod("GetMaterialPropertyName2");
+                if (mi == null) return null;
+
+                var ps = mi.GetParameters();
+
+                // Variant A: string GetMaterialPropertyName2(string configName, out string dbName)
+                if (ps.Length == 2 && ps[0].ParameterType == typeof(string) && ps[1].IsOut)
+                {
+                    object[] args = new object[] { configName ?? "", null };
+                    var ret = mi.Invoke(ext, args);
+                    var mat = ret as string;
+                    if (!string.IsNullOrWhiteSpace(mat))
+                        return mat;
+                }
+
+                // Variant B: bool GetMaterialPropertyName2(string configName, out string dbName, out string matName)
+                if (ps.Length == 3 && ps[0].ParameterType == typeof(string) && ps[1].IsOut && ps[2].IsOut)
+                {
+                    object[] args = new object[] { configName ?? "", null, null };
+                    mi.Invoke(ext, args);
+
+                    var mat = args[2] as string;
+                    if (!string.IsNullOrWhiteSpace(mat))
+                        return mat;
+
+                    var maybe = args[1] as string;
+                    if (!string.IsNullOrWhiteSpace(maybe))
+                        return maybe;
+                }
+            }
+            catch { }
 
             return null;
         }
 
-        private static string TryInvokeGetMaterialPropertyName2(object target, string cfg)
+        private static string TryGetMaterial_FromMaterialIdName(IModelDoc2 model)
         {
-            if (target == null) return null;
-
             try
             {
-                var t = target.GetType();
-                var methods = t.GetMethods(BindingFlags.Instance | BindingFlags.Public)
-                               .Where(x => x.Name == "GetMaterialPropertyName2")
-                               .ToList();
+                // ✅ FIX #1: NEVER use model.GetType() here (SW GetType() returns int).
+                // Reflect on the interface instead.
+                var p = typeof(IModelDoc2).GetProperty("MaterialIdName");
+                if (p == null)
+                    return null;
 
-                foreach (var mi in methods)
+                var id = p.GetValue(model, null) as string;
+                if (string.IsNullOrWhiteSpace(id))
+                    return null;
+
+                // Often: "SOLIDWORKS Materials.sldmat::AISI 304"
+                int idx = id.LastIndexOf("::", StringComparison.Ordinal);
+                string mat = (idx >= 0) ? id.Substring(idx + 2) : id;
+                mat = (mat ?? "").Trim();
+                return string.IsNullOrWhiteSpace(mat) ? null : mat;
+            }
+            catch { }
+
+            return null;
+        }
+
+        private static string TryGetMaterial_FromCustomProps(IModelDoc2 model, string configName)
+        {
+            try
+            {
+                var ext = model?.Extension;
+                if (ext == null) return null;
+
+                string v = TryGetCustomProp(ext, configName, "SW-Material")
+                        ?? TryGetCustomProp(ext, configName, "Material");
+
+                if (!string.IsNullOrWhiteSpace(v))
+                    return v;
+
+                v = TryGetCustomProp(ext, "", "SW-Material")
+                 ?? TryGetCustomProp(ext, "", "Material");
+
+                return string.IsNullOrWhiteSpace(v) ? null : v;
+            }
+            catch { }
+
+            return null;
+        }
+
+        private static string TryGetCustomProp(IModelDocExtension ext, string configName, string propName)
+        {
+            try
+            {
+                if (ext == null) return null;
+
+                CustomPropertyManager cpm = null;
+                try { cpm = ext.CustomPropertyManager[configName ?? ""]; } catch { cpm = null; }
+                if (cpm == null) return null;
+
+                string valOut, resolved;
+
+                // ✅ FIX #2: don't assume return type (some interop return bool, some int)
+                cpm.Get4(propName, false, out valOut, out resolved);
+
+                string v = !string.IsNullOrWhiteSpace(resolved) ? resolved : valOut;
+                v = (v ?? "").Trim();
+                return string.IsNullOrWhiteSpace(v) ? null : v;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private static string TryGetMaterial_FromFirstSolidBody(IModelDoc2 model, string configName)
+        {
+            try
+            {
+                var part = model as IPartDoc;
+                if (part == null) return null;
+
+                object bodiesObj = null;
+                try { bodiesObj = part.GetBodies2((int)swBodyType_e.swSolidBody, false); } catch { bodiesObj = null; }
+
+                var bodies = bodiesObj as object[];
+                if (bodies == null || bodies.Length == 0)
+                    return null;
+
+                var body = bodies[0];
+                if (body == null)
+                    return null;
+
+                // Use reflection (body is object, safe)
+                var mi = body.GetType().GetMethod("GetMaterialPropertyName2");
+                if (mi == null) return null;
+
+                var ps = mi.GetParameters();
+
+                // Variant B: bool GetMaterialPropertyName2(string config, out string db, out string mat)
+                if (ps.Length == 3 && ps[0].ParameterType == typeof(string) && ps[1].IsOut && ps[2].IsOut)
                 {
-                    var ps = mi.GetParameters();
+                    object[] args = new object[] { configName ?? "", null, null };
+                    mi.Invoke(body, args);
+                    var mat = args[2] as string;
+                    if (!string.IsNullOrWhiteSpace(mat))
+                        return mat;
+                }
 
-                    if (ps.Length == 3 && ps[0].ParameterType == typeof(string))
-                    {
-                        object[] args = new object[] { cfg ?? "", null, null };
-                        mi.Invoke(target, args);
-
-                        string mat = args[2] as string;
-                        if (!string.IsNullOrWhiteSpace(mat)) return mat;
-
-                        mat = args[1] as string;
-                        if (!string.IsNullOrWhiteSpace(mat)) return mat;
-                    }
-
-                    if (ps.Length == 1 && ps[0].ParameterType == typeof(string) && mi.ReturnType == typeof(string))
-                    {
-                        var ret = mi.Invoke(target, new object[] { cfg ?? "" }) as string;
-                        if (!string.IsNullOrWhiteSpace(ret)) return ret;
-                    }
+                // Variant A: string GetMaterialPropertyName2(string config, out string db)
+                if (ps.Length == 2 && ps[0].ParameterType == typeof(string) && ps[1].IsOut)
+                {
+                    object[] args = new object[] { configName ?? "", null };
+                    var ret = mi.Invoke(body, args);
+                    var mat = ret as string;
+                    if (!string.IsNullOrWhiteSpace(mat))
+                        return mat;
                 }
             }
             catch { }
@@ -636,7 +802,7 @@ namespace SW2026RibbonAddin.Commands
         }
 
         // ------------------------------------------------------------------
-        //  Folder selection + CSV + active-doc helpers
+        // Folder / CSV / doc helpers
         // ------------------------------------------------------------------
 
         private static string SelectMainFolder(IModelDoc2 model)
@@ -693,16 +859,14 @@ namespace SW2026RibbonAddin.Commands
 
         private static void TryWriteCsv(string csvPath, List<string> lines)
         {
-            try { File.WriteAllLines(csvPath, lines); }
-            catch (Exception ex) { Debug.WriteLine("CSV write failed for " + csvPath + ": " + ex); }
-        }
-
-        private static string EscapeCsv(string value)
-        {
-            if (value == null) return "";
-            bool mustQuote = value.Contains(",") || value.Contains("\"") || value.Contains("\r") || value.Contains("\n");
-            if (!mustQuote) return value;
-            return "\"" + value.Replace("\"", "\"\"") + "\"";
+            try
+            {
+                File.WriteAllLines(csvPath, lines, Encoding.UTF8);
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine("CSV write failed for " + csvPath + ": " + ex);
+            }
         }
 
         private static string GetActiveDocKey(ISldWorks swApp)
@@ -737,6 +901,24 @@ namespace SW2026RibbonAddin.Commands
                     ref err);
             }
             catch { }
+        }
+
+        private static string CsvCell(string s)
+        {
+            if (s == null) return "";
+            s = s.Trim();
+
+            bool needsQuotes =
+                s.Contains(",") ||
+                s.Contains("\"") ||
+                s.Contains("\r") ||
+                s.Contains("\n");
+
+            if (!needsQuotes)
+                return s;
+
+            s = s.Replace("\"", "\"\"");
+            return "\"" + s + "\"";
         }
     }
 }
