@@ -8,6 +8,7 @@ using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Reflection;
 using System.Text;
 using System.Windows.Forms;
 
@@ -19,11 +20,8 @@ using ACadSharp.Tables;
 using CSMath;           // XYZ
 using Clipper2Lib;      // Clipper64, Paths64, Path64, Point64, ClipperOffset, etc.
 
-using WinPoint = System.Drawing.Point;
-using WinSize = System.Drawing.Size;
-using WinContentAlignment = System.Drawing.ContentAlignment;
+// Fix ambiguity with ACadSharp.Entities.ClipType
 using ClipperClipType = Clipper2Lib.ClipType;
-
 
 namespace SW2026RibbonAddin.Commands
 {
@@ -32,7 +30,7 @@ namespace SW2026RibbonAddin.Commands
         public string Id => "LaserCut";
 
         public string DisplayName => "Laser\nnesting";
-        public string Tooltip => "Nest combined thickness DWGs into sheets. Supports Fast (rectangles) or Contour (Level 1).";
+        public string Tooltip => "Nest combined thickness DWGs into sheets. Supports Fast (rectangles), Contour L1, Contour L2 (NFP).";
         public string Hint => "Laser cut nesting";
 
         public string SmallIconFile => "laser_cut_20.png";
@@ -93,6 +91,7 @@ namespace SW2026RibbonAddin.Commands
     {
         FastRectangles = 0,
         ContourLevel1 = 1,
+        ContourLevel2_NFP = 2, // NEW
     }
 
     internal readonly struct SheetPreset
@@ -134,8 +133,11 @@ namespace SW2026RibbonAddin.Commands
         // Endpoint snapping tolerance for loop building (mm)
         public double ContourSnapMm { get; set; } = 0.05;
 
-        // Candidate limit per (sheet,rotation) placement attempt (safety)
-        public int MaxCandidatesPerTry { get; set; } = 6000;
+        // Candidate cap (safety)
+        public int MaxCandidatesPerTry { get; set; } = 7000;
+
+        // Level 2: limit how many placed polygons we generate NFP from (performance guard)
+        public int MaxNfpPartnersPerTry { get; set; } = 80;
     }
 
     internal sealed class LaserCutOptionsForm : Form
@@ -149,7 +151,8 @@ namespace SW2026RibbonAddin.Commands
         private readonly CheckBox _filterPreview;
 
         private readonly RadioButton _rbFast;
-        private readonly RadioButton _rbContour;
+        private readonly RadioButton _rbContour1;
+        private readonly RadioButton _rbContour2;
 
         private readonly NumericUpDown _chord;
         private readonly NumericUpDown _snap;
@@ -176,14 +179,14 @@ namespace SW2026RibbonAddin.Commands
             MinimizeBox = false;
             ShowInTaskbar = false;
 
-            ClientSize = new WinSize(640, 360);
+            ClientSize = new System.Drawing.Size(660, 395);
 
             Controls.Add(new Label { Left = 12, Top = 16, Width = 170, Text = "Sheet preset:" });
             _preset = new ComboBox
             {
                 Left = 180,
                 Top = 12,
-                Width = 440,
+                Width = 460,
                 DropDownStyle = ComboBoxStyle.DropDownList
             };
             foreach (var p in _presets)
@@ -222,7 +225,7 @@ namespace SW2026RibbonAddin.Commands
             {
                 Left = 12,
                 Top = 86,
-                Width = 610,
+                Width = 630,
                 Text = "Separate by EXACT SolidWorks material name",
                 Checked = true
             };
@@ -243,7 +246,7 @@ namespace SW2026RibbonAddin.Commands
             {
                 Left = 32,
                 Top = 112,
-                Width = 610,
+                Width = 630,
                 Text = "Output one nested DWG per material",
                 Checked = true
             };
@@ -253,7 +256,7 @@ namespace SW2026RibbonAddin.Commands
             {
                 Left = 32,
                 Top = 136,
-                Width = 610,
+                Width = 630,
                 Text = "Keep only that material's source preview (plates + labels) in each output",
                 Checked = true
             };
@@ -263,8 +266,8 @@ namespace SW2026RibbonAddin.Commands
             {
                 Left = 12,
                 Top = 170,
-                Width = 610,
-                Height = 120,
+                Width = 630,
+                Height = 150,
                 Text = "Nesting algorithm"
             };
             Controls.Add(grp);
@@ -273,27 +276,37 @@ namespace SW2026RibbonAddin.Commands
             {
                 Left = 16,
                 Top = 24,
-                Width = 560,
-                Text = "Fast (Rectangles) — very fast, more wasted sheet",
+                Width = 600,
+                Text = "Fast (Rectangles) — very fast, wastes more sheet",
                 Checked = false
             };
             grp.Controls.Add(_rbFast);
 
-            _rbContour = new RadioButton
+            _rbContour1 = new RadioButton
             {
                 Left = 16,
                 Top = 48,
-                Width = 560,
-                Text = "Contour (Level 1) — uses outer contour + gap offset, better packing (slower)",
+                Width = 600,
+                Text = "Contour (Level 1) — real contour + offset gap, good packing (slower)",
                 Checked = true
             };
-            grp.Controls.Add(_rbContour);
+            grp.Controls.Add(_rbContour1);
 
-            grp.Controls.Add(new Label { Left = 36, Top = 78, Width = 160, Text = "Arc chord (mm):" });
+            _rbContour2 = new RadioButton
+            {
+                Left = 16,
+                Top = 72,
+                Width = 600,
+                Text = "Contour (Level 2) — NFP/Minkowski touch placement (slowest, best)",
+                Checked = false
+            };
+            grp.Controls.Add(_rbContour2);
+
+            grp.Controls.Add(new Label { Left = 36, Top = 104, Width = 160, Text = "Arc chord (mm):" });
             _chord = new NumericUpDown
             {
                 Left = 200,
-                Top = 74,
+                Top = 100,
                 Width = 90,
                 DecimalPlaces = 2,
                 Minimum = 0.10M,
@@ -302,11 +315,11 @@ namespace SW2026RibbonAddin.Commands
             };
             grp.Controls.Add(_chord);
 
-            grp.Controls.Add(new Label { Left = 320, Top = 78, Width = 160, Text = "Snap tol (mm):" });
+            grp.Controls.Add(new Label { Left = 320, Top = 104, Width = 160, Text = "Snap tol (mm):" });
             _snap = new NumericUpDown
             {
                 Left = 460,
-                Top = 74,
+                Top = 100,
                 Width = 90,
                 DecimalPlaces = 2,
                 Minimum = 0.01M,
@@ -318,15 +331,15 @@ namespace SW2026RibbonAddin.Commands
             var note = new Label
             {
                 Left = 12,
-                Top = 300,
-                Width = 610,
+                Top = 330,
+                Width = 630,
                 Height = 24,
                 Text = "Note: rotations are always 0/90/180/270. Gap + margin are auto (>= thickness)."
             };
             Controls.Add(note);
 
-            _ok = new Button { Text = "OK", Left = 450, Top = 328, Width = 80, Height = 26 };
-            _cancel = new Button { Text = "Cancel", Left = 540, Top = 328, Width = 80, Height = 26, DialogResult = DialogResult.Cancel };
+            _ok = new Button { Text = "OK", Left = 460, Top = 360, Width = 80, Height = 26 };
+            _cancel = new Button { Text = "Cancel", Left = 560, Top = 360, Width = 80, Height = 26, DialogResult = DialogResult.Cancel };
             Controls.Add(_ok);
             Controls.Add(_cancel);
 
@@ -341,6 +354,11 @@ namespace SW2026RibbonAddin.Commands
                     (double)_w.Value,
                     (double)_h.Value);
 
+                NestingMode mode =
+                    _rbContour2.Checked ? NestingMode.ContourLevel2_NFP :
+                    _rbContour1.Checked ? NestingMode.ContourLevel1 :
+                    NestingMode.FastRectangles;
+
                 Settings = new LaserCutRunSettings
                 {
                     DefaultSheet = sheet,
@@ -349,7 +367,7 @@ namespace SW2026RibbonAddin.Commands
                     OutputOneDwgPerMaterial = _sepMat.Checked && _onePerMat.Checked,
                     KeepOnlyCurrentMaterialInSourcePreview = _sepMat.Checked && _filterPreview.Checked,
 
-                    Mode = _rbContour.Checked ? NestingMode.ContourLevel1 : NestingMode.FastRectangles,
+                    Mode = mode,
                     ContourChordMm = (double)_chord.Value,
                     ContourSnapMm = (double)_snap.Value,
                 };
@@ -393,7 +411,7 @@ namespace SW2026RibbonAddin.Commands
             MinimizeBox = false;
             ShowInTaskbar = false;
 
-            ClientSize = new WinSize(560, 95);
+            ClientSize = new System.Drawing.Size(560, 95);
 
             _label = new Label
             {
@@ -401,7 +419,7 @@ namespace SW2026RibbonAddin.Commands
                 Top = 10,
                 Width = 536,
                 Height = 22,
-                TextAlign = WinContentAlignment.MiddleLeft,
+                TextAlign = System.Drawing.ContentAlignment.MiddleLeft,
                 Text = "Starting..."
             };
             Controls.Add(_label);
@@ -431,7 +449,7 @@ namespace SW2026RibbonAddin.Commands
 
             _label.Refresh();
             _bar.Refresh();
-            Application.DoEvents();
+            System.Windows.Forms.Application.DoEvents();
         }
     }
 
@@ -439,8 +457,10 @@ namespace SW2026RibbonAddin.Commands
     {
         // Geometry scale for Clipper (mm -> integer)
         private const long SCALE = 1000; // 0.001 mm units
-
         private static readonly int[] RotationsDeg = { 0, 90, 180, 270 };
+
+        // Reflection cached MinkowskiSum method (avoids compile-time dependency on exact API signature)
+        private static MethodInfo _miMinkowskiSum;
 
         internal sealed class NestRunResult
         {
@@ -459,28 +479,13 @@ namespace SW2026RibbonAddin.Commands
             public int Quantity;
             public string MaterialExact;
 
-            // bbox in mm (used by Fast mode and also for fallback)
+            // bbox in mm
             public double MinX, MinY, MaxX, MaxY;
             public double Width, Height;
 
-            // Contour polygon (outer boundary) in scaled Clipper units, in block-local coords (unrotated)
+            // Outer contour polygon (scaled) in block-local coords
             public Path64 OuterContour0;
-            public long OuterArea2Abs; // abs(2*area) in scaled^2
-        }
-
-        private sealed class FreeRect
-        {
-            public double X, Y, W, H;
-        }
-
-        private sealed class SheetRectState
-        {
-            public int Index;
-            public double OriginXmm;
-            public double OriginYmm;
-            public List<FreeRect> Free = new List<FreeRect>();
-            public int PlacedCount;
-            public double UsedArea;
+            public long OuterArea2Abs;
         }
 
         private sealed class SheetContourState
@@ -490,19 +495,50 @@ namespace SW2026RibbonAddin.Commands
             public double OriginYmm;
 
             public List<PlacedContour> Placed = new List<PlacedContour>();
+
             public int PlacedCount;
-            public long UsedArea2Abs; // scaled^2
+            public long UsedArea2Abs;
         }
 
         private sealed class PlacedContour
         {
-            public Path64 OffsetPoly; // translated into sheet-local usable coords (scaled)
-            public LongRect BBox;      // bbox of OffsetPoly (scaled)
+            public Path64 OffsetPoly;
+            public LongRect BBox;
         }
 
         private struct LongRect
         {
             public long MinX, MinY, MaxX, MaxY;
+        }
+
+        private struct CandidateIns
+        {
+            public long InsX, InsY;
+        }
+
+        private struct RotatedPoly
+        {
+            public int RotDeg;
+            public double RotRad;
+
+            public Path64 PolyRot;
+            public Path64 PolyOffset;
+
+            public LongRect OffsetBounds;
+            public Point64[] Anchors;
+            public long RotArea2Abs;
+        }
+
+        private struct ContourPlacement
+        {
+            public long InsertX;
+            public long InsertY;
+            public double RotRad;
+
+            public Path64 OffsetPolyTranslated;
+            public LongRect OffsetBBoxTranslated;
+
+            public long RotArea2Abs;
         }
 
         public static void NestFolder(string mainFolder, LaserCutRunSettings settings, bool showUi = true)
@@ -587,15 +623,14 @@ namespace SW2026RibbonAddin.Commands
             if (defsFirst.Count == 0)
                 throw new InvalidOperationException("No plate blocks (P_*_Q#) found in: " + sourceDwgPath);
 
-            // group by exact material
             var groups = BuildGroups(defsFirst, settings);
 
             var results = new List<NestRunResult>();
 
             foreach (var grp in groups)
             {
-                string groupKey = grp.Key;       // normalized key
-                string groupLabel = grp.Value;   // exact label
+                string groupKey = grp.Key;
+                string groupLabel = grp.Value;
 
                 // Re-read fresh doc for each output
                 CadDocument doc;
@@ -610,7 +645,6 @@ namespace SW2026RibbonAddin.Commands
                 if (totalInstances <= 0)
                     continue;
 
-                // auto gap + margin
                 double thicknessMm = TryGetPlateThicknessFromFileName(sourceDwgPath) ?? 0.0;
 
                 double gapMm = 3.0;
@@ -621,7 +655,6 @@ namespace SW2026RibbonAddin.Commands
 
                 var modelSpace = doc.BlockRecords["*Model_Space"];
 
-                // Option 2: keep only material preview
                 if (settings.SeparateByMaterialExact &&
                     settings.OutputOneDwgPerMaterial &&
                     settings.KeepOnlyCurrentMaterialInSourcePreview &&
@@ -630,17 +663,15 @@ namespace SW2026RibbonAddin.Commands
                     FilterSourcePreviewToTheseBlocks(doc, defs.Select(d => d.BlockName).ToHashSet(StringComparer.OrdinalIgnoreCase));
                 }
 
-                // Find extents of remaining preview to place sheets above it
                 GetModelSpaceExtents(doc, out double srcMinX, out double srcMinY, out double srcMaxX, out double srcMaxY);
 
                 double baseSheetOriginX = srcMinX;
                 double baseSheetOriginY = srcMaxY + 200.0;
 
-                // Run nesting with progress
                 using (var progress = new LaserCutProgressForm(totalInstances))
                 {
                     progress.Show();
-                    Application.DoEvents();
+                    System.Windows.Forms.Application.DoEvents();
 
                     int sheetsUsed;
 
@@ -659,7 +690,7 @@ namespace SW2026RibbonAddin.Commands
                             progress,
                             totalInstances);
                     }
-                    else
+                    else if (settings.Mode == NestingMode.ContourLevel1)
                     {
                         sheetsUsed = NestContourLevel1(
                             defs,
@@ -677,10 +708,28 @@ namespace SW2026RibbonAddin.Commands
                             snapMm: Math.Max(0.01, settings.ContourSnapMm),
                             maxCandidates: Math.Max(500, settings.MaxCandidatesPerTry));
                     }
+                    else
+                    {
+                        sheetsUsed = NestContourLevel2_Nfp(
+                            defs,
+                            modelSpace,
+                            settings.DefaultSheet.WidthMm,
+                            settings.DefaultSheet.HeightMm,
+                            marginMm,
+                            gapMm,
+                            baseSheetOriginX,
+                            baseSheetOriginY,
+                            groupLabel,
+                            progress,
+                            totalInstances,
+                            chordMm: Math.Max(0.10, settings.ContourChordMm),
+                            snapMm: Math.Max(0.01, settings.ContourSnapMm),
+                            maxCandidates: Math.Max(500, settings.MaxCandidatesPerTry),
+                            maxPartners: Math.Max(10, settings.MaxNfpPartnersPerTry));
+                    }
 
                     progress.Close();
 
-                    // Save
                     string dir = Path.GetDirectoryName(sourceDwgPath) ?? "";
                     string nameNoExt = Path.GetFileNameWithoutExtension(sourceDwgPath) ?? "thickness";
 
@@ -698,7 +747,6 @@ namespace SW2026RibbonAddin.Commands
                     using (var writer = new DwgWriter(outPath, doc))
                         writer.Write();
 
-                    // Log
                     string logPath = Path.Combine(dir, $"{nameNoExt}_nest_log.txt");
                     AppendNestLog(
                         logPath,
@@ -729,9 +777,23 @@ namespace SW2026RibbonAddin.Commands
             return results;
         }
 
-        // -----------------------------------------
-        // FAST MODE (Rectangles) - existing approach
-        // -----------------------------------------
+        // ============================================================
+        // FAST MODE (Rectangles) — unchanged basic approach
+        // ============================================================
+
+        private sealed class FreeRect
+        {
+            public double X, Y, W, H;
+        }
+
+        private sealed class SheetRectState
+        {
+            public int Index;
+            public double OriginXmm;
+            public double OriginYmm;
+            public List<FreeRect> Free = new List<FreeRect>();
+        }
+
         private static int NestFastRectangles(
             List<PartDefinition> defs,
             BlockRecord modelSpace,
@@ -745,7 +807,6 @@ namespace SW2026RibbonAddin.Commands
             LaserCutProgressForm progress,
             int totalInstances)
         {
-            // We keep the old conservative rule for fast mode
             double placementMargin = marginMm + gapMm;
 
             double usableW = sheetWmm - 2 * placementMargin;
@@ -753,13 +814,11 @@ namespace SW2026RibbonAddin.Commands
             if (usableW <= 0 || usableH <= 0)
                 throw new InvalidOperationException("Sheet is too small after margins/gap.");
 
-            // Expand instances
             var instances = new List<PartDefinition>();
             foreach (var d in defs)
                 for (int i = 0; i < d.Quantity; i++)
                     instances.Add(d);
 
-            // Sort by bbox area
             instances.Sort((a, b) => (b.Width * b.Height).CompareTo(a.Width * a.Height));
 
             var sheets = new List<SheetRectState>();
@@ -811,13 +870,10 @@ namespace SW2026RibbonAddin.Commands
 
         private static bool TryPlaceRect(SheetRectState sheet, PartDefinition part, double gapMm, BlockRecord modelSpace)
         {
-            // Only 0/90 rotations matter for rectangles (180=0, 270=90)
-            // But we still respect DWG by inserting unrotated (fast mode)
             for (int frIndex = 0; frIndex < sheet.Free.Count; frIndex++)
             {
                 var fr = sheet.Free[frIndex];
 
-                // Try both orientations
                 if (TryPlaceRectOrientation(sheet, part, frIndex, fr, part.Width, part.Height, 0.0, gapMm, modelSpace))
                     return true;
 
@@ -851,7 +907,6 @@ namespace SW2026RibbonAddin.Commands
             double worldMinX = sheet.OriginXmm + localMinX;
             double worldMinY = sheet.OriginYmm + localMinY;
 
-            // For fast mode we use bbox-based insert computation
             double insertX;
             double insertY;
 
@@ -862,7 +917,6 @@ namespace SW2026RibbonAddin.Commands
             }
             else
             {
-                // 90° about origin: (x,y)->(-y,x) => bbox min is (-MaxY, MinX)
                 insertX = worldMinX + part.MaxY;
                 insertY = worldMinY - part.MinX;
             }
@@ -877,7 +931,6 @@ namespace SW2026RibbonAddin.Commands
             };
             modelSpace.Entities.Add(ins);
 
-            // Split free rect (simple guillotine split)
             sheet.Free.RemoveAt(frIndex);
 
             double rightW = fr.W - usedW;
@@ -891,9 +944,10 @@ namespace SW2026RibbonAddin.Commands
             return true;
         }
 
-        // -----------------------------------------
-        // CONTOUR MODE (Level 1) - polygon packing
-        // -----------------------------------------
+        // ============================================================
+        // CONTOUR LEVEL 1 — candidate by bbox/anchors/vertices
+        // ============================================================
+
         private static int NestContourLevel1(
             List<PartDefinition> defs,
             BlockRecord modelSpace,
@@ -910,8 +964,6 @@ namespace SW2026RibbonAddin.Commands
             double snapMm,
             int maxCandidates)
         {
-            // Correct contour nesting boundary buffer:
-            // expanded polygon (gap/2) must stay >= (margin + gap/2) from sheet edge
             double boundaryBufferMm = marginMm + gapMm / 2.0;
 
             double usableWmm = sheetWmm - 2 * boundaryBufferMm;
@@ -922,73 +974,13 @@ namespace SW2026RibbonAddin.Commands
             long usableW = ToInt(usableWmm);
             long usableH = ToInt(usableHmm);
 
-            // Expand instances
-            var instances = new List<PartDefinition>();
-            foreach (var d in defs)
-                for (int i = 0; i < d.Quantity; i++)
-                    instances.Add(d);
+            var instances = ExpandInstances(defs);
+            instances.Sort((a, b) => SortByAreaDesc(a, b));
 
-            // Sort by contour area (fallback bbox area)
-            instances.Sort((a, b) =>
-            {
-                long areaA = a.OuterArea2Abs > 0 ? a.OuterArea2Abs : ToInt(a.Width) * ToInt(a.Height);
-                long areaB = b.OuterArea2Abs > 0 ? b.OuterArea2Abs : ToInt(b.Width) * ToInt(b.Height);
-                return areaB.CompareTo(areaA);
-            });
-
-            // Precompute rotated + offset polygons per unique block (per rotation)
-            // Key: block name + rotation
             var polyCache = new Dictionary<string, RotatedPoly>(StringComparer.OrdinalIgnoreCase);
 
             RotatedPoly GetRot(PartDefinition part, int rotDeg)
-            {
-                string key = part.BlockName + "||" + rotDeg.ToString(CultureInfo.InvariantCulture) + "||gap:" + gapMm.ToString("0.###", CultureInfo.InvariantCulture);
-                if (polyCache.TryGetValue(key, out var rp))
-                    return rp;
-
-                // 1) base contour (ensure we have it; fallback rectangle)
-                Path64 basePoly = part.OuterContour0;
-                if (basePoly == null || basePoly.Count < 3)
-                {
-                    basePoly = MakeRectPolyScaled(part.MinX, part.MinY, part.MaxX, part.MaxY);
-                }
-
-                // 2) rotate
-                Path64 rotPoly = RotatePoly(basePoly, rotDeg);
-
-                // 3) offset outward by gap/2
-                double delta = (gapMm / 2.0) * SCALE;
-                Path64 offset = OffsetLargest(rotPoly, delta);
-
-                // If offset fails, fallback to rotPoly (still works, just no gap safety)
-                if (offset == null || offset.Count < 3)
-                    offset = rotPoly;
-
-                // Clean duplicates
-                offset = CleanPath(offset);
-
-                var bbox = GetBounds(offset);
-
-                // anchors (4)
-                var anchors = GetAnchors(offset);
-
-                // area
-                long area2Abs = Area2Abs(rotPoly);
-
-                rp = new RotatedPoly
-                {
-                    RotDeg = rotDeg,
-                    RotRad = rotDeg * Math.PI / 180.0,
-                    PolyRot = rotPoly,
-                    PolyOffset = offset,
-                    OffsetBounds = bbox,
-                    Anchors = anchors,
-                    RotArea2Abs = area2Abs
-                };
-
-                polyCache[key] = rp;
-                return rp;
-            }
+                => GetOrCreateRotated(part, rotDeg, gapMm, polyCache);
 
             var sheets = new List<SheetContourState>();
 
@@ -1007,47 +999,24 @@ namespace SW2026RibbonAddin.Commands
             }
 
             var cur = NewSheet();
-
             int placed = 0;
 
             foreach (var part in instances)
             {
                 bool placedThis = false;
 
-                // Try on existing sheets first
                 for (int si = 0; si < sheets.Count; si++)
                 {
-                    if (TryPlaceContourOnSheet(
-                        sheets[si],
-                        part,
-                        usableW,
-                        usableH,
-                        maxCandidates,
-                        GetRot,
-                        out var placement))
+                    if (TryPlaceContourOnSheet_Level1(sheets[si], part, usableW, usableH, maxCandidates, GetRot, out var placement))
                     {
-                        AddPlacedToDwg(
-                            modelSpace,
-                            part,
-                            sheets[si],
-                            boundaryBufferMm,
-                            placement.InsertX,
-                            placement.InsertY,
-                            placement.RotRad);
+                        AddPlacedToDwg(modelSpace, part, sheets[si], boundaryBufferMm, placement.InsertX, placement.InsertY, placement.RotRad);
 
-                        // store translated offset poly for collision checks
-                        sheets[si].Placed.Add(new PlacedContour
-                        {
-                            OffsetPoly = placement.OffsetPolyTranslated,
-                            BBox = placement.OffsetBBoxTranslated
-                        });
-
+                        sheets[si].Placed.Add(new PlacedContour { OffsetPoly = placement.OffsetPolyTranslated, BBox = placement.OffsetBBoxTranslated });
                         sheets[si].PlacedCount++;
                         sheets[si].UsedArea2Abs += placement.RotArea2Abs;
 
                         placed++;
                         progress.Step($"Placed {placed}/{totalInstances} (Contour L1)");
-
                         placedThis = true;
                         break;
                     }
@@ -1056,20 +1025,14 @@ namespace SW2026RibbonAddin.Commands
                 if (placedThis)
                     continue;
 
-                // Need new sheet
                 cur = NewSheet();
 
-                if (!TryPlaceContourOnSheet(cur, part, usableW, usableH, maxCandidates, GetRot, out var placement2))
+                if (!TryPlaceContourOnSheet_Level1(cur, part, usableW, usableH, maxCandidates, GetRot, out var placement2))
                     throw new InvalidOperationException("Failed to place a part even on a fresh sheet. Sheet too small?");
 
                 AddPlacedToDwg(modelSpace, part, cur, boundaryBufferMm, placement2.InsertX, placement2.InsertY, placement2.RotRad);
 
-                cur.Placed.Add(new PlacedContour
-                {
-                    OffsetPoly = placement2.OffsetPolyTranslated,
-                    BBox = placement2.OffsetBBoxTranslated
-                });
-
+                cur.Placed.Add(new PlacedContour { OffsetPoly = placement2.OffsetPolyTranslated, BBox = placement2.OffsetBBoxTranslated });
                 cur.PlacedCount++;
                 cur.UsedArea2Abs += placement2.RotArea2Abs;
 
@@ -1077,45 +1040,11 @@ namespace SW2026RibbonAddin.Commands
                 progress.Step($"Placed {placed}/{totalInstances} (Contour L1)");
             }
 
-            // Optional sheet label with fill %
-            long usableArea2 = usableW * usableH; // scaled^2
-            foreach (var s in sheets)
-            {
-                double fill = usableArea2 > 0 ? (double)s.UsedArea2Abs / usableArea2 * 100.0 : 0.0;
-                AddSheetLabel(modelSpace, s.OriginXmm, s.OriginYmm, sheetWmm, sheetHmm, s.Index, fill);
-            }
-
+            AddFillLabels(modelSpace, sheets, usableW, usableH, sheetWmm, sheetHmm);
             return sheets.Count;
         }
 
-        private struct ContourPlacement
-        {
-            public long InsertX;
-            public long InsertY;
-            public double RotRad;
-
-            public Path64 OffsetPolyTranslated;
-            public LongRect OffsetBBoxTranslated;
-
-            public long RotArea2Abs;
-        }
-
-        private struct RotatedPoly
-        {
-            public int RotDeg;
-            public double RotRad;
-
-            public Path64 PolyRot;
-            public Path64 PolyOffset;
-
-            public LongRect OffsetBounds;
-
-            public Point64[] Anchors; // 4 anchors from offset poly
-
-            public long RotArea2Abs;
-        }
-
-        private static bool TryPlaceContourOnSheet(
+        private static bool TryPlaceContourOnSheet_Level1(
             SheetContourState sheet,
             PartDefinition part,
             long usableW,
@@ -1126,64 +1055,26 @@ namespace SW2026RibbonAddin.Commands
         {
             placement = default;
 
-            // Try all 0/90/180/270
-            // Strategy: search candidates in "bottom-left" order (min Y then min X),
-            // accept first feasible.
             foreach (int rotDeg in RotationsDeg)
             {
                 var rp = getRot(part, rotDeg);
 
-                // Quick fit check using offset bbox size
                 long offW = rp.OffsetBounds.MaxX - rp.OffsetBounds.MinX;
                 long offH = rp.OffsetBounds.MaxY - rp.OffsetBounds.MinY;
                 if (offW <= 0 || offH <= 0 || offW > usableW || offH > usableH)
                     continue;
 
-                // Generate candidates
-                var candidates = GenerateCandidates(sheet, rp, maxCandidates);
-
-                // Sort by resulting bbox minY, then minX
-                candidates.Sort((a, b) =>
-                {
-                    long aMinY = a.InsY + rp.OffsetBounds.MinY;
-                    long bMinY = b.InsY + rp.OffsetBounds.MinY;
-                    int cmp = aMinY.CompareTo(bMinY);
-                    if (cmp != 0) return cmp;
-
-                    long aMinX = a.InsX + rp.OffsetBounds.MinX;
-                    long bMinX = b.InsX + rp.OffsetBounds.MinX;
-                    return aMinX.CompareTo(bMinX);
-                });
+                var candidates = GenerateCandidates_Level1(sheet, rp, usableW, usableH, maxCandidates);
+                candidates.Sort((a, b) => CandidateCompare(a, b, rp));
 
                 foreach (var cand in candidates)
                 {
-                    long minX = cand.InsX + rp.OffsetBounds.MinX;
-                    long minY = cand.InsY + rp.OffsetBounds.MinY;
-                    long maxX = cand.InsX + rp.OffsetBounds.MaxX;
-                    long maxY = cand.InsY + rp.OffsetBounds.MaxY;
-
-                    if (minX < 0 || minY < 0 || maxX > usableW || maxY > usableH)
+                    if (!CandidateFits(cand, rp, usableW, usableH, out var movedBBox))
                         continue;
 
-                    // Translate offset poly for collision checks
                     var moved = TranslatePath(rp.PolyOffset, cand.InsX, cand.InsY);
-                    var movedBBox = new LongRect { MinX = minX, MinY = minY, MaxX = maxX, MaxY = maxY };
 
-                    bool overlap = false;
-
-                    foreach (var placed in sheet.Placed)
-                    {
-                        if (!RectsOverlap(movedBBox, placed.BBox))
-                            continue;
-
-                        if (PolygonsOverlapAreaPositive(moved, placed.OffsetPoly))
-                        {
-                            overlap = true;
-                            break;
-                        }
-                    }
-
-                    if (overlap)
+                    if (OverlapsAnything(sheet, moved, movedBBox))
                         continue;
 
                     placement = new ContourPlacement
@@ -1191,10 +1082,8 @@ namespace SW2026RibbonAddin.Commands
                         InsertX = cand.InsX,
                         InsertY = cand.InsY,
                         RotRad = rp.RotRad,
-
                         OffsetPolyTranslated = moved,
                         OffsetBBoxTranslated = movedBBox,
-
                         RotArea2Abs = rp.RotArea2Abs
                     };
                     return true;
@@ -1204,12 +1093,7 @@ namespace SW2026RibbonAddin.Commands
             return false;
         }
 
-        private struct CandidateIns
-        {
-            public long InsX, InsY;
-        }
-
-        private static List<CandidateIns> GenerateCandidates(SheetContourState sheet, RotatedPoly rp, int maxCandidates)
+        private static List<CandidateIns> GenerateCandidates_Level1(SheetContourState sheet, RotatedPoly rp, long usableW, long usableH, int maxCandidates)
         {
             var result = new List<CandidateIns>(Math.Min(maxCandidates, 2048));
             var seen = new HashSet<(long, long)>();
@@ -1219,16 +1103,25 @@ namespace SW2026RibbonAddin.Commands
                 if (result.Count >= maxCandidates)
                     return;
 
-                var key = (ix, iy);
-                if (seen.Add(key))
-                    result.Add(new CandidateIns { InsX = ix, InsY = iy });
+                if (!seen.Add((ix, iy)))
+                    return;
+
+                // quick fit filter
+                long minX = ix + rp.OffsetBounds.MinX;
+                long minY = iy + rp.OffsetBounds.MinY;
+                long maxX = ix + rp.OffsetBounds.MaxX;
+                long maxY = iy + rp.OffsetBounds.MaxY;
+
+                if (minX < 0 || minY < 0 || maxX > usableW || maxY > usableH)
+                    return;
+
+                result.Add(new CandidateIns { InsX = ix, InsY = iy });
             }
 
-            // Base candidate: align bbox-min to (0,0)
+            // base candidate
             Add(-rp.OffsetBounds.MinX, -rp.OffsetBounds.MinY);
 
-            // Bounding-box edge candidates (fast)
-            // x candidates from right edges, y from top edges
+            // bbox edge candidates
             var xSet = new HashSet<long> { 0 };
             var ySet = new HashSet<long> { 0 };
 
@@ -1238,22 +1131,20 @@ namespace SW2026RibbonAddin.Commands
                 ySet.Add(p.BBox.MaxY);
             }
 
-            var xs = xSet.OrderBy(v => v).Take(120).ToList();
-            var ys = ySet.OrderBy(v => v).Take(120).ToList();
+            var xs = xSet.OrderBy(v => v).Take(140).ToList();
+            var ys = ySet.OrderBy(v => v).Take(140).ToList();
 
             foreach (var y in ys)
             {
                 foreach (var x in xs)
                 {
-                    // desired bbox-min = (x,y)
                     Add(x - rp.OffsetBounds.MinX, y - rp.OffsetBounds.MinY);
                     if (result.Count >= maxCandidates) break;
                 }
                 if (result.Count >= maxCandidates) break;
             }
 
-            // Vertex-based candidates (better interlocking)
-            // Align moving anchors to sampled vertices of placed polygons.
+            // vertex align candidates (sampled)
             if (result.Count < maxCandidates && sheet.Placed.Count > 0)
             {
                 foreach (var placed in sheet.Placed)
@@ -1261,19 +1152,17 @@ namespace SW2026RibbonAddin.Commands
                     int n = placed.OffsetPoly.Count;
                     if (n < 3) continue;
 
-                    int step = Math.Max(1, n / 30); // sample ~30 points max
+                    int step = Math.Max(1, n / 30);
 
                     for (int i = 0; i < n; i += step)
                     {
                         var v = placed.OffsetPoly[i];
-
                         for (int a = 0; a < rp.Anchors.Length; a++)
                         {
                             var m = rp.Anchors[a];
                             Add(v.X - m.X, v.Y - m.Y);
                             if (result.Count >= maxCandidates) break;
                         }
-
                         if (result.Count >= maxCandidates) break;
                     }
 
@@ -1282,6 +1171,442 @@ namespace SW2026RibbonAddin.Commands
             }
 
             return result;
+        }
+
+        // ============================================================
+        // CONTOUR LEVEL 2 — NFP/Minkowski touch placement
+        // ============================================================
+
+        private static int NestContourLevel2_Nfp(
+            List<PartDefinition> defs,
+            BlockRecord modelSpace,
+            double sheetWmm,
+            double sheetHmm,
+            double marginMm,
+            double gapMm,
+            double baseOriginXmm,
+            double baseOriginYmm,
+            string materialLabel,
+            LaserCutProgressForm progress,
+            int totalInstances,
+            double chordMm,
+            double snapMm,
+            int maxCandidates,
+            int maxPartners)
+        {
+            // boundary buffer = margin + gap/2
+            double boundaryBufferMm = marginMm + gapMm / 2.0;
+
+            double usableWmm = sheetWmm - 2 * boundaryBufferMm;
+            double usableHmm = sheetHmm - 2 * boundaryBufferMm;
+            if (usableWmm <= 0 || usableHmm <= 0)
+                throw new InvalidOperationException("Sheet is too small after margins/gap.");
+
+            long usableW = ToInt(usableWmm);
+            long usableH = ToInt(usableHmm);
+
+            var instances = ExpandInstances(defs);
+            instances.Sort((a, b) => SortByAreaDesc(a, b));
+
+            var polyCache = new Dictionary<string, RotatedPoly>(StringComparer.OrdinalIgnoreCase);
+            RotatedPoly GetRot(PartDefinition part, int rotDeg)
+                => GetOrCreateRotated(part, rotDeg, gapMm, polyCache);
+
+            var sheets = new List<SheetContourState>();
+
+            SheetContourState NewSheet()
+            {
+                var s = new SheetContourState
+                {
+                    Index = sheets.Count + 1,
+                    OriginXmm = baseOriginXmm + (sheets.Count) * (sheetWmm + 60.0),
+                    OriginYmm = baseOriginYmm
+                };
+
+                DrawSheetOutline(s.OriginXmm, s.OriginYmm, sheetWmm, sheetHmm, modelSpace, materialLabel, s.Index, NestingMode.ContourLevel2_NFP);
+                sheets.Add(s);
+                return s;
+            }
+
+            var cur = NewSheet();
+            int placed = 0;
+
+            foreach (var part in instances)
+            {
+                bool placedThis = false;
+
+                for (int si = 0; si < sheets.Count; si++)
+                {
+                    if (TryPlaceContourOnSheet_Level2Nfp(sheets[si], part, usableW, usableH, maxCandidates, maxPartners, GetRot, out var placement))
+                    {
+                        AddPlacedToDwg(modelSpace, part, sheets[si], boundaryBufferMm, placement.InsertX, placement.InsertY, placement.RotRad);
+
+                        sheets[si].Placed.Add(new PlacedContour { OffsetPoly = placement.OffsetPolyTranslated, BBox = placement.OffsetBBoxTranslated });
+                        sheets[si].PlacedCount++;
+                        sheets[si].UsedArea2Abs += placement.RotArea2Abs;
+
+                        placed++;
+                        progress.Step($"Placed {placed}/{totalInstances} (Contour L2 NFP)");
+                        placedThis = true;
+                        break;
+                    }
+                }
+
+                if (placedThis)
+                    continue;
+
+                cur = NewSheet();
+
+                if (!TryPlaceContourOnSheet_Level2Nfp(cur, part, usableW, usableH, maxCandidates, maxPartners, GetRot, out var placement2))
+                    throw new InvalidOperationException("Failed to place a part even on a fresh sheet. Sheet too small?");
+
+                AddPlacedToDwg(modelSpace, part, cur, boundaryBufferMm, placement2.InsertX, placement2.InsertY, placement2.RotRad);
+
+                cur.Placed.Add(new PlacedContour { OffsetPoly = placement2.OffsetPolyTranslated, BBox = placement2.OffsetBBoxTranslated });
+                cur.PlacedCount++;
+                cur.UsedArea2Abs += placement2.RotArea2Abs;
+
+                placed++;
+                progress.Step($"Placed {placed}/{totalInstances} (Contour L2 NFP)");
+            }
+
+            AddFillLabels(modelSpace, sheets, usableW, usableH, sheetWmm, sheetHmm);
+            return sheets.Count;
+        }
+
+        private static bool TryPlaceContourOnSheet_Level2Nfp(
+            SheetContourState sheet,
+            PartDefinition part,
+            long usableW,
+            long usableH,
+            int maxCandidates,
+            int maxPartners,
+            Func<PartDefinition, int, RotatedPoly> getRot,
+            out ContourPlacement placement)
+        {
+            placement = default;
+
+            foreach (int rotDeg in RotationsDeg)
+            {
+                var rp = getRot(part, rotDeg);
+
+                long offW = rp.OffsetBounds.MaxX - rp.OffsetBounds.MinX;
+                long offH = rp.OffsetBounds.MaxY - rp.OffsetBounds.MinY;
+                if (offW <= 0 || offH <= 0 || offW > usableW || offH > usableH)
+                    continue;
+
+                var candidates = GenerateCandidates_Level2Nfp(sheet, rp, usableW, usableH, maxCandidates, maxPartners);
+                candidates.Sort((a, b) => CandidateCompare(a, b, rp));
+
+                foreach (var cand in candidates)
+                {
+                    if (!CandidateFits(cand, rp, usableW, usableH, out var movedBBox))
+                        continue;
+
+                    var moved = TranslatePath(rp.PolyOffset, cand.InsX, cand.InsY);
+
+                    if (OverlapsAnything(sheet, moved, movedBBox))
+                        continue;
+
+                    placement = new ContourPlacement
+                    {
+                        InsertX = cand.InsX,
+                        InsertY = cand.InsY,
+                        RotRad = rp.RotRad,
+                        OffsetPolyTranslated = moved,
+                        OffsetBBoxTranslated = movedBBox,
+                        RotArea2Abs = rp.RotArea2Abs
+                    };
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private static List<CandidateIns> GenerateCandidates_Level2Nfp(
+            SheetContourState sheet,
+            RotatedPoly rp,
+            long usableW,
+            long usableH,
+            int maxCandidates,
+            int maxPartners)
+        {
+            var result = new List<CandidateIns>(Math.Min(maxCandidates, 4096));
+            var seen = new HashSet<(long, long)>();
+
+            void Add(long ix, long iy)
+            {
+                if (result.Count >= maxCandidates)
+                    return;
+
+                if (!seen.Add((ix, iy)))
+                    return;
+
+                long minX = ix + rp.OffsetBounds.MinX;
+                long minY = iy + rp.OffsetBounds.MinY;
+                long maxX = ix + rp.OffsetBounds.MaxX;
+                long maxY = iy + rp.OffsetBounds.MaxY;
+
+                if (minX < 0 || minY < 0 || maxX > usableW || maxY > usableH)
+                    return;
+
+                result.Add(new CandidateIns { InsX = ix, InsY = iy });
+            }
+
+            // base candidate
+            Add(-rp.OffsetBounds.MinX, -rp.OffsetBounds.MinY);
+
+            if (sheet.Placed.Count == 0)
+                return result;
+
+            // Also include simple bbox-edge grid candidates (helps when NFP is heavy/limited)
+            {
+                var xSet = new HashSet<long> { 0 };
+                var ySet = new HashSet<long> { 0 };
+
+                foreach (var p in sheet.Placed)
+                {
+                    xSet.Add(p.BBox.MaxX);
+                    ySet.Add(p.BBox.MaxY);
+                }
+
+                var xs = xSet.OrderBy(v => v).Take(100).ToList();
+                var ys = ySet.OrderBy(v => v).Take(100).ToList();
+
+                foreach (var y in ys)
+                {
+                    foreach (var x in xs)
+                    {
+                        Add(x - rp.OffsetBounds.MinX, y - rp.OffsetBounds.MinY);
+                        if (result.Count >= maxCandidates) break;
+                    }
+                    if (result.Count >= maxCandidates) break;
+                }
+            }
+
+            // NFP candidates: MinkowskiSum(PlacedPoly, -MovingPoly)
+            // Use only the *last* placed parts (often near packing frontier) as partners for speed.
+            int partnerCount = Math.Min(maxPartners, sheet.Placed.Count);
+
+            for (int pi = sheet.Placed.Count - 1; pi >= 0 && partnerCount > 0; pi--, partnerCount--)
+            {
+                var placed = sheet.Placed[pi];
+                if (placed.OffsetPoly == null || placed.OffsetPoly.Count < 3)
+                    continue;
+
+                // Compute -A
+                var negA = NegatePath(rp.PolyOffset);
+
+                Paths64 nfpPaths;
+                try
+                {
+                    nfpPaths = MinkowskiSumSafe(placed.OffsetPoly, negA, true);
+                }
+                catch
+                {
+                    // If MinkowskiSum is not available in the installed Clipper2 build,
+                    // we gracefully fall back to Level 1 style candidates (still works).
+                    continue;
+                }
+
+                if (nfpPaths == null || nfpPaths.Count == 0)
+                    continue;
+
+                foreach (var p in nfpPaths)
+                {
+                    if (p == null || p.Count < 3)
+                        continue;
+
+                    int step = Math.Max(1, p.Count / 35); // sample vertices
+                    for (int i = 0; i < p.Count; i += step)
+                    {
+                        var v = p[i];
+                        Add(v.X, v.Y);
+                        if (result.Count >= maxCandidates)
+                            break;
+                    }
+
+                    if (result.Count >= maxCandidates)
+                        break;
+                }
+
+                if (result.Count >= maxCandidates)
+                    break;
+            }
+
+            return result;
+        }
+
+        private static Path64 NegatePath(Path64 p)
+        {
+            if (p == null) return null;
+
+            var r = new Path64(p.Count);
+            foreach (var pt in p)
+                r.Add(new Point64(-pt.X, -pt.Y));
+
+            // orientation can matter in some Minkowski implementations
+            r.Reverse();
+            return r;
+        }
+
+        private static Paths64 MinkowskiSumSafe(Path64 a, Path64 b, bool closed)
+        {
+            // We search the Clipper2 assembly for a static MinkowskiSum that accepts (Path64, Path64, bool)
+            // and returns Paths64.
+            if (_miMinkowskiSum == null)
+            {
+                var asm = typeof(Clipper64).Assembly;
+
+                foreach (var t in asm.GetTypes())
+                {
+                    var methods = t.GetMethods(BindingFlags.Public | BindingFlags.Static);
+                    foreach (var m in methods)
+                    {
+                        if (!string.Equals(m.Name, "MinkowskiSum", StringComparison.Ordinal))
+                            continue;
+
+                        var ps = m.GetParameters();
+                        if (ps.Length != 3)
+                            continue;
+
+                        if (ps[0].ParameterType != typeof(Path64)) continue;
+                        if (ps[1].ParameterType != typeof(Path64)) continue;
+                        if (ps[2].ParameterType != typeof(bool)) continue;
+
+                        if (m.ReturnType != typeof(Paths64))
+                            continue;
+
+                        _miMinkowskiSum = m;
+                        break;
+                    }
+
+                    if (_miMinkowskiSum != null)
+                        break;
+                }
+
+                if (_miMinkowskiSum == null)
+                    throw new InvalidOperationException("Clipper2 MinkowskiSum(Path64, Path64, bool) not found. Check Clipper2Lib package version.");
+            }
+
+            return (Paths64)_miMinkowskiSum.Invoke(null, new object[] { a, b, closed });
+        }
+
+        // ============================================================
+        // Shared helpers (placement checks, caches, geometry)
+        // ============================================================
+
+        private static List<PartDefinition> ExpandInstances(List<PartDefinition> defs)
+        {
+            var instances = new List<PartDefinition>();
+            foreach (var d in defs)
+                for (int i = 0; i < d.Quantity; i++)
+                    instances.Add(d);
+            return instances;
+        }
+
+        private static int SortByAreaDesc(PartDefinition a, PartDefinition b)
+        {
+            long areaA = a.OuterArea2Abs > 0 ? a.OuterArea2Abs : ToInt(a.Width) * ToInt(a.Height);
+            long areaB = b.OuterArea2Abs > 0 ? b.OuterArea2Abs : ToInt(b.Width) * ToInt(b.Height);
+            return areaB.CompareTo(areaA);
+        }
+
+        private static RotatedPoly GetOrCreateRotated(PartDefinition part, int rotDeg, double gapMm, Dictionary<string, RotatedPoly> cache)
+        {
+            string key = part.BlockName + "||" + rotDeg.ToString(CultureInfo.InvariantCulture) + "||gap:" + gapMm.ToString("0.###", CultureInfo.InvariantCulture);
+
+            if (cache.TryGetValue(key, out var rp))
+                return rp;
+
+            Path64 basePoly = part.OuterContour0;
+            if (basePoly == null || basePoly.Count < 3)
+                basePoly = MakeRectPolyScaled(part.MinX, part.MinY, part.MaxX, part.MaxY);
+
+            Path64 rotPoly = RotatePoly(basePoly, rotDeg);
+
+            double delta = (gapMm / 2.0) * SCALE;
+            Path64 offset = OffsetLargest(rotPoly, delta);
+            if (offset == null || offset.Count < 3)
+                offset = rotPoly;
+
+            offset = CleanPath(offset);
+
+            var bbox = GetBounds(offset);
+            var anchors = GetAnchors(offset);
+            long area2Abs = Area2Abs(rotPoly);
+
+            rp = new RotatedPoly
+            {
+                RotDeg = rotDeg,
+                RotRad = rotDeg * Math.PI / 180.0,
+                PolyRot = rotPoly,
+                PolyOffset = offset,
+                OffsetBounds = bbox,
+                Anchors = anchors,
+                RotArea2Abs = area2Abs
+            };
+
+            cache[key] = rp;
+            return rp;
+        }
+
+        private static int CandidateCompare(CandidateIns a, CandidateIns b, RotatedPoly rp)
+        {
+            long aMinY = a.InsY + rp.OffsetBounds.MinY;
+            long bMinY = b.InsY + rp.OffsetBounds.MinY;
+            int cmp = aMinY.CompareTo(bMinY);
+            if (cmp != 0) return cmp;
+
+            long aMinX = a.InsX + rp.OffsetBounds.MinX;
+            long bMinX = b.InsX + rp.OffsetBounds.MinX;
+            return aMinX.CompareTo(bMinX);
+        }
+
+        private static bool CandidateFits(CandidateIns cand, RotatedPoly rp, long usableW, long usableH, out LongRect movedBBox)
+        {
+            long minX = cand.InsX + rp.OffsetBounds.MinX;
+            long minY = cand.InsY + rp.OffsetBounds.MinY;
+            long maxX = cand.InsX + rp.OffsetBounds.MaxX;
+            long maxY = cand.InsY + rp.OffsetBounds.MaxY;
+
+            movedBBox = new LongRect { MinX = minX, MinY = minY, MaxX = maxX, MaxY = maxY };
+
+            if (minX < 0 || minY < 0 || maxX > usableW || maxY > usableH)
+                return false;
+
+            return true;
+        }
+
+        private static bool OverlapsAnything(SheetContourState sheet, Path64 moved, LongRect movedBBox)
+        {
+            foreach (var placed in sheet.Placed)
+            {
+                if (!RectsOverlap(movedBBox, placed.BBox))
+                    continue;
+
+                if (PolygonsOverlapAreaPositive(moved, placed.OffsetPoly))
+                    return true;
+            }
+
+            return false;
+        }
+
+        private static void AddFillLabels(BlockRecord modelSpace, List<SheetContourState> sheets, long usableW, long usableH, double sheetWmm, double sheetHmm)
+        {
+            long usableArea2 = usableW * usableH;
+            foreach (var s in sheets)
+            {
+                double fill = usableArea2 > 0 ? (double)s.UsedArea2Abs / usableArea2 * 100.0 : 0.0;
+
+                modelSpace.Entities.Add(new MText
+                {
+                    Value = $"Fill: {fill:0.0}%",
+                    InsertPoint = new XYZ(s.OriginXmm + sheetWmm - 220.0, s.OriginYmm + sheetHmm + 18.0, 0.0),
+                    Height = 18.0
+                });
+            }
         }
 
         private static void AddPlacedToDwg(
@@ -1307,9 +1632,10 @@ namespace SW2026RibbonAddin.Commands
             modelSpace.Entities.Add(ins);
         }
 
-        // -----------------------------------------
+        // ============================================================
         // Part loading + contour extraction
-        // -----------------------------------------
+        // ============================================================
+
         private static IEnumerable<PartDefinition> LoadPartDefinitions(CadDocument doc, LaserCutRunSettings settings)
         {
             if (doc == null)
@@ -1333,12 +1659,10 @@ namespace SW2026RibbonAddin.Commands
                 if (!int.TryParse(qtyToken, NumberStyles.Integer, CultureInfo.InvariantCulture, out qty))
                     qty = 1;
 
-                // material exact from block token written by combiner
                 string material = "UNKNOWN";
                 MaterialNameCodec.TryExtractFromBlockName(name, out material);
                 material = MaterialNameCodec.Normalize(material);
 
-                // bbox (mm)
                 if (!TryGetBlockBbox(block, out double minX, out double minY, out double maxX, out double maxY))
                     continue;
 
@@ -1347,7 +1671,6 @@ namespace SW2026RibbonAddin.Commands
                 if (w <= 0 || h <= 0)
                     continue;
 
-                // contour (only needed for contour mode; but we can compute always)
                 Path64 contour = null;
                 long area2Abs = 0;
 
@@ -1363,7 +1686,6 @@ namespace SW2026RibbonAddin.Commands
                     area2Abs = 0;
                 }
 
-                // fallback rectangle if contour failed
                 if (contour == null || contour.Count < 3)
                 {
                     contour = MakeRectPolyScaled(minX, minY, maxX, maxY);
@@ -1414,10 +1736,7 @@ namespace SW2026RibbonAddin.Commands
 
                     any = true;
                 }
-                catch
-                {
-                    // ignore entities without bbox
-                }
+                catch { }
             }
 
             if (!any || minX == double.MaxValue || maxX == double.MinValue)
@@ -1425,6 +1744,10 @@ namespace SW2026RibbonAddin.Commands
 
             return true;
         }
+
+        // ============================================================
+        // Contour extraction (segments -> loops -> largest area)
+        // ============================================================
 
         private static Path64 ExtractOuterContourScaled(BlockRecord block, double chordMm, double snapMm)
         {
@@ -1434,7 +1757,6 @@ namespace SW2026RibbonAddin.Commands
             chordMm = Math.Max(0.10, chordMm);
             snapMm = Math.Max(0.01, snapMm);
 
-            // 1) collect segments (scaled)
             var segs = new List<(Point64 A, Point64 B)>();
 
             foreach (var ent in block.Entities)
@@ -1443,9 +1765,7 @@ namespace SW2026RibbonAddin.Commands
 
                 if (ent is Line ln)
                 {
-                    segs.Add((
-                        Snap(ToP64(ln.StartPoint), snapMm),
-                        Snap(ToP64(ln.EndPoint), snapMm)));
+                    segs.Add((Snap(ToP64(ln.StartPoint), snapMm), Snap(ToP64(ln.EndPoint), snapMm)));
                 }
                 else if (ent is Arc arc)
                 {
@@ -1457,25 +1777,19 @@ namespace SW2026RibbonAddin.Commands
                 }
                 else
                 {
-                    // polylines (reflection-safe)
                     if (TryAddPolylineSegments(ent, segs, chordMm, snapMm))
                         continue;
                 }
             }
 
-            // Not enough data
             if (segs.Count < 3)
                 return null;
 
-            // 2) build loops from segments
             var loops = BuildClosedLoops(segs);
-
             if (loops.Count > 0)
             {
-                // pick largest abs area
                 Path64 best = null;
                 long bestArea = 0;
-
                 foreach (var loop in loops)
                 {
                     long a2 = Area2Abs(loop);
@@ -1485,11 +1799,10 @@ namespace SW2026RibbonAddin.Commands
                         best = loop;
                     }
                 }
-
                 return best;
             }
 
-            // 3) fallback: convex hull of all points
+            // fallback: convex hull
             var pts = new List<Point64>(segs.Count * 2);
             foreach (var s in segs)
             {
@@ -1497,8 +1810,7 @@ namespace SW2026RibbonAddin.Commands
                 pts.Add(s.B);
             }
 
-            var hull = ConvexHull(pts);
-            return hull;
+            return ConvexHull(pts);
         }
 
         private static List<Path64> BuildClosedLoops(List<(Point64 A, Point64 B)> segs)
@@ -1507,7 +1819,6 @@ namespace SW2026RibbonAddin.Commands
             if (segs == null || segs.Count == 0)
                 return loops;
 
-            // adjacency map
             var adj = new Dictionary<(long, long), List<int>>();
             var used = new bool[segs.Count];
 
@@ -1537,7 +1848,6 @@ namespace SW2026RibbonAddin.Commands
                 var path = new Path64();
                 path.Add(start);
 
-                // walk
                 Point64 cur = s0.B;
                 var curK = Key(cur);
 
@@ -1554,7 +1864,6 @@ namespace SW2026RibbonAddin.Commands
 
                     int nextSeg = -1;
 
-                    // choose an unused segment, prefer not going back to prev point
                     foreach (int si in incident)
                     {
                         if (used[si]) continue;
@@ -1597,7 +1906,6 @@ namespace SW2026RibbonAddin.Commands
                         nextK = aK2;
                     }
 
-                    // avoid duplicates
                     if (path.Count == 0 || path[path.Count - 1].X != nextPt.X || path[path.Count - 1].Y != nextPt.Y)
                         path.Add(nextPt);
 
@@ -1606,10 +1914,8 @@ namespace SW2026RibbonAddin.Commands
                     cur = nextPt;
                 }
 
-                // closed?
                 if (curK == startK && path.Count >= 4)
                 {
-                    // remove last duplicate if it equals first
                     if (path.Count > 1 && path[path.Count - 1].X == path[0].X && path[path.Count - 1].Y == path[0].Y)
                         path.RemoveAt(path.Count - 1);
 
@@ -1625,7 +1931,6 @@ namespace SW2026RibbonAddin.Commands
 
         private static bool TryAddPolylineSegments(Entity ent, List<(Point64 A, Point64 B)> segs, double chordMm, double snapMm)
         {
-            // Supports both LwPolyline and Polyline (reflection-safe for vertex access + bulge)
             try
             {
                 var t = ent.GetType();
@@ -1668,9 +1973,7 @@ namespace SW2026RibbonAddin.Commands
 
                     if (Math.Abs(v1.Bulge) < 1e-12)
                     {
-                        segs.Add((
-                            Snap(ToP64(v1.X, v1.Y), snapMm),
-                            Snap(ToP64(v2.X, v2.Y), snapMm)));
+                        segs.Add((Snap(ToP64(v1.X, v1.Y), snapMm), Snap(ToP64(v2.X, v2.Y), snapMm)));
                     }
                     else
                     {
@@ -1704,10 +2007,6 @@ namespace SW2026RibbonAddin.Commands
                     if (bv is double bd) bulge = bd;
                 }
 
-                // Common patterns:
-                // - X / Y properties
-                // - Location (XYZ)
-                // - Point (XYZ)
                 var px = t.GetProperty("X");
                 var py = t.GetProperty("Y");
 
@@ -1775,18 +2074,16 @@ namespace SW2026RibbonAddin.Commands
 
             double d = Math.Sqrt(Math.Max(0.0, Rabs * Rabs - (L / 2.0) * (L / 2.0)));
 
-            // left normal
             double nx = -dy / L;
             double ny = dx / L;
 
-            // bulge sign controls center side
             double sign = b >= 0 ? 1.0 : -1.0;
 
             double cx = mx + sign * nx * d;
             double cy = my + sign * ny * d;
 
             double a1 = Math.Atan2(y1 - cy, x1 - cx);
-            // sweep = theta
+
             int segCount = Math.Max(8, (int)Math.Ceiling((Rabs * Math.Abs(theta)) / Math.Max(0.10, chordMm)));
             segCount = Math.Min(segCount, 720);
 
@@ -1805,21 +2102,11 @@ namespace SW2026RibbonAddin.Commands
             }
         }
 
-        private static void AddArcSegments(
-            List<(Point64 A, Point64 B)> segs,
-            XYZ center,
-            double radius,
-            double startAngle,
-            double endAngle,
-            double chordMm,
-            double snapMm)
+        private static void AddArcSegments(List<(Point64 A, Point64 B)> segs, XYZ center, double radius, double startAngle, double endAngle, double chordMm, double snapMm)
         {
-            // DXF arc angles are generally degrees; SolidWorks exports usually degrees.
-            // If your file is radians, you can switch here.
             double sa = DegreesToRadiansIfNeeded(startAngle);
             double ea = DegreesToRadiansIfNeeded(endAngle);
 
-            // CCW sweep
             double sweep = ea - sa;
             while (sweep < 0) sweep += 2.0 * Math.PI;
             if (sweep <= 1e-12) sweep = 2.0 * Math.PI;
@@ -1864,18 +2151,15 @@ namespace SW2026RibbonAddin.Commands
 
         private static double DegreesToRadiansIfNeeded(double angle)
         {
-            // If value is > 2π by a lot, assume degrees.
-            if (Math.Abs(angle) > 10.0) // 10 rad ~ 572°
+            if (Math.Abs(angle) > 10.0)
                 return angle * Math.PI / 180.0;
-
-            // Many SolidWorks exports have 0/90/180/270 => >10 triggers degrees, so OK.
-            // Small angles could be ambiguous; leave as-is.
             return angle;
         }
 
-        // -----------------------------------------
+        // ============================================================
         // Polygon helpers (Clipper units)
-        // -----------------------------------------
+        // ============================================================
+
         private static long ToInt(double mm) => (long)Math.Round(mm * SCALE);
 
         private static Point64 ToP64(XYZ p) => new Point64(ToInt(p.X), ToInt(p.Y));
@@ -1908,11 +2192,10 @@ namespace SW2026RibbonAddin.Commands
                 prev = cur;
             }
 
-            // If last == first, drop last
             if (res.Count > 1 && res[0].X == res[res.Count - 1].X && res[0].Y == res[res.Count - 1].Y)
                 res.RemoveAt(res.Count - 1);
 
-            return res.Count >= 3 ? res : res;
+            return res;
         }
 
         private static Path64 MakeRectPolyScaled(double minX, double minY, double maxX, double maxY)
@@ -1922,14 +2205,13 @@ namespace SW2026RibbonAddin.Commands
             long x2 = ToInt(maxX);
             long y2 = ToInt(maxY);
 
-            var p = new Path64
+            return new Path64
             {
                 new Point64(x1, y1),
                 new Point64(x2, y1),
                 new Point64(x2, y2),
                 new Point64(x1, y2)
             };
-            return p;
         }
 
         private static Path64 RotatePoly(Path64 p, int rotDeg)
@@ -1946,20 +2228,11 @@ namespace SW2026RibbonAddin.Commands
 
                 switch (rotDeg)
                 {
-                    case 0:
-                        r.Add(new Point64(x, y));
-                        break;
-                    case 90:
-                        r.Add(new Point64(-y, x));
-                        break;
-                    case 180:
-                        r.Add(new Point64(-x, -y));
-                        break;
-                    case 270:
-                        r.Add(new Point64(y, -x));
-                        break;
+                    case 0: r.Add(new Point64(x, y)); break;
+                    case 90: r.Add(new Point64(-y, x)); break;
+                    case 180: r.Add(new Point64(-x, -y)); break;
+                    case 270: r.Add(new Point64(y, -x)); break;
                     default:
-                        // should never happen in our rotations list
                         double rad = rotDeg * Math.PI / 180.0;
                         long xr = (long)Math.Round(x * Math.Cos(rad) - y * Math.Sin(rad));
                         long yr = (long)Math.Round(x * Math.Sin(rad) + y * Math.Cos(rad));
@@ -1977,7 +2250,6 @@ namespace SW2026RibbonAddin.Commands
                 return null;
 
             var co = new ClipperOffset();
-            // Round is safer for offsets (reduces spikes on acute angles)
             co.AddPath(poly, JoinType.Round, EndType.Polygon);
 
             var sol = new Paths64();
@@ -1986,7 +2258,6 @@ namespace SW2026RibbonAddin.Commands
             if (sol == null || sol.Count == 0)
                 return null;
 
-            // pick largest abs area
             Path64 best = null;
             long bestArea = 0;
 
@@ -2021,7 +2292,6 @@ namespace SW2026RibbonAddin.Commands
 
         private static Point64[] GetAnchors(Path64 p)
         {
-            // anchors based on extremes
             Point64 bl = p[0], br = p[0], tl = p[0], tr = p[0];
 
             foreach (var pt in p)
@@ -2050,7 +2320,6 @@ namespace SW2026RibbonAddin.Commands
 
         private static bool PolygonsOverlapAreaPositive(Path64 a, Path64 b)
         {
-            // Intersection area > 0 => overlap
             var clipper = new Clipper64();
             clipper.AddSubject(a);
             clipper.AddClip(b);
@@ -2082,8 +2351,6 @@ namespace SW2026RibbonAddin.Commands
             {
                 var a = p[i];
                 var b = p[(i + 1) % n];
-
-                // cross
                 sum += a.X * b.Y - b.X * a.Y;
             }
 
@@ -2095,7 +2362,6 @@ namespace SW2026RibbonAddin.Commands
             if (pts == null)
                 return null;
 
-            // remove duplicates
             var uniq = pts.Distinct().ToList();
             if (uniq.Count < 3)
                 return null;
@@ -2137,9 +2403,10 @@ namespace SW2026RibbonAddin.Commands
             return hull.Count >= 3 ? hull : null;
         }
 
-        // -----------------------------------------
-        // Grouping (material exact)
-        // -----------------------------------------
+        // ============================================================
+        // Grouping by exact material
+        // ============================================================
+
         private static Dictionary<string, string> BuildGroups(List<PartDefinition> defs, LaserCutRunSettings settings)
         {
             var groups = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
@@ -2198,9 +2465,10 @@ namespace SW2026RibbonAddin.Commands
             return null;
         }
 
-        // -----------------------------------------
-        // Option 2 preview filtering
-        // -----------------------------------------
+        // ============================================================
+        // Preview filtering (Option 2)
+        // ============================================================
+
         private static void FilterSourcePreviewToTheseBlocks(CadDocument doc, HashSet<string> keepBlockNames)
         {
             if (doc == null || keepBlockNames == null || keepBlockNames.Count == 0)
@@ -2214,7 +2482,6 @@ namespace SW2026RibbonAddin.Commands
 
             var keepRanges = new List<(double minX, double maxX)>();
 
-            // Build lookup bbox per block
             var defMap = new Dictionary<string, (double minX, double minY, double maxX, double maxY)>(StringComparer.OrdinalIgnoreCase);
             foreach (var br in doc.BlockRecords)
             {
@@ -2278,10 +2545,6 @@ namespace SW2026RibbonAddin.Commands
                     if (!IsNear(mt.InsertPoint.X))
                         remove.Add(e);
                 }
-                else
-                {
-                    // keep other entities (axes, etc.) to avoid removing useful stuff
-                }
             }
 
             foreach (var e in remove.Distinct())
@@ -2329,9 +2592,10 @@ namespace SW2026RibbonAddin.Commands
                 minX = minY = maxX = maxY = 0.0;
         }
 
-        // -----------------------------------------
-        // DWG visuals (sheet outline + labels)
-        // -----------------------------------------
+        // ============================================================
+        // DWG visuals + log
+        // ============================================================
+
         private static void DrawSheetOutline(
             double originXmm,
             double originYmm,
@@ -2360,19 +2624,6 @@ namespace SW2026RibbonAddin.Commands
             });
         }
 
-        private static void AddSheetLabel(BlockRecord modelSpace, double originXmm, double originYmm, double sheetWmm, double sheetHmm, int sheetIndex, double fillPercent)
-        {
-            modelSpace.Entities.Add(new MText
-            {
-                Value = $"Fill: {fillPercent:0.0}%",
-                InsertPoint = new XYZ(originXmm + sheetWmm - 220.0, originYmm + sheetHmm + 18.0, 0.0),
-                Height = 18.0
-            });
-        }
-
-        // -----------------------------------------
-        // Log
-        // -----------------------------------------
         private static void AppendNestLog(
             string logPath,
             string thicknessFile,
@@ -2405,10 +2656,7 @@ namespace SW2026RibbonAddin.Commands
 
                 File.AppendAllText(logPath, sb.ToString(), Encoding.UTF8);
             }
-            catch
-            {
-                // ignore logging failures
-            }
+            catch { }
         }
     }
 }
