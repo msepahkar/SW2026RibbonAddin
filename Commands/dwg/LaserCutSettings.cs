@@ -1,4 +1,7 @@
-﻿namespace SW2026RibbonAddin.Commands
+﻿using System;
+using System.IO;
+
+namespace SW2026RibbonAddin.Commands
 {
     internal enum NestingMode
     {
@@ -25,9 +28,11 @@
 
     internal sealed class LaserCutRunSettings
     {
+        // Not heavily used now because every job has its own sheet dims,
+        // but we keep it for logging and future features.
         public SheetPreset DefaultSheet { get; set; }
 
-        // Material behavior (exact SolidWorks material string written into the block name by DWG export)
+        // These are ALWAYS enabled now (your request).
         public bool SeparateByMaterialExact { get; set; } = true;
         public bool OutputOneDwgPerMaterial { get; set; } = true;
         public bool KeepOnlyCurrentMaterialInSourcePreview { get; set; } = true;
@@ -43,11 +48,27 @@
         public int MaxCandidatesPerTry { get; set; } = 7000;
         public int MaxNfpPartnersPerTry { get; set; } = 80;
 
-        // Optional compatibility alias (if any of your other files used this older name)
+        // Compatibility alias (if any older file uses this name)
         public bool SeparateByMaterial
         {
             get => SeparateByMaterialExact;
             set => SeparateByMaterialExact = value;
         }
+    }
+
+    internal sealed class LaserNestJob
+    {
+        public bool Enabled { get; set; } = true;
+
+        public string ThicknessFilePath { get; set; }
+        public double ThicknessMm { get; set; }
+
+        // EXACT material string from SolidWorks (stored in block name)
+        public string MaterialExact { get; set; }
+
+        // Sheet for THIS job (material + thickness)
+        public SheetPreset Sheet { get; set; }
+
+        public string ThicknessFileName => Path.GetFileName(ThicknessFilePath) ?? "";
     }
 }

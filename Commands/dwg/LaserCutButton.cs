@@ -1,5 +1,7 @@
 ﻿using System;
+using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Windows.Forms;
 
 namespace SW2026RibbonAddin.Commands
@@ -9,7 +11,7 @@ namespace SW2026RibbonAddin.Commands
         public string Id => "LaserCut";
 
         public string DisplayName => "Laser\nnesting";
-        public string Tooltip => "Nest thickness_*.dwg files into sheets (Fast / Contour L1 / Contour L2).";
+        public string Tooltip => "Nest thickness_*.dwg into sheets (per material / per thickness).";
         public string Hint => "Laser cut nesting";
 
         public string SmallIconFile => "laser_cut_20.png";
@@ -26,18 +28,54 @@ namespace SW2026RibbonAddin.Commands
             if (string.IsNullOrWhiteSpace(folder))
                 return;
 
+            // 1) Scan available (Material x Thickness) jobs BEFORE showing options
+            List<LaserNestJob> jobs;
+            try
+            {
+                Cursor.Current = Cursors.WaitCursor;
+                jobs = DwgLaserNester.ScanJobsForFolder(folder);
+            }
+            finally
+            {
+                Cursor.Current = Cursors.Default;
+            }
+
+            if (jobs == null || jobs.Count == 0)
+            {
+                MessageBox.Show(
+                    "No parts found in thickness_*.dwg files.\r\n\r\nMake sure you ran Combine DWG first.",
+                    "Laser nesting",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Information);
+                return;
+            }
+
+            // default run settings (the 3 checkboxes are ALWAYS enabled now)
             LaserCutRunSettings settings;
-            using (var dlg = new LaserCutOptionsForm())
+            List<LaserNestJob> selectedJobs;
+
+            using (var dlg = new LaserCutOptionsForm(folder, jobs))
             {
                 if (dlg.ShowDialog() != DialogResult.OK)
                     return;
 
                 settings = dlg.Settings;
+                selectedJobs = dlg.SelectedJobs;
+            }
+
+            if (selectedJobs == null || selectedJobs.Count == 0)
+            {
+                MessageBox.Show(
+                    "Nothing selected.\r\n\r\nSelect at least one thickness/material to run nesting.",
+                    "Laser nesting",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Information);
+                return;
             }
 
             try
             {
-                DwgLaserNester.NestFolder(folder, settings, showUi: true);
+                DwgLaserNester.NestJobs(folder, selectedJobs, settings, showUi: true);
             }
             catch (Exception ex)
             {

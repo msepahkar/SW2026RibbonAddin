@@ -1,6 +1,5 @@
 ﻿using System;
-using System.IO;
-using System.Text;
+using System.Collections.Generic;
 using System.Windows.Forms;
 
 namespace SW2026RibbonAddin.Commands
@@ -10,9 +9,10 @@ namespace SW2026RibbonAddin.Commands
         public string Id => "BatchCombineNest";
 
         public string DisplayName => "Batch\nCombine+Nest";
-        public string Tooltip => "Runs Combine DWG (builds thickness_*.dwg) then runs Laser nesting on the same folder.";
-        public string Hint => "Combine then Nest";
+        public string Tooltip => "Runs Combine DWG on a main folder, then nests thickness_*.dwg per exact material + thickness.";
+        public string Hint => "Batch combine + nest";
 
+        // Reuse combine icons (change if you want)
         public string SmallIconFile => "combine_dwg_20.png";
         public string LargeIconFile => "combine_dwg_32.png";
 
@@ -21,70 +21,67 @@ namespace SW2026RibbonAddin.Commands
 
         public bool IsFreeFeature => false;
 
-        public int GetEnableState(AddinContext context) => AddinContext.Enable;
-
         public void Execute(AddinContext context)
         {
             string mainFolder = SelectMainFolder();
             if (string.IsNullOrWhiteSpace(mainFolder))
                 return;
 
-            if (!Directory.Exists(mainFolder))
-            {
-                MessageBox.Show(
-                    "Folder does not exist:\r\n" + mainFolder,
-                    "Batch Combine+Nest",
-                    MessageBoxButtons.OK,
-                    MessageBoxIcon.Warning);
-                return;
-            }
-
             try
             {
-                // 1) Combine (creates all_parts.csv + thickness_*.dwg in mainFolder)
-                var combineResult = DwgBatchCombiner.Combine(mainFolder, showUi: false);
+                // 1) Combine
+                DwgBatchCombiner.Combine(mainFolder);
 
-                // 2) Nest options
+                // 2) Scan nesting jobs (Material x Thickness)
+                var jobs = DwgLaserNester.ScanJobsForFolder(mainFolder);
+                if (jobs == null || jobs.Count == 0)
+                {
+                    MessageBox.Show(
+                        "No thickness_*.dwg files were found after combining.\r\n\r\n" +
+                        "Make sure the main folder contains job subfolders with parts.csv + DWGs.",
+                        "Batch Combine + Nest",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Information);
+                    return;
+                }
+
+                // 3) Show the new options dialog (needs folder + jobs)
                 LaserCutRunSettings settings;
-                using (var dlg = new LaserCutOptionsForm())
+                List<LaserNestJob> selectedJobs;
+
+                using (var dlg = new LaserCutOptionsForm(mainFolder, jobs))
                 {
                     if (dlg.ShowDialog() != DialogResult.OK)
                         return;
 
                     settings = dlg.Settings;
+                    selectedJobs = dlg.SelectedJobs;
                 }
 
-                // 3) Nest folder (reads thickness_*.dwg and outputs nested DWGs)
-                DwgLaserNester.NestFolder(mainFolder, settings, showUi: false);
+                if (selectedJobs == null || selectedJobs.Count == 0)
+                {
+                    MessageBox.Show(
+                        "Nothing selected.",
+                        "Batch Combine + Nest",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Information);
+                    return;
+                }
 
-                // Final message (single message for the whole pipeline)
-                var sb = new StringBuilder();
-                sb.AppendLine("Batch Combine+Nest finished.");
-                sb.AppendLine();
-                sb.AppendLine("Folder:");
-                sb.AppendLine(mainFolder);
-                sb.AppendLine();
-                sb.AppendLine("Outputs:");
-                sb.AppendLine("- all_parts.csv");
-                sb.AppendLine("- thickness_*.dwg");
-                sb.AppendLine("- thickness_*_nested_*.dwg");
-                sb.AppendLine("- batch_nest_summary.txt");
-
-                MessageBox.Show(
-                    sb.ToString(),
-                    "Batch Combine+Nest",
-                    MessageBoxButtons.OK,
-                    MessageBoxIcon.Information);
+                // 4) Run nesting batch
+                DwgLaserNester.NestJobs(mainFolder, selectedJobs, settings, showUi: true);
             }
             catch (Exception ex)
             {
                 MessageBox.Show(
-                    "Batch Combine+Nest failed:\r\n\r\n" + ex.Message,
-                    "Batch Combine+Nest",
+                    "Batch Combine + Nest failed:\r\n\r\n" + ex.Message,
+                    "Batch Combine + Nest",
                     MessageBoxButtons.OK,
                     MessageBoxIcon.Error);
             }
         }
+
+        public int GetEnableState(AddinContext context) => AddinContext.Enable;
 
         private static string SelectMainFolder()
         {
