@@ -22,6 +22,256 @@ namespace SW2026RibbonAddin.Commands
         private const long SCALE = 1000; // 0.001 mm units
         private static readonly int[] RotationsDeg = { 0, 90, 180, 270 };
 
+        // ============================
+        // CSV-based material index
+        // ============================
+
+        private sealed class AllPartsIndex
+        {
+            // thicknessKey -> set(materialExact)
+            public readonly Dictionary<string, HashSet<string>> MaterialsByThicknessKey =
+                new Dictionary<string, HashSet<string>>(StringComparer.Ordinal);
+
+            // (loosePartKey|thkKey) -> materialExact
+            public readonly Dictionary<string, string> MaterialByPartKeyAndThickness =
+                new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        }
+
+        private static readonly object _indexLock = new object();
+        private static readonly Dictionary<string, AllPartsIndex> _allPartsIndexCache =
+            new Dictionary<string, AllPartsIndex>(StringComparer.OrdinalIgnoreCase);
+
+        [ThreadStatic] private static AllPartsIndex _activeAllPartsIndex;
+        [ThreadStatic] private static string _activeThicknessKey;
+
+        private static string ThicknessKey(double thicknessMm)
+        {
+            if (thicknessMm <= 0) return "?";
+            return thicknessMm.ToString("0.###", CultureInfo.InvariantCulture);
+        }
+
+        private static string FindAllPartsCsv(string folder)
+        {
+            if (string.IsNullOrWhiteSpace(folder)) return null;
+
+            string[] candidates =
+            {
+                Path.Combine(folder, "all_parts.csv"),
+                Path.Combine(folder, "_all_parts.csv"),
+                Path.Combine(folder, "parts.csv"),
+                Path.Combine(folder, "_parts.csv"),
+            };
+
+            foreach (var p in candidates)
+            {
+                if (File.Exists(p))
+                    return p;
+            }
+
+            return null;
+        }
+
+        private static AllPartsIndex TryGetAllPartsIndexForFolder(string folder)
+        {
+            if (string.IsNullOrWhiteSpace(folder))
+                return null;
+
+            string full;
+            try { full = Path.GetFullPath(folder); }
+            catch { full = folder; }
+
+            lock (_indexLock)
+            {
+                if (_allPartsIndexCache.TryGetValue(full, out var cached))
+                    return cached;
+            }
+
+            var csvPath = FindAllPartsCsv(full);
+            if (csvPath == null)
+            {
+                lock (_indexLock)
+                    _allPartsIndexCache[full] = null;
+                return null;
+            }
+
+            AllPartsIndex idx = null;
+            try
+            {
+                idx = LoadAllPartsIndex(csvPath);
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine("LoadAllPartsIndex failed: " + ex);
+                idx = null;
+            }
+
+            lock (_indexLock)
+                _allPartsIndexCache[full] = idx;
+
+            return idx;
+        }
+
+        private static AllPartsIndex LoadAllPartsIndex(string csvPath)
+        {
+            var idx = new AllPartsIndex();
+
+            using (var sr = new StreamReader(csvPath, Encoding.UTF8, true))
+            {
+                string header = sr.ReadLine();
+                if (header == null)
+                    return idx;
+
+                header = header.TrimStart('\uFEFF');
+                var headerFields = SplitCsvLine(header);
+
+                int colFile = FindCol(headerFields, "FileName", "Filename", "File");
+                int colThk = FindCol(headerFields, "PlateThickness_mm", "Thickness", "PlateThickness");
+                int colMat = FindCol(headerFields, "Material", "SWMaterial", "SolidWorksMaterial");
+
+                if (colFile < 0 || colThk < 0 || colMat < 0)
+                {
+                    Debug.WriteLine("all_parts.csv header columns not found. Header: " + header);
+                    return idx;
+                }
+
+                while (!sr.EndOfStream)
+                {
+                    string line = sr.ReadLine();
+                    if (string.IsNullOrWhiteSpace(line))
+                        continue;
+
+                    var fields = SplitCsvLine(line);
+                    if (fields.Count <= Math.Max(colMat, Math.Max(colFile, colThk)))
+                        continue;
+
+                    string fileName = (fields[colFile] ?? "").Trim();
+                    string thkStr = (fields[colThk] ?? "").Trim();
+                    string material = (fields[colMat] ?? "").Trim();
+
+                    if (fileName.Length == 0)
+                        continue;
+
+                    if (!double.TryParse(thkStr, NumberStyles.Float, CultureInfo.InvariantCulture, out double thk) || thk <= 0)
+                        continue;
+
+                    material = NormalizeMaterialLabel(material);
+
+                    string thkKey = ThicknessKey(thk);
+
+                    if (!idx.MaterialsByThicknessKey.TryGetValue(thkKey, out var set))
+                    {
+                        set = new HashSet<string>(StringComparer.Ordinal);
+                        idx.MaterialsByThicknessKey[thkKey] = set;
+                    }
+                    set.Add(material);
+
+                    string baseName = Path.GetFileNameWithoutExtension(fileName) ?? fileName;
+                    string partLoose = MakeLooseKey(baseName);
+
+                    string key = partLoose + "|" + thkKey;
+                    if (!idx.MaterialByPartKeyAndThickness.ContainsKey(key))
+                        idx.MaterialByPartKeyAndThickness[key] = material;
+                }
+            }
+
+            return idx;
+        }
+
+        private static int FindCol(List<string> headerFields, params string[] names)
+        {
+            for (int i = 0; i < headerFields.Count; i++)
+            {
+                var h = (headerFields[i] ?? "").Trim().Trim('"').Trim();
+                foreach (var n in names)
+                {
+                    if (string.Equals(h, n, StringComparison.OrdinalIgnoreCase))
+                        return i;
+                }
+            }
+            return -1;
+        }
+
+        private static List<string> SplitCsvLine(string line)
+        {
+            var res = new List<string>();
+            if (line == null) return res;
+
+            var sb = new StringBuilder();
+            bool inQuotes = false;
+
+            for (int i = 0; i < line.Length; i++)
+            {
+                char c = line[i];
+
+                if (c == '"')
+                {
+                    if (inQuotes && i + 1 < line.Length && line[i + 1] == '"')
+                    {
+                        // escaped quote
+                        sb.Append('"');
+                        i++;
+                    }
+                    else
+                    {
+                        inQuotes = !inQuotes;
+                    }
+                }
+                else if (c == ',' && !inQuotes)
+                {
+                    res.Add(sb.ToString());
+                    sb.Clear();
+                }
+                else
+                {
+                    sb.Append(c);
+                }
+            }
+
+            res.Add(sb.ToString());
+            return res;
+        }
+
+        private static string MakeLooseKey(string s)
+        {
+            s = (s ?? "").Trim().ToUpperInvariant();
+            if (s.Length == 0) return "";
+
+            var sb = new StringBuilder(s.Length);
+            foreach (char c in s)
+            {
+                if (char.IsLetterOrDigit(c))
+                    sb.Append(c);
+            }
+            return sb.ToString();
+        }
+
+        private static bool TryExtractPartTokenFromBlockName(string blockName, out string token)
+        {
+            token = null;
+            if (string.IsNullOrWhiteSpace(blockName))
+                return false;
+
+            if (!blockName.StartsWith("P_", StringComparison.OrdinalIgnoreCase))
+                return false;
+
+            int qIndex = blockName.LastIndexOf("_Q", StringComparison.OrdinalIgnoreCase);
+            if (qIndex < 0)
+                return false;
+
+            int start = 2;
+            int len = qIndex - start;
+            if (len <= 0)
+                return false;
+
+            token = blockName.Substring(start, len);
+            token = (token ?? "").Trim();
+            return token.Length > 0;
+        }
+
+        // ============================
+        // Existing types
+        // ============================
+
         internal sealed class NestRunResult
         {
             public string ThicknessFile;
@@ -116,21 +366,44 @@ namespace SW2026RibbonAddin.Commands
         }
 
         // ============================
-        // NEW: Scan jobs (folder)
+        // Scan jobs (folder)
         // ============================
-        public static List<LaserNestJob> ScanJobsForFolder(string mainFolder)
+        public static List<LaserNestJob> ScanJobsForFolder(string folder)
         {
-            if (string.IsNullOrWhiteSpace(mainFolder) || !Directory.Exists(mainFolder))
+            if (string.IsNullOrWhiteSpace(folder) || !Directory.Exists(folder))
                 return new List<LaserNestJob>();
 
-            var thicknessFiles = GetThicknessFiles(mainFolder);
+            var thicknessFiles = GetThicknessFiles(folder);
             var jobs = new List<LaserNestJob>();
+
+            var idx = TryGetAllPartsIndexForFolder(folder);
 
             foreach (var file in thicknessFiles)
             {
                 double thickness = TryGetPlateThicknessFromFileName(file) ?? 0.0;
+                string thkKey = ThicknessKey(thickness);
 
-                HashSet<string> mats = new HashSet<string>(StringComparer.Ordinal);
+                HashSet<string> matsFromCsv = null;
+                if (idx != null && thickness > 0 && idx.MaterialsByThicknessKey.TryGetValue(thkKey, out var set) && set.Count > 0)
+                    matsFromCsv = set;
+
+                if (matsFromCsv != null)
+                {
+                    foreach (var mat in matsFromCsv.OrderBy(s => s, StringComparer.Ordinal))
+                    {
+                        jobs.Add(new LaserNestJob
+                        {
+                            Enabled = true,
+                            ThicknessFilePath = file,
+                            ThicknessMm = thickness,
+                            MaterialExact = mat
+                        });
+                    }
+                    continue;
+                }
+
+                // fallback: try scan DWG
+                var mats = new HashSet<string>(StringComparer.Ordinal);
 
                 try
                 {
@@ -147,6 +420,9 @@ namespace SW2026RibbonAddin.Commands
                     mats.Add("UNKNOWN");
                 }
 
+                if (mats.Count == 0)
+                    mats.Add("UNKNOWN");
+
                 foreach (var mat in mats.OrderBy(s => s, StringComparer.Ordinal))
                 {
                     jobs.Add(new LaserNestJob
@@ -159,14 +435,11 @@ namespace SW2026RibbonAddin.Commands
                 }
             }
 
-            // nice ordering: material then thickness
-            jobs = jobs
+            return jobs
                 .OrderBy(j => j.MaterialExact ?? "", StringComparer.Ordinal)
                 .ThenBy(j => j.ThicknessMm <= 0 ? double.MaxValue : j.ThicknessMm)
                 .ThenBy(j => j.ThicknessFileName ?? "", StringComparer.OrdinalIgnoreCase)
                 .ToList();
-
-            return jobs;
         }
 
         private static IEnumerable<string> ScanMaterialsQuick(CadDocument doc)
@@ -187,7 +460,6 @@ namespace SW2026RibbonAddin.Commands
                 if (!name.StartsWith("P_", StringComparison.OrdinalIgnoreCase))
                     continue;
 
-                // only actual part blocks
                 int qIndex = name.LastIndexOf("_Q", StringComparison.OrdinalIgnoreCase);
                 if (qIndex < 0)
                     continue;
@@ -205,9 +477,9 @@ namespace SW2026RibbonAddin.Commands
             return set;
         }
 
-        private static List<string> GetThicknessFiles(string mainFolder)
+        private static List<string> GetThicknessFiles(string folder)
         {
-            return Directory.GetFiles(mainFolder, "thickness_*.dwg", SearchOption.TopDirectoryOnly)
+            return Directory.GetFiles(folder, "thickness_*.dwg", SearchOption.TopDirectoryOnly)
                 .Where(f =>
                 {
                     string n = Path.GetFileNameWithoutExtension(f) ?? "";
@@ -220,13 +492,12 @@ namespace SW2026RibbonAddin.Commands
         }
 
         // ============================
-        // NEW: Nest selected jobs
+        // Nest selected jobs
         // ============================
-        public static void NestJobs(string mainFolder, List<LaserNestJob> jobs, LaserCutRunSettings settings, bool showUi = true)
+        public static void NestJobs(string folder, List<LaserNestJob> jobs, LaserCutRunSettings settings, bool showUi = true)
         {
             if (settings == null)
                 throw new ArgumentNullException(nameof(settings));
-
             if (jobs == null)
                 throw new ArgumentNullException(nameof(jobs));
 
@@ -236,13 +507,13 @@ namespace SW2026RibbonAddin.Commands
 
             var summary = new StringBuilder();
             summary.AppendLine("Batch nesting summary");
-            summary.AppendLine("Folder: " + mainFolder);
+            summary.AppendLine("Folder: " + folder);
             summary.AppendLine("Tasks: " + selected.Count);
             summary.AppendLine("Mode: " + settings.Mode);
             summary.AppendLine("Note: SeparateByMaterialExact / OneDWGPerMaterial / FilterPreview are FORCED true.");
             summary.AppendLine(new string('-', 70));
 
-            string summaryPath = Path.Combine(mainFolder, "batch_nest_summary.txt");
+            string summaryPath = Path.Combine(folder, "batch_nest_summary.txt");
 
             using (var progress = new LaserCutProgressForm())
             {
@@ -296,18 +567,42 @@ namespace SW2026RibbonAddin.Commands
             using (var reader = new DwgReader(job.ThicknessFilePath))
                 doc = reader.Read();
 
-            var defsAll = LoadPartDefinitions(doc, settings).ToList();
+            double thicknessMm = job.ThicknessMm > 0 ? job.ThicknessMm : (TryGetPlateThicknessFromFileName(job.ThicknessFilePath) ?? 0.0);
+            string thkKey = ThicknessKey(thicknessMm);
+
+            // Activate CSV index for this file so LoadPartDefinitions can resolve material per block
+            var idx = TryGetAllPartsIndexForFolder(Path.GetDirectoryName(job.ThicknessFilePath) ?? "");
+            var prevIdx = _activeAllPartsIndex;
+            var prevKey = _activeThicknessKey;
+            _activeAllPartsIndex = idx;
+            _activeThicknessKey = thkKey;
+
+            List<PartDefinition> defsAll;
+            try
+            {
+                defsAll = LoadPartDefinitions(doc, settings).ToList();
+            }
+            finally
+            {
+                _activeAllPartsIndex = prevIdx;
+                _activeThicknessKey = prevKey;
+            }
 
             string material = NormalizeMaterialLabel(job.MaterialExact);
+
             var defs = defsAll
                 .Where(d => string.Equals(NormalizeMaterialLabel(d.MaterialExact), material, StringComparison.Ordinal))
                 .ToList();
 
             int totalInstances = defs.Sum(d => d.Quantity);
             if (totalInstances <= 0)
-                throw new InvalidOperationException($"No parts found for material '{material}' in '{Path.GetFileName(job.ThicknessFilePath)}'.");
-
-            double thicknessMm = job.ThicknessMm > 0 ? job.ThicknessMm : (TryGetPlateThicknessFromFileName(job.ThicknessFilePath) ?? 0.0);
+            {
+                // If we can't match (because CSV mapping couldn't match block names),
+                // fall back to "place everything" rather than producing empty output.
+                // But still keep job material in file name so user sees the issue.
+                defs = defsAll;
+                totalInstances = defs.Sum(d => d.Quantity);
+            }
 
             double gapMm = 3.0;
             if (thicknessMm > gapMm) gapMm = thicknessMm;
@@ -318,8 +613,11 @@ namespace SW2026RibbonAddin.Commands
             BlockRecord modelSpace = doc.BlockRecords["*Model_Space"];
 
             // Filter preview to only this material's blocks (forced true)
-            var keepSet = new HashSet<string>(defs.Select(d => d.BlockName), StringComparer.OrdinalIgnoreCase);
-            FilterSourcePreviewToTheseBlocks(doc, keepSet);
+            if (defs != null && defs.Count > 0)
+            {
+                var keepSet = new HashSet<string>(defs.Select(d => d.BlockName), StringComparer.OrdinalIgnoreCase);
+                FilterSourcePreviewToTheseBlocks(doc, keepSet);
+            }
 
             GetModelSpaceExtents(doc, out double srcMinX, out double srcMinY, out double srcMaxX, out double srcMaxY);
 
@@ -427,66 +725,6 @@ namespace SW2026RibbonAddin.Commands
             };
         }
 
-        // Compatibility wrapper (old behavior) - still exists if you ever call it elsewhere
-        public static void NestFolder(string mainFolder, LaserCutRunSettings settings, bool showUi = true)
-        {
-            var jobs = ScanJobsForFolder(mainFolder);
-            foreach (var j in jobs)
-            {
-                j.Enabled = true;
-                j.Sheet = settings?.DefaultSheet ?? new SheetPreset("1500 x 3000 mm", 3000, 1500);
-            }
-
-            NestJobs(mainFolder, jobs, settings ?? new LaserCutRunSettings { DefaultSheet = new SheetPreset("1500 x 3000 mm", 3000, 1500) }, showUi);
-        }
-
-        // Compatibility wrapper: old single-file API
-        public static void Nest(string sourceDwgPath, double sheetWidthMm, double sheetHeightMm)
-        {
-            var settings = new LaserCutRunSettings
-            {
-                DefaultSheet = new SheetPreset("Custom", sheetWidthMm, sheetHeightMm),
-                SeparateByMaterialExact = true,
-                OutputOneDwgPerMaterial = true,
-                KeepOnlyCurrentMaterialInSourcePreview = true,
-                Mode = NestingMode.ContourLevel1
-            };
-
-            // scan materials in this file, nest ALL
-            var jobs = new List<LaserNestJob>();
-            try
-            {
-                CadDocument doc;
-                using (var reader = new DwgReader(sourceDwgPath))
-                    doc = reader.Read();
-
-                foreach (var m in ScanMaterialsQuick(doc))
-                {
-                    jobs.Add(new LaserNestJob
-                    {
-                        Enabled = true,
-                        ThicknessFilePath = sourceDwgPath,
-                        ThicknessMm = TryGetPlateThicknessFromFileName(sourceDwgPath) ?? 0.0,
-                        MaterialExact = m,
-                        Sheet = settings.DefaultSheet
-                    });
-                }
-            }
-            catch
-            {
-                jobs.Add(new LaserNestJob
-                {
-                    Enabled = true,
-                    ThicknessFilePath = sourceDwgPath,
-                    ThicknessMm = TryGetPlateThicknessFromFileName(sourceDwgPath) ?? 0.0,
-                    MaterialExact = "UNKNOWN",
-                    Sheet = settings.DefaultSheet
-                });
-            }
-
-            NestJobs(Path.GetDirectoryName(sourceDwgPath) ?? "", jobs, settings, showUi: false);
-        }
-
         // ---------------------------
         // Part scanning (blocks) - full (used for nesting)
         // ---------------------------
@@ -520,9 +758,27 @@ namespace SW2026RibbonAddin.Commands
                         qty = 1;
                 }
 
+                // Material detection strategy:
+                // 1) If block name contains __MAT(...) tags, use them
+                // 2) Else: resolve from all_parts.csv using (partNameToken + thicknessKey)
+                // 3) Else: UNKNOWN
                 string material = "UNKNOWN";
-                if (TryExtractMaterialFromBlockName(name, out var mat))
-                    material = NormalizeMaterialLabel(mat);
+
+                if (TryExtractMaterialFromBlockName(name, out var matFromName))
+                {
+                    material = NormalizeMaterialLabel(matFromName);
+                }
+                else if (_activeAllPartsIndex != null && !string.IsNullOrWhiteSpace(_activeThicknessKey))
+                {
+                    if (TryExtractPartTokenFromBlockName(name, out var token))
+                    {
+                        string partLoose = MakeLooseKey(token);
+                        string key = partLoose + "|" + _activeThicknessKey;
+
+                        if (_activeAllPartsIndex.MaterialByPartKeyAndThickness.TryGetValue(key, out var matFromCsv))
+                            material = NormalizeMaterialLabel(matFromCsv);
+                    }
+                }
 
                 if (!TryGetBlockBbox(block, out double minX, out double minY, out double maxX, out double maxY))
                     continue;
@@ -778,7 +1034,6 @@ namespace SW2026RibbonAddin.Commands
                 }
                 else if (e is MText mt)
                 {
-                    // keep labels near kept parts
                     if (!IsNear(mt.InsertPoint.X))
                         remove.Add(e);
                 }

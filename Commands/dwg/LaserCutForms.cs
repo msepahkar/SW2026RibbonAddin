@@ -160,10 +160,10 @@ namespace SW2026RibbonAddin.Commands
             };
             grp.Controls.Add(_chord);
 
-            grp.Controls.Add(new Label { Left = 320, Top = 96, Width = 160, Text = "Snap tol (mm):" });
+            grp.Controls.Add(new Label { Left = 310, Top = 96, Width = 110, Text = "Snap tol (mm):" });
             _snap = new NumericUpDown
             {
-                Left = 460,
+                Left = 430,
                 Top = 92,
                 Width = 90,
                 DecimalPlaces = 2,
