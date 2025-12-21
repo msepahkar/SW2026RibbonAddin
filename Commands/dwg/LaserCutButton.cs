@@ -1,15 +1,29 @@
-﻿using System;
+﻿// Commands\dwg\LaserCutButton.cs
+// DROP-IN: Replace the entire file with this.
+// Requires NuGet: Clipper2Lib
+
+using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Text;
 using System.Windows.Forms;
+
 using ACadSharp;
 using ACadSharp.Entities;
 using ACadSharp.IO;
 using ACadSharp.Tables;
-using CSMath;
+
+using CSMath;           // XYZ
+using Clipper2Lib;      // Clipper64, Paths64, Path64, Point64, ClipperOffset, etc.
+
+using WinPoint = System.Drawing.Point;
+using WinSize = System.Drawing.Size;
+using WinContentAlignment = System.Drawing.ContentAlignment;
+using ClipperClipType = Clipper2Lib.ClipType;
+
 
 namespace SW2026RibbonAddin.Commands
 {
@@ -18,7 +32,7 @@ namespace SW2026RibbonAddin.Commands
         public string Id => "LaserCut";
 
         public string DisplayName => "Laser\nnesting";
-        public string Tooltip => "Nest combined thickness DWGs into laser sheets (0/90/180/270 rotations).";
+        public string Tooltip => "Nest combined thickness DWGs into sheets. Supports Fast (rectangles) or Contour (Level 1).";
         public string Hint => "Laser cut nesting";
 
         public string SmallIconFile => "laser_cut_20.png";
@@ -31,8 +45,8 @@ namespace SW2026RibbonAddin.Commands
 
         public void Execute(AddinContext context)
         {
-            string mainFolder = SelectMainFolder();
-            if (string.IsNullOrEmpty(mainFolder))
+            string folder = SelectFolder();
+            if (string.IsNullOrWhiteSpace(folder))
                 return;
 
             LaserCutRunSettings settings;
@@ -46,7 +60,7 @@ namespace SW2026RibbonAddin.Commands
 
             try
             {
-                DwgLaserNester.NestFolder(mainFolder, settings, showUi: true);
+                DwgLaserNester.NestFolder(folder, settings, showUi: true);
             }
             catch (Exception ex)
             {
@@ -58,16 +72,13 @@ namespace SW2026RibbonAddin.Commands
             }
         }
 
-        public int GetEnableState(AddinContext context)
-        {
-            return AddinContext.Enable;
-        }
+        public int GetEnableState(AddinContext context) => AddinContext.Enable;
 
-        private static string SelectMainFolder()
+        private static string SelectFolder()
         {
             using (var dlg = new FolderBrowserDialog())
             {
-                dlg.Description = "Select folder that contains thickness_*.dwg (combined outputs from Combine DWG)";
+                dlg.Description = "Select the folder that contains thickness_*.dwg (outputs of Combine DWG)";
                 dlg.ShowNewFolderButton = false;
 
                 if (dlg.ShowDialog() != DialogResult.OK)
@@ -78,45 +89,53 @@ namespace SW2026RibbonAddin.Commands
         }
     }
 
+    internal enum NestingMode
+    {
+        FastRectangles = 0,
+        ContourLevel1 = 1,
+    }
+
     internal readonly struct SheetPreset
     {
         public string Name { get; }
         public double WidthMm { get; }
         public double HeightMm { get; }
 
-        public SheetPreset(string name, double widthMm, double heightMm)
+        public SheetPreset(string name, double wMm, double hMm)
         {
             Name = name ?? "";
-            WidthMm = widthMm;
-            HeightMm = heightMm;
+            WidthMm = wMm;
+            HeightMm = hMm;
         }
 
-        public override string ToString()
-        {
-            return $"{Name} ({WidthMm:0.###} x {HeightMm:0.###} mm)";
-        }
+        public override string ToString() => $"{Name} ({WidthMm:0.###} x {HeightMm:0.###} mm)";
     }
 
     internal sealed class LaserCutRunSettings
     {
         public SheetPreset DefaultSheet { get; set; }
 
-        // Exact material grouping (no normalization)
+        // EXACT material grouping (no normalization)
         public bool SeparateByMaterialExact { get; set; } = true;
 
         // If SeparateByMaterialExact is true, create one output DWG per material string
         public bool OutputOneDwgPerMaterial { get; set; } = true;
 
-        // Option 2 behavior: keep only this material's source preview (plates + labels) in each output
+        // Option 2 behavior: keep only this material's preview in each output
         public bool KeepOnlyCurrentMaterialInSourcePreview { get; set; } = true;
 
-        // Kept ONLY so older code (like BatchCombineNestButton) doesn't break if it prints these.
-        // With exact materials, these presets are not used.
-        public bool UsePerMaterialSheetPresets { get; set; } = false;
-        public SheetPreset SteelSheet { get; set; }
-        public SheetPreset AluminumSheet { get; set; }
-        public SheetPreset StainlessSheet { get; set; }
-        public SheetPreset OtherSheet { get; set; }
+        // Nesting algorithm selection
+        public NestingMode Mode { get; set; } = NestingMode.ContourLevel1;
+
+        // Contour extraction tuning (mm)
+        // Smaller chord => better contour, slower.
+        public double ContourChordMm { get; set; } = 0.8;
+
+        // Endpoint snapping tolerance for loop building (mm)
+        public double ContourSnapMm { get; set; } = 0.05;
+
+        // Candidate limit per (sheet,rotation) placement attempt (safety)
+        public int MaxCandidatesPerTry { get; set; } = 6000;
     }
 
     internal sealed class LaserCutOptionsForm : Form
@@ -126,17 +145,23 @@ namespace SW2026RibbonAddin.Commands
         private readonly NumericUpDown _h;
 
         private readonly CheckBox _sepMat;
-        private readonly CheckBox _oneDwgPerMat;
+        private readonly CheckBox _onePerMat;
         private readonly CheckBox _filterPreview;
+
+        private readonly RadioButton _rbFast;
+        private readonly RadioButton _rbContour;
+
+        private readonly NumericUpDown _chord;
+        private readonly NumericUpDown _snap;
 
         private readonly Button _ok;
         private readonly Button _cancel;
 
         private readonly List<SheetPreset> _presets = new List<SheetPreset>
         {
-            new SheetPreset("1500 x 3000 mm", 3000, 1500),
-            new SheetPreset("1250 x 2500 mm", 2500, 1250),
-            new SheetPreset("1000 x 2000 mm", 2000, 1000),
+            new SheetPreset("1500 x 3000", 3000, 1500),
+            new SheetPreset("1250 x 2500", 2500, 1250),
+            new SheetPreset("1000 x 2000", 2000, 1000),
             new SheetPreset("Custom", 3000, 1500),
         };
 
@@ -144,148 +169,199 @@ namespace SW2026RibbonAddin.Commands
 
         public LaserCutOptionsForm()
         {
-            Text = "Batch nest options (applies to ALL thickness files)";
+            Text = "Laser nesting options";
             FormBorderStyle = FormBorderStyle.FixedDialog;
-            StartPosition = FormStartPosition.CenterParent;
+            StartPosition = FormStartPosition.CenterScreen;
             MaximizeBox = false;
             MinimizeBox = false;
             ShowInTaskbar = false;
-            Width = 560;
-            Height = 270;
 
-            var lblPreset = new Label { Left = 12, Top = 16, Width = 170, Text = "Global sheet preset:" };
+            ClientSize = new WinSize(640, 360);
+
+            Controls.Add(new Label { Left = 12, Top = 16, Width = 170, Text = "Sheet preset:" });
             _preset = new ComboBox
             {
-                Left = 190,
+                Left = 180,
                 Top = 12,
-                Width = 330,
+                Width = 440,
                 DropDownStyle = ComboBoxStyle.DropDownList
             };
             foreach (var p in _presets)
                 _preset.Items.Add(p.ToString());
             _preset.SelectedIndex = 0;
-            _preset.SelectedIndexChanged += (_, __) => ApplyPresetToNumeric();
+            _preset.SelectedIndexChanged += (_, __) => ApplyPreset();
+            Controls.Add(_preset);
 
-            var lblW = new Label { Left = 12, Top = 52, Width = 170, Text = "Width (mm):" };
+            Controls.Add(new Label { Left = 12, Top = 50, Width = 170, Text = "Width (mm):" });
             _w = new NumericUpDown
             {
-                Left = 190,
-                Top = 48,
-                Width = 120,
+                Left = 180,
+                Top = 46,
+                Width = 140,
                 DecimalPlaces = 1,
                 Minimum = 100,
                 Maximum = 200000,
                 Value = 3000
             };
+            Controls.Add(_w);
 
-            var lblH = new Label { Left = 320, Top = 52, Width = 80, Text = "Height:" };
+            Controls.Add(new Label { Left = 340, Top = 50, Width = 90, Text = "Height (mm):" });
             _h = new NumericUpDown
             {
-                Left = 400,
-                Top = 48,
-                Width = 120,
+                Left = 430,
+                Top = 46,
+                Width = 140,
                 DecimalPlaces = 1,
                 Minimum = 100,
                 Maximum = 200000,
                 Value = 1500
             };
+            Controls.Add(_h);
 
             _sepMat = new CheckBox
             {
                 Left = 12,
                 Top = 86,
-                Width = 520,
-                Text = "Separate nests by EXACT SolidWorks material name (no normalization / no translation)",
+                Width = 610,
+                Text = "Separate by EXACT SolidWorks material name",
                 Checked = true
             };
             _sepMat.CheckedChanged += (_, __) =>
             {
-                _oneDwgPerMat.Enabled = _sepMat.Checked;
-                _filterPreview.Enabled = _sepMat.Checked;
-                if (!_sepMat.Checked)
+                bool on = _sepMat.Checked;
+                _onePerMat.Enabled = on;
+                _filterPreview.Enabled = on;
+                if (!on)
                 {
-                    _oneDwgPerMat.Checked = false;
+                    _onePerMat.Checked = false;
                     _filterPreview.Checked = false;
                 }
-                else
-                {
-                    _oneDwgPerMat.Checked = true;
-                    _filterPreview.Checked = true;
-                }
             };
+            Controls.Add(_sepMat);
 
-            _oneDwgPerMat = new CheckBox
+            _onePerMat = new CheckBox
             {
                 Left = 32,
                 Top = 112,
-                Width = 520,
-                Text = "Output one nested DWG per material name",
+                Width = 610,
+                Text = "Output one nested DWG per material",
                 Checked = true
             };
+            Controls.Add(_onePerMat);
 
             _filterPreview = new CheckBox
             {
                 Left = 32,
                 Top = 136,
-                Width = 520,
-                Text = "Keep only that material's source preview (plates + labels) in each output (Option 2)",
+                Width = 610,
+                Text = "Keep only that material's source preview (plates + labels) in each output",
                 Checked = true
             };
+            Controls.Add(_filterPreview);
+
+            var grp = new GroupBox
+            {
+                Left = 12,
+                Top = 170,
+                Width = 610,
+                Height = 120,
+                Text = "Nesting algorithm"
+            };
+            Controls.Add(grp);
+
+            _rbFast = new RadioButton
+            {
+                Left = 16,
+                Top = 24,
+                Width = 560,
+                Text = "Fast (Rectangles) — very fast, more wasted sheet",
+                Checked = false
+            };
+            grp.Controls.Add(_rbFast);
+
+            _rbContour = new RadioButton
+            {
+                Left = 16,
+                Top = 48,
+                Width = 560,
+                Text = "Contour (Level 1) — uses outer contour + gap offset, better packing (slower)",
+                Checked = true
+            };
+            grp.Controls.Add(_rbContour);
+
+            grp.Controls.Add(new Label { Left = 36, Top = 78, Width = 160, Text = "Arc chord (mm):" });
+            _chord = new NumericUpDown
+            {
+                Left = 200,
+                Top = 74,
+                Width = 90,
+                DecimalPlaces = 2,
+                Minimum = 0.10M,
+                Maximum = 5.00M,
+                Value = 0.80M
+            };
+            grp.Controls.Add(_chord);
+
+            grp.Controls.Add(new Label { Left = 320, Top = 78, Width = 160, Text = "Snap tol (mm):" });
+            _snap = new NumericUpDown
+            {
+                Left = 460,
+                Top = 74,
+                Width = 90,
+                DecimalPlaces = 2,
+                Minimum = 0.01M,
+                Maximum = 0.50M,
+                Value = 0.05M
+            };
+            grp.Controls.Add(_snap);
 
             var note = new Label
             {
                 Left = 12,
-                Top = 162,
-                Width = 520,
-                Text = "Note: rotations are always 0/90/180/270. Gap+margin are auto (>= thickness)."
+                Top = 300,
+                Width = 610,
+                Height = 24,
+                Text = "Note: rotations are always 0/90/180/270. Gap + margin are auto (>= thickness)."
             };
+            Controls.Add(note);
 
-            _ok = new Button { Text = "OK", Left = 360, Width = 75, Top = 190, DialogResult = DialogResult.OK };
-            _cancel = new Button { Text = "Cancel", Left = 445, Width = 75, Top = 190, DialogResult = DialogResult.Cancel };
+            _ok = new Button { Text = "OK", Left = 450, Top = 328, Width = 80, Height = 26 };
+            _cancel = new Button { Text = "Cancel", Left = 540, Top = 328, Width = 80, Height = 26, DialogResult = DialogResult.Cancel };
+            Controls.Add(_ok);
+            Controls.Add(_cancel);
 
             AcceptButton = _ok;
             CancelButton = _cancel;
 
-            Controls.Add(lblPreset);
-            Controls.Add(_preset);
-            Controls.Add(lblW);
-            Controls.Add(_w);
-            Controls.Add(lblH);
-            Controls.Add(_h);
-
-            Controls.Add(_sepMat);
-            Controls.Add(_oneDwgPerMat);
-            Controls.Add(_filterPreview);
-            Controls.Add(note);
-
-            Controls.Add(_ok);
-            Controls.Add(_cancel);
-
-            ApplyPresetToNumeric();
-
-            // Build settings on OK
             _ok.Click += (_, __) =>
             {
                 var chosen = _presets[Math.Max(0, _preset.SelectedIndex)];
-                var final = new SheetPreset(
+                var sheet = new SheetPreset(
                     chosen.Name == "Custom" ? "Custom" : chosen.Name,
                     (double)_w.Value,
                     (double)_h.Value);
 
                 Settings = new LaserCutRunSettings
                 {
-                    DefaultSheet = final,
+                    DefaultSheet = sheet,
+
                     SeparateByMaterialExact = _sepMat.Checked,
-                    OutputOneDwgPerMaterial = _sepMat.Checked && _oneDwgPerMat.Checked,
+                    OutputOneDwgPerMaterial = _sepMat.Checked && _onePerMat.Checked,
                     KeepOnlyCurrentMaterialInSourcePreview = _sepMat.Checked && _filterPreview.Checked,
 
-                    // compatibility fields:
-                    UsePerMaterialSheetPresets = false
+                    Mode = _rbContour.Checked ? NestingMode.ContourLevel1 : NestingMode.FastRectangles,
+                    ContourChordMm = (double)_chord.Value,
+                    ContourSnapMm = (double)_snap.Value,
                 };
+
+                DialogResult = DialogResult.OK;
+                Close();
             };
+
+            ApplyPreset();
         }
 
-        private void ApplyPresetToNumeric()
+        private void ApplyPreset()
         {
             int idx = Math.Max(0, _preset.SelectedIndex);
             var p = _presets[idx];
@@ -302,7 +378,8 @@ namespace SW2026RibbonAddin.Commands
     {
         private readonly ProgressBar _bar;
         private readonly Label _label;
-        private int _total;
+
+        private readonly int _total;
         private int _done;
 
         public LaserCutProgressForm(int total)
@@ -315,13 +392,30 @@ namespace SW2026RibbonAddin.Commands
             MaximizeBox = false;
             MinimizeBox = false;
             ShowInTaskbar = false;
-            Width = 520;
-            Height = 130;
 
-            _label = new Label { Left = 12, Top = 12, Width = 480, Text = "Starting..." };
-            _bar = new ProgressBar { Left = 12, Top = 40, Width = 480, Height = 20, Minimum = 0, Maximum = _total, Value = 0 };
+            ClientSize = new WinSize(560, 95);
 
+            _label = new Label
+            {
+                Left = 12,
+                Top = 10,
+                Width = 536,
+                Height = 22,
+                TextAlign = WinContentAlignment.MiddleLeft,
+                Text = "Starting..."
+            };
             Controls.Add(_label);
+
+            _bar = new ProgressBar
+            {
+                Left = 12,
+                Top = 40,
+                Width = 536,
+                Height = 20,
+                Minimum = 0,
+                Maximum = _total,
+                Value = 0
+            };
             Controls.Add(_bar);
         }
 
@@ -330,16 +424,24 @@ namespace SW2026RibbonAddin.Commands
             _done++;
             if (_done > _total) _done = _total;
 
-            _label.Text = message ?? "";
+            if (!string.IsNullOrWhiteSpace(message))
+                _label.Text = message;
+
             _bar.Value = _done;
 
-            // keep UI responsive
-            System.Windows.Forms.Application.DoEvents();
+            _label.Refresh();
+            _bar.Refresh();
+            Application.DoEvents();
         }
     }
 
     internal static class DwgLaserNester
     {
+        // Geometry scale for Clipper (mm -> integer)
+        private const long SCALE = 1000; // 0.001 mm units
+
+        private static readonly int[] RotationsDeg = { 0, 90, 180, 270 };
+
         internal sealed class NestRunResult
         {
             public string ThicknessFile;
@@ -347,51 +449,70 @@ namespace SW2026RibbonAddin.Commands
             public string OutputDwg;
             public int SheetsUsed;
             public int TotalParts;
+            public NestingMode Mode;
         }
 
         private sealed class PartDefinition
         {
             public BlockRecord Block;
             public string BlockName;
-
+            public int Quantity;
             public string MaterialExact;
 
-            public double MinX;
-            public double MinY;
-            public double MaxX;
-            public double MaxY;
+            // bbox in mm (used by Fast mode and also for fallback)
+            public double MinX, MinY, MaxX, MaxY;
+            public double Width, Height;
 
-            public double Width;
-            public double Height;
-
-            public int Quantity;
-        }
-
-        private sealed class SheetState
-        {
-            public int Index;
-            public double OriginX;
-            public double OriginY;
-            public List<FreeRect> FreeRects = new List<FreeRect>();
+            // Contour polygon (outer boundary) in scaled Clipper units, in block-local coords (unrotated)
+            public Path64 OuterContour0;
+            public long OuterArea2Abs; // abs(2*area) in scaled^2
         }
 
         private sealed class FreeRect
         {
-            public double X;
-            public double Y;
-            public double Width;
-            public double Height;
+            public double X, Y, W, H;
+        }
+
+        private sealed class SheetRectState
+        {
+            public int Index;
+            public double OriginXmm;
+            public double OriginYmm;
+            public List<FreeRect> Free = new List<FreeRect>();
+            public int PlacedCount;
+            public double UsedArea;
+        }
+
+        private sealed class SheetContourState
+        {
+            public int Index;
+            public double OriginXmm;
+            public double OriginYmm;
+
+            public List<PlacedContour> Placed = new List<PlacedContour>();
+            public int PlacedCount;
+            public long UsedArea2Abs; // scaled^2
+        }
+
+        private sealed class PlacedContour
+        {
+            public Path64 OffsetPoly; // translated into sheet-local usable coords (scaled)
+            public LongRect BBox;      // bbox of OffsetPoly (scaled)
+        }
+
+        private struct LongRect
+        {
+            public long MinX, MinY, MaxX, MaxY;
         }
 
         public static void NestFolder(string mainFolder, LaserCutRunSettings settings, bool showUi = true)
         {
-            if (settings.DefaultSheet.WidthMm <= 0 || settings.DefaultSheet.HeightMm <= 0)
-                throw new ArgumentException("Sheet width/height must be positive.");
+            if (settings == null)
+                throw new ArgumentNullException(nameof(settings));
 
             if (string.IsNullOrWhiteSpace(mainFolder) || !Directory.Exists(mainFolder))
                 throw new DirectoryNotFoundException("Folder not found: " + mainFolder);
 
-            // Only take the combined thickness outputs, not already nested results
             var thicknessFiles = Directory.GetFiles(mainFolder, "thickness_*.dwg", SearchOption.TopDirectoryOnly)
                 .Where(f =>
                 {
@@ -407,8 +528,7 @@ namespace SW2026RibbonAddin.Commands
                 if (showUi)
                 {
                     MessageBox.Show(
-                        "No thickness_*.dwg files found in this folder.\r\n" +
-                        "Run Combine DWG first (it creates thickness_*.dwg).",
+                        "No thickness_*.dwg files found in this folder.\r\nRun Combine DWG first.",
                         "Laser nesting",
                         MessageBoxButtons.OK,
                         MessageBoxIcon.Information);
@@ -423,7 +543,8 @@ namespace SW2026RibbonAddin.Commands
             batchSummary.AppendLine("SeparateByMaterialExact: " + settings.SeparateByMaterialExact);
             batchSummary.AppendLine("OutputOneDwgPerMaterial: " + settings.OutputOneDwgPerMaterial);
             batchSummary.AppendLine("KeepOnlyCurrentMaterialInSourcePreview: " + settings.KeepOnlyCurrentMaterialInSourcePreview);
-            batchSummary.AppendLine(new string('-', 60));
+            batchSummary.AppendLine("Mode: " + settings.Mode);
+            batchSummary.AppendLine(new string('-', 70));
 
             foreach (var thicknessFile in thicknessFiles)
             {
@@ -433,10 +554,11 @@ namespace SW2026RibbonAddin.Commands
                 foreach (var r in results)
                 {
                     batchSummary.AppendLine($"  Material: {r.MaterialExact}");
+                    batchSummary.AppendLine($"  Mode: {r.Mode}");
                     batchSummary.AppendLine($"  SheetsUsed: {r.SheetsUsed}, Parts: {r.TotalParts}");
                     batchSummary.AppendLine($"  Output: {Path.GetFileName(r.OutputDwg)}");
                 }
-                batchSummary.AppendLine(new string('-', 60));
+                batchSummary.AppendLine(new string('-', 70));
             }
 
             string summaryPath = Path.Combine(mainFolder, "batch_nest_summary.txt");
@@ -452,154 +574,120 @@ namespace SW2026RibbonAddin.Commands
             }
         }
 
-        // Back-compat overloads (in case some other button calls these)
-        public static void Nest(string sourceDwgPath, double sheetWidth, double sheetHeight)
-        {
-            var settings = new LaserCutRunSettings
-            {
-                DefaultSheet = new SheetPreset("Custom", sheetWidth, sheetHeight),
-                SeparateByMaterialExact = false,
-                OutputOneDwgPerMaterial = false,
-                KeepOnlyCurrentMaterialInSourcePreview = false
-            };
-
-            NestThicknessFile(sourceDwgPath, settings);
-        }
-
-        public static List<NestRunResult> Nest(string thicknessFile, LaserCutRunSettings settings)
-        {
-            return NestThicknessFile(thicknessFile, settings);
-        }
-
         public static List<NestRunResult> NestThicknessFile(string sourceDwgPath, LaserCutRunSettings settings)
         {
             if (!File.Exists(sourceDwgPath))
                 throw new FileNotFoundException("DWG file not found.", sourceDwgPath);
 
-            // First pass: read once to find materials + quantities
-            CadDocument doc0;
+            CadDocument firstDoc;
             using (var reader = new DwgReader(sourceDwgPath))
-                doc0 = reader.Read();
+                firstDoc = reader.Read();
 
-            var defs0 = LoadPartDefinitions(doc0).ToList();
-            if (defs0.Count == 0)
+            var defsFirst = LoadPartDefinitions(firstDoc, settings).ToList();
+            if (defsFirst.Count == 0)
                 throw new InvalidOperationException("No plate blocks (P_*_Q#) found in: " + sourceDwgPath);
 
-            var groups = BuildGroups(defs0, settings);
+            // group by exact material
+            var groups = BuildGroups(defsFirst, settings);
 
             var results = new List<NestRunResult>();
 
             foreach (var grp in groups)
             {
-                string materialKey = grp.Key;
-                string materialLabel = grp.Value; // exact (pretty) label
+                string groupKey = grp.Key;       // normalized key
+                string groupLabel = grp.Value;   // exact label
 
-                // Re-read fresh doc for each output (so outputs don't overlap each other)
+                // Re-read fresh doc for each output
                 CadDocument doc;
                 using (var reader = new DwgReader(sourceDwgPath))
                     doc = reader.Read();
 
-                var defs = LoadPartDefinitions(doc)
-                    .Where(d => MaterialNameCodec.Normalize(d.MaterialExact)
-                        .Equals(materialKey, StringComparison.OrdinalIgnoreCase))
+                var defs = LoadPartDefinitions(doc, settings)
+                    .Where(d => NormalizeKey(d.MaterialExact).Equals(groupKey, StringComparison.OrdinalIgnoreCase))
                     .ToList();
 
                 int totalInstances = defs.Sum(d => d.Quantity);
                 if (totalInstances <= 0)
                     continue;
 
-                // Determine auto gap+margin (>= thickness)
+                // auto gap + margin
                 double thicknessMm = TryGetPlateThicknessFromFileName(sourceDwgPath) ?? 0.0;
 
-                double partGap = 3.0;
-                if (thicknessMm > partGap)
-                    partGap = thicknessMm;
+                double gapMm = 3.0;
+                if (thicknessMm > gapMm) gapMm = thicknessMm;
 
-                double sheetMargin = 10.0;
-                if (thicknessMm > sheetMargin)
-                    sheetMargin = thicknessMm;
+                double marginMm = 10.0;
+                if (thicknessMm > marginMm) marginMm = thicknessMm;
 
-                double placementMargin = sheetMargin + 2.0 * partGap;
+                var modelSpace = doc.BlockRecords["*Model_Space"];
 
-                double sheetWidth = settings.DefaultSheet.WidthMm;
-                double sheetHeight = settings.DefaultSheet.HeightMm;
-
-                // Validate fit
-                double usableWidth = sheetWidth - 2 * placementMargin;
-                double usableHeight = sheetHeight - 2 * placementMargin;
-
-                foreach (var d in defs)
-                {
-                    if (d.Width > usableWidth || d.Height > usableHeight)
-                    {
-                        throw new InvalidOperationException(
-                            $"Part '{d.BlockName}' ({d.Width:0.##} x {d.Height:0.##} mm) " +
-                            $"does not fit inside sheet {sheetWidth:0.##} x {sheetHeight:0.##} mm " +
-                            $"with margin {placementMargin:0.##} mm.");
-                    }
-                }
-
-                // Option 2: keep only that material’s source preview
+                // Option 2: keep only material preview
                 if (settings.SeparateByMaterialExact &&
                     settings.OutputOneDwgPerMaterial &&
-                    settings.KeepOnlyCurrentMaterialInSourcePreview)
+                    settings.KeepOnlyCurrentMaterialInSourcePreview &&
+                    !string.Equals(groupLabel, "ALL", StringComparison.OrdinalIgnoreCase))
                 {
                     FilterSourcePreviewToTheseBlocks(doc, defs.Select(d => d.BlockName).ToHashSet(StringComparer.OrdinalIgnoreCase));
                 }
 
-                // Expand instances
-                var instances = new List<PartDefinition>(totalInstances);
-                foreach (var d in defs)
-                {
-                    for (int i = 0; i < d.Quantity; i++)
-                        instances.Add(d);
-                }
+                // Find extents of remaining preview to place sheets above it
+                GetModelSpaceExtents(doc, out double srcMinX, out double srcMinY, out double srcMaxX, out double srcMaxY);
 
-                // Sort biggest first
-                instances.Sort((a, b) =>
-                {
-                    double areaA = a.Width * a.Height;
-                    double areaB = b.Width * b.Height;
-                    return areaB.CompareTo(areaA);
-                });
+                double baseSheetOriginX = srcMinX;
+                double baseSheetOriginY = srcMaxY + 200.0;
 
-                var modelSpace = doc.BlockRecords["*Model_Space"];
-
-                // Compute extents of remaining source preview
-                GetModelSpaceExtents(doc, out double origMinX, out double origMinY, out double origMaxX, out double origMaxY);
-
-                // Place sheets ABOVE source preview
-                double baseSheetOriginY = origMaxY + 200.0;
-                double baseSheetOriginX = origMinX;
-
+                // Run nesting with progress
                 using (var progress = new LaserCutProgressForm(totalInstances))
                 {
                     progress.Show();
-                    System.Windows.Forms.Application.DoEvents();
+                    Application.DoEvents();
 
-                    int sheetCount = NestFreeRectangles(
-                        instances,
-                        modelSpace,
-                        sheetWidth,
-                        sheetHeight,
-                        placementMargin,
-                        sheetGap: 50.0,
-                        partGap,
-                        baseSheetOriginX,
-                        baseSheetOriginY,
-                        progress,
-                        totalInstances,
-                        materialLabel);
+                    int sheetsUsed;
 
-                    // Write output
+                    if (settings.Mode == NestingMode.FastRectangles)
+                    {
+                        sheetsUsed = NestFastRectangles(
+                            defs,
+                            modelSpace,
+                            settings.DefaultSheet.WidthMm,
+                            settings.DefaultSheet.HeightMm,
+                            marginMm,
+                            gapMm,
+                            baseSheetOriginX,
+                            baseSheetOriginY,
+                            groupLabel,
+                            progress,
+                            totalInstances);
+                    }
+                    else
+                    {
+                        sheetsUsed = NestContourLevel1(
+                            defs,
+                            modelSpace,
+                            settings.DefaultSheet.WidthMm,
+                            settings.DefaultSheet.HeightMm,
+                            marginMm,
+                            gapMm,
+                            baseSheetOriginX,
+                            baseSheetOriginY,
+                            groupLabel,
+                            progress,
+                            totalInstances,
+                            chordMm: Math.Max(0.10, settings.ContourChordMm),
+                            snapMm: Math.Max(0.01, settings.ContourSnapMm),
+                            maxCandidates: Math.Max(500, settings.MaxCandidatesPerTry));
+                    }
+
+                    progress.Close();
+
+                    // Save
                     string dir = Path.GetDirectoryName(sourceDwgPath) ?? "";
                     string nameNoExt = Path.GetFileNameWithoutExtension(sourceDwgPath) ?? "thickness";
 
                     string outPath;
-
                     if (settings.SeparateByMaterialExact && settings.OutputOneDwgPerMaterial)
                     {
-                        string safeMat = MaterialNameCodec.MakeSafeFileToken(materialLabel);
+                        string safeMat = MaterialNameCodec.MakeSafeFileToken(groupLabel);
                         outPath = Path.Combine(dir, $"{nameNoExt}_nested_{safeMat}.dwg");
                     }
                     else
@@ -610,64 +698,1450 @@ namespace SW2026RibbonAddin.Commands
                     using (var writer = new DwgWriter(outPath, doc))
                         writer.Write();
 
-                    // Write a small log next to output
+                    // Log
                     string logPath = Path.Combine(dir, $"{nameNoExt}_nest_log.txt");
-                    AppendNestLog(logPath, sourceDwgPath, materialLabel, sheetWidth, sheetHeight, thicknessMm, partGap, sheetCount, totalInstances, outPath);
+                    AppendNestLog(
+                        logPath,
+                        sourceDwgPath,
+                        groupLabel,
+                        settings.DefaultSheet.WidthMm,
+                        settings.DefaultSheet.HeightMm,
+                        thicknessMm,
+                        gapMm,
+                        marginMm,
+                        sheetsUsed,
+                        totalInstances,
+                        outPath,
+                        settings.Mode);
 
                     results.Add(new NestRunResult
                     {
                         ThicknessFile = sourceDwgPath,
-                        MaterialExact = materialLabel,
+                        MaterialExact = groupLabel,
                         OutputDwg = outPath,
-                        SheetsUsed = sheetCount,
-                        TotalParts = totalInstances
+                        SheetsUsed = sheetsUsed,
+                        TotalParts = totalInstances,
+                        Mode = settings.Mode
                     });
-
-                    progress.Close();
                 }
             }
 
             return results;
         }
 
-        private static void AppendNestLog(
-            string logPath,
-            string thicknessFile,
-            string material,
-            double sheetW,
-            double sheetH,
-            double thicknessMm,
+        // -----------------------------------------
+        // FAST MODE (Rectangles) - existing approach
+        // -----------------------------------------
+        private static int NestFastRectangles(
+            List<PartDefinition> defs,
+            BlockRecord modelSpace,
+            double sheetWmm,
+            double sheetHmm,
+            double marginMm,
             double gapMm,
-            int sheets,
-            int parts,
-            string outDwg)
+            double baseOriginXmm,
+            double baseOriginYmm,
+            string materialLabel,
+            LaserCutProgressForm progress,
+            int totalInstances)
         {
-            try
-            {
-                var sb = new StringBuilder();
-                sb.AppendLine("Nest run:");
-                sb.AppendLine("  Thickness file: " + Path.GetFileName(thicknessFile));
-                sb.AppendLine("  Material: " + material);
-                sb.AppendLine($"  Sheet: {sheetW:0.###} x {sheetH:0.###} mm");
-                sb.AppendLine($"  Thickness(mm): {thicknessMm:0.###}");
-                sb.AppendLine($"  Gap(mm): {gapMm:0.###}  (auto >= thickness)");
-                sb.AppendLine($"  Sheets used: {sheets}");
-                sb.AppendLine($"  Total parts: {parts}");
-                sb.AppendLine("  Output: " + Path.GetFileName(outDwg));
-                sb.AppendLine(new string('-', 60));
+            // We keep the old conservative rule for fast mode
+            double placementMargin = marginMm + gapMm;
 
-                File.AppendAllText(logPath, sb.ToString(), Encoding.UTF8);
-            }
-            catch
+            double usableW = sheetWmm - 2 * placementMargin;
+            double usableH = sheetHmm - 2 * placementMargin;
+            if (usableW <= 0 || usableH <= 0)
+                throw new InvalidOperationException("Sheet is too small after margins/gap.");
+
+            // Expand instances
+            var instances = new List<PartDefinition>();
+            foreach (var d in defs)
+                for (int i = 0; i < d.Quantity; i++)
+                    instances.Add(d);
+
+            // Sort by bbox area
+            instances.Sort((a, b) => (b.Width * b.Height).CompareTo(a.Width * a.Height));
+
+            var sheets = new List<SheetRectState>();
+
+            SheetRectState NewSheet()
             {
-                // ignore logging failures
+                var s = new SheetRectState
+                {
+                    Index = sheets.Count + 1,
+                    OriginXmm = baseOriginXmm + (sheets.Count) * (sheetWmm + 60.0),
+                    OriginYmm = baseOriginYmm
+                };
+
+                DrawSheetOutline(s.OriginXmm, s.OriginYmm, sheetWmm, sheetHmm, modelSpace, materialLabel, s.Index, NestingMode.FastRectangles);
+
+                s.Free.Add(new FreeRect
+                {
+                    X = placementMargin,
+                    Y = placementMargin,
+                    W = sheetWmm - 2 * placementMargin,
+                    H = sheetHmm - 2 * placementMargin
+                });
+
+                sheets.Add(s);
+                return s;
+            }
+
+            var cur = NewSheet();
+
+            int placed = 0;
+
+            foreach (var part in instances)
+            {
+                while (true)
+                {
+                    if (TryPlaceRect(cur, part, gapMm, modelSpace))
+                    {
+                        placed++;
+                        progress.Step($"Placed {placed}/{totalInstances} (Fast rectangles)");
+                        break;
+                    }
+
+                    cur = NewSheet();
+                }
+            }
+
+            return sheets.Count;
+        }
+
+        private static bool TryPlaceRect(SheetRectState sheet, PartDefinition part, double gapMm, BlockRecord modelSpace)
+        {
+            // Only 0/90 rotations matter for rectangles (180=0, 270=90)
+            // But we still respect DWG by inserting unrotated (fast mode)
+            for (int frIndex = 0; frIndex < sheet.Free.Count; frIndex++)
+            {
+                var fr = sheet.Free[frIndex];
+
+                // Try both orientations
+                if (TryPlaceRectOrientation(sheet, part, frIndex, fr, part.Width, part.Height, 0.0, gapMm, modelSpace))
+                    return true;
+
+                if (TryPlaceRectOrientation(sheet, part, frIndex, fr, part.Height, part.Width, Math.PI / 2.0, gapMm, modelSpace))
+                    return true;
+            }
+
+            return false;
+        }
+
+        private static bool TryPlaceRectOrientation(
+            SheetRectState sheet,
+            PartDefinition part,
+            int frIndex,
+            FreeRect fr,
+            double w,
+            double h,
+            double rotRad,
+            double gapMm,
+            BlockRecord modelSpace)
+        {
+            double usedW = w + gapMm;
+            double usedH = h + gapMm;
+
+            if (usedW > fr.W || usedH > fr.H)
+                return false;
+
+            double localMinX = fr.X + gapMm * 0.5;
+            double localMinY = fr.Y + gapMm * 0.5;
+
+            double worldMinX = sheet.OriginXmm + localMinX;
+            double worldMinY = sheet.OriginYmm + localMinY;
+
+            // For fast mode we use bbox-based insert computation
+            double insertX;
+            double insertY;
+
+            if (Math.Abs(rotRad) < 1e-9)
+            {
+                insertX = worldMinX - part.MinX;
+                insertY = worldMinY - part.MinY;
+            }
+            else
+            {
+                // 90° about origin: (x,y)->(-y,x) => bbox min is (-MaxY, MinX)
+                insertX = worldMinX + part.MaxY;
+                insertY = worldMinY - part.MinX;
+            }
+
+            var ins = new Insert(part.Block)
+            {
+                InsertPoint = new XYZ(insertX, insertY, 0.0),
+                Rotation = rotRad,
+                XScale = 1.0,
+                YScale = 1.0,
+                ZScale = 1.0
+            };
+            modelSpace.Entities.Add(ins);
+
+            // Split free rect (simple guillotine split)
+            sheet.Free.RemoveAt(frIndex);
+
+            double rightW = fr.W - usedW;
+            if (rightW > 1.0)
+                sheet.Free.Add(new FreeRect { X = fr.X + usedW, Y = fr.Y, W = rightW, H = fr.H });
+
+            double topH = fr.H - usedH;
+            if (topH > 1.0)
+                sheet.Free.Add(new FreeRect { X = fr.X, Y = fr.Y + usedH, W = usedW, H = topH });
+
+            return true;
+        }
+
+        // -----------------------------------------
+        // CONTOUR MODE (Level 1) - polygon packing
+        // -----------------------------------------
+        private static int NestContourLevel1(
+            List<PartDefinition> defs,
+            BlockRecord modelSpace,
+            double sheetWmm,
+            double sheetHmm,
+            double marginMm,
+            double gapMm,
+            double baseOriginXmm,
+            double baseOriginYmm,
+            string materialLabel,
+            LaserCutProgressForm progress,
+            int totalInstances,
+            double chordMm,
+            double snapMm,
+            int maxCandidates)
+        {
+            // Correct contour nesting boundary buffer:
+            // expanded polygon (gap/2) must stay >= (margin + gap/2) from sheet edge
+            double boundaryBufferMm = marginMm + gapMm / 2.0;
+
+            double usableWmm = sheetWmm - 2 * boundaryBufferMm;
+            double usableHmm = sheetHmm - 2 * boundaryBufferMm;
+            if (usableWmm <= 0 || usableHmm <= 0)
+                throw new InvalidOperationException("Sheet is too small after margins/gap.");
+
+            long usableW = ToInt(usableWmm);
+            long usableH = ToInt(usableHmm);
+
+            // Expand instances
+            var instances = new List<PartDefinition>();
+            foreach (var d in defs)
+                for (int i = 0; i < d.Quantity; i++)
+                    instances.Add(d);
+
+            // Sort by contour area (fallback bbox area)
+            instances.Sort((a, b) =>
+            {
+                long areaA = a.OuterArea2Abs > 0 ? a.OuterArea2Abs : ToInt(a.Width) * ToInt(a.Height);
+                long areaB = b.OuterArea2Abs > 0 ? b.OuterArea2Abs : ToInt(b.Width) * ToInt(b.Height);
+                return areaB.CompareTo(areaA);
+            });
+
+            // Precompute rotated + offset polygons per unique block (per rotation)
+            // Key: block name + rotation
+            var polyCache = new Dictionary<string, RotatedPoly>(StringComparer.OrdinalIgnoreCase);
+
+            RotatedPoly GetRot(PartDefinition part, int rotDeg)
+            {
+                string key = part.BlockName + "||" + rotDeg.ToString(CultureInfo.InvariantCulture) + "||gap:" + gapMm.ToString("0.###", CultureInfo.InvariantCulture);
+                if (polyCache.TryGetValue(key, out var rp))
+                    return rp;
+
+                // 1) base contour (ensure we have it; fallback rectangle)
+                Path64 basePoly = part.OuterContour0;
+                if (basePoly == null || basePoly.Count < 3)
+                {
+                    basePoly = MakeRectPolyScaled(part.MinX, part.MinY, part.MaxX, part.MaxY);
+                }
+
+                // 2) rotate
+                Path64 rotPoly = RotatePoly(basePoly, rotDeg);
+
+                // 3) offset outward by gap/2
+                double delta = (gapMm / 2.0) * SCALE;
+                Path64 offset = OffsetLargest(rotPoly, delta);
+
+                // If offset fails, fallback to rotPoly (still works, just no gap safety)
+                if (offset == null || offset.Count < 3)
+                    offset = rotPoly;
+
+                // Clean duplicates
+                offset = CleanPath(offset);
+
+                var bbox = GetBounds(offset);
+
+                // anchors (4)
+                var anchors = GetAnchors(offset);
+
+                // area
+                long area2Abs = Area2Abs(rotPoly);
+
+                rp = new RotatedPoly
+                {
+                    RotDeg = rotDeg,
+                    RotRad = rotDeg * Math.PI / 180.0,
+                    PolyRot = rotPoly,
+                    PolyOffset = offset,
+                    OffsetBounds = bbox,
+                    Anchors = anchors,
+                    RotArea2Abs = area2Abs
+                };
+
+                polyCache[key] = rp;
+                return rp;
+            }
+
+            var sheets = new List<SheetContourState>();
+
+            SheetContourState NewSheet()
+            {
+                var s = new SheetContourState
+                {
+                    Index = sheets.Count + 1,
+                    OriginXmm = baseOriginXmm + (sheets.Count) * (sheetWmm + 60.0),
+                    OriginYmm = baseOriginYmm
+                };
+
+                DrawSheetOutline(s.OriginXmm, s.OriginYmm, sheetWmm, sheetHmm, modelSpace, materialLabel, s.Index, NestingMode.ContourLevel1);
+                sheets.Add(s);
+                return s;
+            }
+
+            var cur = NewSheet();
+
+            int placed = 0;
+
+            foreach (var part in instances)
+            {
+                bool placedThis = false;
+
+                // Try on existing sheets first
+                for (int si = 0; si < sheets.Count; si++)
+                {
+                    if (TryPlaceContourOnSheet(
+                        sheets[si],
+                        part,
+                        usableW,
+                        usableH,
+                        maxCandidates,
+                        GetRot,
+                        out var placement))
+                    {
+                        AddPlacedToDwg(
+                            modelSpace,
+                            part,
+                            sheets[si],
+                            boundaryBufferMm,
+                            placement.InsertX,
+                            placement.InsertY,
+                            placement.RotRad);
+
+                        // store translated offset poly for collision checks
+                        sheets[si].Placed.Add(new PlacedContour
+                        {
+                            OffsetPoly = placement.OffsetPolyTranslated,
+                            BBox = placement.OffsetBBoxTranslated
+                        });
+
+                        sheets[si].PlacedCount++;
+                        sheets[si].UsedArea2Abs += placement.RotArea2Abs;
+
+                        placed++;
+                        progress.Step($"Placed {placed}/{totalInstances} (Contour L1)");
+
+                        placedThis = true;
+                        break;
+                    }
+                }
+
+                if (placedThis)
+                    continue;
+
+                // Need new sheet
+                cur = NewSheet();
+
+                if (!TryPlaceContourOnSheet(cur, part, usableW, usableH, maxCandidates, GetRot, out var placement2))
+                    throw new InvalidOperationException("Failed to place a part even on a fresh sheet. Sheet too small?");
+
+                AddPlacedToDwg(modelSpace, part, cur, boundaryBufferMm, placement2.InsertX, placement2.InsertY, placement2.RotRad);
+
+                cur.Placed.Add(new PlacedContour
+                {
+                    OffsetPoly = placement2.OffsetPolyTranslated,
+                    BBox = placement2.OffsetBBoxTranslated
+                });
+
+                cur.PlacedCount++;
+                cur.UsedArea2Abs += placement2.RotArea2Abs;
+
+                placed++;
+                progress.Step($"Placed {placed}/{totalInstances} (Contour L1)");
+            }
+
+            // Optional sheet label with fill %
+            long usableArea2 = usableW * usableH; // scaled^2
+            foreach (var s in sheets)
+            {
+                double fill = usableArea2 > 0 ? (double)s.UsedArea2Abs / usableArea2 * 100.0 : 0.0;
+                AddSheetLabel(modelSpace, s.OriginXmm, s.OriginYmm, sheetWmm, sheetHmm, s.Index, fill);
+            }
+
+            return sheets.Count;
+        }
+
+        private struct ContourPlacement
+        {
+            public long InsertX;
+            public long InsertY;
+            public double RotRad;
+
+            public Path64 OffsetPolyTranslated;
+            public LongRect OffsetBBoxTranslated;
+
+            public long RotArea2Abs;
+        }
+
+        private struct RotatedPoly
+        {
+            public int RotDeg;
+            public double RotRad;
+
+            public Path64 PolyRot;
+            public Path64 PolyOffset;
+
+            public LongRect OffsetBounds;
+
+            public Point64[] Anchors; // 4 anchors from offset poly
+
+            public long RotArea2Abs;
+        }
+
+        private static bool TryPlaceContourOnSheet(
+            SheetContourState sheet,
+            PartDefinition part,
+            long usableW,
+            long usableH,
+            int maxCandidates,
+            Func<PartDefinition, int, RotatedPoly> getRot,
+            out ContourPlacement placement)
+        {
+            placement = default;
+
+            // Try all 0/90/180/270
+            // Strategy: search candidates in "bottom-left" order (min Y then min X),
+            // accept first feasible.
+            foreach (int rotDeg in RotationsDeg)
+            {
+                var rp = getRot(part, rotDeg);
+
+                // Quick fit check using offset bbox size
+                long offW = rp.OffsetBounds.MaxX - rp.OffsetBounds.MinX;
+                long offH = rp.OffsetBounds.MaxY - rp.OffsetBounds.MinY;
+                if (offW <= 0 || offH <= 0 || offW > usableW || offH > usableH)
+                    continue;
+
+                // Generate candidates
+                var candidates = GenerateCandidates(sheet, rp, maxCandidates);
+
+                // Sort by resulting bbox minY, then minX
+                candidates.Sort((a, b) =>
+                {
+                    long aMinY = a.InsY + rp.OffsetBounds.MinY;
+                    long bMinY = b.InsY + rp.OffsetBounds.MinY;
+                    int cmp = aMinY.CompareTo(bMinY);
+                    if (cmp != 0) return cmp;
+
+                    long aMinX = a.InsX + rp.OffsetBounds.MinX;
+                    long bMinX = b.InsX + rp.OffsetBounds.MinX;
+                    return aMinX.CompareTo(bMinX);
+                });
+
+                foreach (var cand in candidates)
+                {
+                    long minX = cand.InsX + rp.OffsetBounds.MinX;
+                    long minY = cand.InsY + rp.OffsetBounds.MinY;
+                    long maxX = cand.InsX + rp.OffsetBounds.MaxX;
+                    long maxY = cand.InsY + rp.OffsetBounds.MaxY;
+
+                    if (minX < 0 || minY < 0 || maxX > usableW || maxY > usableH)
+                        continue;
+
+                    // Translate offset poly for collision checks
+                    var moved = TranslatePath(rp.PolyOffset, cand.InsX, cand.InsY);
+                    var movedBBox = new LongRect { MinX = minX, MinY = minY, MaxX = maxX, MaxY = maxY };
+
+                    bool overlap = false;
+
+                    foreach (var placed in sheet.Placed)
+                    {
+                        if (!RectsOverlap(movedBBox, placed.BBox))
+                            continue;
+
+                        if (PolygonsOverlapAreaPositive(moved, placed.OffsetPoly))
+                        {
+                            overlap = true;
+                            break;
+                        }
+                    }
+
+                    if (overlap)
+                        continue;
+
+                    placement = new ContourPlacement
+                    {
+                        InsertX = cand.InsX,
+                        InsertY = cand.InsY,
+                        RotRad = rp.RotRad,
+
+                        OffsetPolyTranslated = moved,
+                        OffsetBBoxTranslated = movedBBox,
+
+                        RotArea2Abs = rp.RotArea2Abs
+                    };
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private struct CandidateIns
+        {
+            public long InsX, InsY;
+        }
+
+        private static List<CandidateIns> GenerateCandidates(SheetContourState sheet, RotatedPoly rp, int maxCandidates)
+        {
+            var result = new List<CandidateIns>(Math.Min(maxCandidates, 2048));
+            var seen = new HashSet<(long, long)>();
+
+            void Add(long ix, long iy)
+            {
+                if (result.Count >= maxCandidates)
+                    return;
+
+                var key = (ix, iy);
+                if (seen.Add(key))
+                    result.Add(new CandidateIns { InsX = ix, InsY = iy });
+            }
+
+            // Base candidate: align bbox-min to (0,0)
+            Add(-rp.OffsetBounds.MinX, -rp.OffsetBounds.MinY);
+
+            // Bounding-box edge candidates (fast)
+            // x candidates from right edges, y from top edges
+            var xSet = new HashSet<long> { 0 };
+            var ySet = new HashSet<long> { 0 };
+
+            foreach (var p in sheet.Placed)
+            {
+                xSet.Add(p.BBox.MaxX);
+                ySet.Add(p.BBox.MaxY);
+            }
+
+            var xs = xSet.OrderBy(v => v).Take(120).ToList();
+            var ys = ySet.OrderBy(v => v).Take(120).ToList();
+
+            foreach (var y in ys)
+            {
+                foreach (var x in xs)
+                {
+                    // desired bbox-min = (x,y)
+                    Add(x - rp.OffsetBounds.MinX, y - rp.OffsetBounds.MinY);
+                    if (result.Count >= maxCandidates) break;
+                }
+                if (result.Count >= maxCandidates) break;
+            }
+
+            // Vertex-based candidates (better interlocking)
+            // Align moving anchors to sampled vertices of placed polygons.
+            if (result.Count < maxCandidates && sheet.Placed.Count > 0)
+            {
+                foreach (var placed in sheet.Placed)
+                {
+                    int n = placed.OffsetPoly.Count;
+                    if (n < 3) continue;
+
+                    int step = Math.Max(1, n / 30); // sample ~30 points max
+
+                    for (int i = 0; i < n; i += step)
+                    {
+                        var v = placed.OffsetPoly[i];
+
+                        for (int a = 0; a < rp.Anchors.Length; a++)
+                        {
+                            var m = rp.Anchors[a];
+                            Add(v.X - m.X, v.Y - m.Y);
+                            if (result.Count >= maxCandidates) break;
+                        }
+
+                        if (result.Count >= maxCandidates) break;
+                    }
+
+                    if (result.Count >= maxCandidates) break;
+                }
+            }
+
+            return result;
+        }
+
+        private static void AddPlacedToDwg(
+            BlockRecord modelSpace,
+            PartDefinition part,
+            SheetContourState sheet,
+            double boundaryBufferMm,
+            long insertXScaled,
+            long insertYScaled,
+            double rotRad)
+        {
+            double insXmm = sheet.OriginXmm + boundaryBufferMm + (double)insertXScaled / SCALE;
+            double insYmm = sheet.OriginYmm + boundaryBufferMm + (double)insertYScaled / SCALE;
+
+            var ins = new Insert(part.Block)
+            {
+                InsertPoint = new XYZ(insXmm, insYmm, 0.0),
+                Rotation = rotRad,
+                XScale = 1.0,
+                YScale = 1.0,
+                ZScale = 1.0
+            };
+            modelSpace.Entities.Add(ins);
+        }
+
+        // -----------------------------------------
+        // Part loading + contour extraction
+        // -----------------------------------------
+        private static IEnumerable<PartDefinition> LoadPartDefinitions(CadDocument doc, LaserCutRunSettings settings)
+        {
+            if (doc == null)
+                yield break;
+
+            foreach (var br in doc.BlockRecords)
+            {
+                var block = br;
+                if (block == null) continue;
+
+                string name = block.Name ?? "";
+                if (!name.StartsWith("P_", StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                int qIndex = name.LastIndexOf("_Q", StringComparison.OrdinalIgnoreCase);
+                if (qIndex < 0)
+                    continue;
+
+                int qty = 1;
+                string qtyToken = name.Substring(qIndex + 2);
+                if (!int.TryParse(qtyToken, NumberStyles.Integer, CultureInfo.InvariantCulture, out qty))
+                    qty = 1;
+
+                // material exact from block token written by combiner
+                string material = "UNKNOWN";
+                MaterialNameCodec.TryExtractFromBlockName(name, out material);
+                material = MaterialNameCodec.Normalize(material);
+
+                // bbox (mm)
+                if (!TryGetBlockBbox(block, out double minX, out double minY, out double maxX, out double maxY))
+                    continue;
+
+                double w = maxX - minX;
+                double h = maxY - minY;
+                if (w <= 0 || h <= 0)
+                    continue;
+
+                // contour (only needed for contour mode; but we can compute always)
+                Path64 contour = null;
+                long area2Abs = 0;
+
+                try
+                {
+                    contour = ExtractOuterContourScaled(block, chordMm: settings.ContourChordMm, snapMm: settings.ContourSnapMm);
+                    contour = CleanPath(contour);
+                    area2Abs = Area2Abs(contour);
+                }
+                catch
+                {
+                    contour = null;
+                    area2Abs = 0;
+                }
+
+                // fallback rectangle if contour failed
+                if (contour == null || contour.Count < 3)
+                {
+                    contour = MakeRectPolyScaled(minX, minY, maxX, maxY);
+                    area2Abs = Area2Abs(contour);
+                }
+
+                yield return new PartDefinition
+                {
+                    Block = block,
+                    BlockName = name,
+                    Quantity = Math.Max(1, qty),
+                    MaterialExact = material,
+
+                    MinX = minX,
+                    MinY = minY,
+                    MaxX = maxX,
+                    MaxY = maxY,
+                    Width = w,
+                    Height = h,
+
+                    OuterContour0 = contour,
+                    OuterArea2Abs = area2Abs
+                };
             }
         }
 
+        private static bool TryGetBlockBbox(BlockRecord block, out double minX, out double minY, out double maxX, out double maxY)
+        {
+            minX = double.MaxValue;
+            minY = double.MaxValue;
+            maxX = double.MinValue;
+            maxY = double.MinValue;
+
+            bool any = false;
+
+            foreach (var ent in block.Entities)
+            {
+                try
+                {
+                    var bb = ent.GetBoundingBox();
+                    var a = bb.Min;
+                    var b = bb.Max;
+
+                    if (a.X < minX) minX = a.X;
+                    if (a.Y < minY) minY = a.Y;
+                    if (b.X > maxX) maxX = b.X;
+                    if (b.Y > maxY) maxY = b.Y;
+
+                    any = true;
+                }
+                catch
+                {
+                    // ignore entities without bbox
+                }
+            }
+
+            if (!any || minX == double.MaxValue || maxX == double.MinValue)
+                return false;
+
+            return true;
+        }
+
+        private static Path64 ExtractOuterContourScaled(BlockRecord block, double chordMm, double snapMm)
+        {
+            if (block == null)
+                return null;
+
+            chordMm = Math.Max(0.10, chordMm);
+            snapMm = Math.Max(0.01, snapMm);
+
+            // 1) collect segments (scaled)
+            var segs = new List<(Point64 A, Point64 B)>();
+
+            foreach (var ent in block.Entities)
+            {
+                if (ent == null) continue;
+
+                if (ent is Line ln)
+                {
+                    segs.Add((
+                        Snap(ToP64(ln.StartPoint), snapMm),
+                        Snap(ToP64(ln.EndPoint), snapMm)));
+                }
+                else if (ent is Arc arc)
+                {
+                    AddArcSegments(segs, arc.Center, arc.Radius, arc.StartAngle, arc.EndAngle, chordMm, snapMm);
+                }
+                else if (ent is Circle cir)
+                {
+                    AddCircleSegments(segs, cir.Center, cir.Radius, chordMm, snapMm);
+                }
+                else
+                {
+                    // polylines (reflection-safe)
+                    if (TryAddPolylineSegments(ent, segs, chordMm, snapMm))
+                        continue;
+                }
+            }
+
+            // Not enough data
+            if (segs.Count < 3)
+                return null;
+
+            // 2) build loops from segments
+            var loops = BuildClosedLoops(segs);
+
+            if (loops.Count > 0)
+            {
+                // pick largest abs area
+                Path64 best = null;
+                long bestArea = 0;
+
+                foreach (var loop in loops)
+                {
+                    long a2 = Area2Abs(loop);
+                    if (a2 > bestArea)
+                    {
+                        bestArea = a2;
+                        best = loop;
+                    }
+                }
+
+                return best;
+            }
+
+            // 3) fallback: convex hull of all points
+            var pts = new List<Point64>(segs.Count * 2);
+            foreach (var s in segs)
+            {
+                pts.Add(s.A);
+                pts.Add(s.B);
+            }
+
+            var hull = ConvexHull(pts);
+            return hull;
+        }
+
+        private static List<Path64> BuildClosedLoops(List<(Point64 A, Point64 B)> segs)
+        {
+            var loops = new List<Path64>();
+            if (segs == null || segs.Count == 0)
+                return loops;
+
+            // adjacency map
+            var adj = new Dictionary<(long, long), List<int>>();
+            var used = new bool[segs.Count];
+
+            (long, long) Key(Point64 p) => (p.X, p.Y);
+
+            for (int i = 0; i < segs.Count; i++)
+            {
+                var s = segs[i];
+                var kA = Key(s.A);
+                var kB = Key(s.B);
+
+                if (!adj.TryGetValue(kA, out var la)) { la = new List<int>(); adj[kA] = la; }
+                la.Add(i);
+
+                if (!adj.TryGetValue(kB, out var lb)) { lb = new List<int>(); adj[kB] = lb; }
+                lb.Add(i);
+            }
+
+            for (int i = 0; i < segs.Count; i++)
+            {
+                if (used[i]) continue;
+
+                var s0 = segs[i];
+                var start = s0.A;
+                var startK = Key(start);
+
+                var path = new Path64();
+                path.Add(start);
+
+                // walk
+                Point64 cur = s0.B;
+                var curK = Key(cur);
+
+                used[i] = true;
+                path.Add(cur);
+
+                var prevK = startK;
+
+                int guard = 0;
+                while (curK != startK && guard++ < segs.Count + 10)
+                {
+                    if (!adj.TryGetValue(curK, out var incident))
+                        break;
+
+                    int nextSeg = -1;
+
+                    // choose an unused segment, prefer not going back to prev point
+                    foreach (int si in incident)
+                    {
+                        if (used[si]) continue;
+                        var s = segs[si];
+                        var aK = Key(s.A);
+                        var bK = Key(s.B);
+
+                        var otherK = (aK == curK) ? bK : (bK == curK ? aK : curK);
+
+                        if (otherK != prevK)
+                        {
+                            nextSeg = si;
+                            break;
+                        }
+
+                        if (nextSeg < 0)
+                            nextSeg = si;
+                    }
+
+                    if (nextSeg < 0)
+                        break;
+
+                    used[nextSeg] = true;
+
+                    var ns = segs[nextSeg];
+                    var aK2 = Key(ns.A);
+                    var bK2 = Key(ns.B);
+
+                    Point64 nextPt;
+                    (long, long) nextK;
+
+                    if (aK2 == curK)
+                    {
+                        nextPt = ns.B;
+                        nextK = bK2;
+                    }
+                    else
+                    {
+                        nextPt = ns.A;
+                        nextK = aK2;
+                    }
+
+                    // avoid duplicates
+                    if (path.Count == 0 || path[path.Count - 1].X != nextPt.X || path[path.Count - 1].Y != nextPt.Y)
+                        path.Add(nextPt);
+
+                    prevK = curK;
+                    curK = nextK;
+                    cur = nextPt;
+                }
+
+                // closed?
+                if (curK == startK && path.Count >= 4)
+                {
+                    // remove last duplicate if it equals first
+                    if (path.Count > 1 && path[path.Count - 1].X == path[0].X && path[path.Count - 1].Y == path[0].Y)
+                        path.RemoveAt(path.Count - 1);
+
+                    path = CleanPath(path);
+
+                    if (path != null && path.Count >= 3)
+                        loops.Add(path);
+                }
+            }
+
+            return loops;
+        }
+
+        private static bool TryAddPolylineSegments(Entity ent, List<(Point64 A, Point64 B)> segs, double chordMm, double snapMm)
+        {
+            // Supports both LwPolyline and Polyline (reflection-safe for vertex access + bulge)
+            try
+            {
+                var t = ent.GetType();
+                string tn = t.Name ?? "";
+
+                if (!tn.Contains("Polyline", StringComparison.OrdinalIgnoreCase))
+                    return false;
+
+                var vertsProp = t.GetProperty("Vertices");
+                var vertsObj = vertsProp?.GetValue(ent);
+                if (vertsObj == null)
+                    return false;
+
+                var vertsEnum = vertsObj as System.Collections.IEnumerable;
+                if (vertsEnum == null)
+                    return false;
+
+                var verts = new List<(double X, double Y, double Bulge)>();
+                foreach (var v in vertsEnum)
+                {
+                    if (TryGetVertexXYB(v, out double x, out double y, out double b))
+                        verts.Add((x, y, b));
+                }
+
+                if (verts.Count < 2)
+                    return false;
+
+                bool closed = false;
+                var closedProp = t.GetProperty("IsClosed") ?? t.GetProperty("Closed");
+                if (closedProp != null && closedProp.PropertyType == typeof(bool))
+                    closed = (bool)closedProp.GetValue(ent);
+
+                int count = verts.Count;
+                int last = closed ? count : count - 1;
+
+                for (int i = 0; i < last; i++)
+                {
+                    var v1 = verts[i];
+                    var v2 = verts[(i + 1) % count];
+
+                    if (Math.Abs(v1.Bulge) < 1e-12)
+                    {
+                        segs.Add((
+                            Snap(ToP64(v1.X, v1.Y), snapMm),
+                            Snap(ToP64(v2.X, v2.Y), snapMm)));
+                    }
+                    else
+                    {
+                        AddBulgeArcSegments(segs, v1, v2, chordMm, snapMm);
+                    }
+                }
+
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static bool TryGetVertexXYB(object v, out double x, out double y, out double bulge)
+        {
+            x = y = 0.0;
+            bulge = 0.0;
+
+            if (v == null) return false;
+
+            try
+            {
+                var t = v.GetType();
+
+                var pb = t.GetProperty("Bulge");
+                if (pb != null)
+                {
+                    object bv = pb.GetValue(v);
+                    if (bv is double bd) bulge = bd;
+                }
+
+                // Common patterns:
+                // - X / Y properties
+                // - Location (XYZ)
+                // - Point (XYZ)
+                var px = t.GetProperty("X");
+                var py = t.GetProperty("Y");
+
+                if (px != null && py != null)
+                {
+                    x = Convert.ToDouble(px.GetValue(v), CultureInfo.InvariantCulture);
+                    y = Convert.ToDouble(py.GetValue(v), CultureInfo.InvariantCulture);
+                    return true;
+                }
+
+                var ploc = t.GetProperty("Location") ?? t.GetProperty("Point");
+                if (ploc != null)
+                {
+                    var loc = ploc.GetValue(v);
+                    if (loc != null)
+                    {
+                        var lt = loc.GetType();
+                        var lx = lt.GetProperty("X");
+                        var ly = lt.GetProperty("Y");
+                        if (lx != null && ly != null)
+                        {
+                            x = Convert.ToDouble(lx.GetValue(loc), CultureInfo.InvariantCulture);
+                            y = Convert.ToDouble(ly.GetValue(loc), CultureInfo.InvariantCulture);
+                            return true;
+                        }
+                    }
+                }
+            }
+            catch { }
+
+            return false;
+        }
+
+        private static void AddBulgeArcSegments(List<(Point64 A, Point64 B)> segs, (double X, double Y, double Bulge) v1, (double X, double Y, double Bulge) v2, double chordMm, double snapMm)
+        {
+            double b = v1.Bulge;
+            if (Math.Abs(b) < 1e-12)
+            {
+                segs.Add((Snap(ToP64(v1.X, v1.Y), snapMm), Snap(ToP64(v2.X, v2.Y), snapMm)));
+                return;
+            }
+
+            double x1 = v1.X, y1 = v1.Y;
+            double x2 = v2.X, y2 = v2.Y;
+
+            double dx = x2 - x1;
+            double dy = y2 - y1;
+            double L = Math.Sqrt(dx * dx + dy * dy);
+            if (L < 1e-9)
+                return;
+
+            double theta = 4.0 * Math.Atan(b); // signed
+            double sinHalf = Math.Sin(theta / 2.0);
+            if (Math.Abs(sinHalf) < 1e-12)
+            {
+                segs.Add((Snap(ToP64(x1, y1), snapMm), Snap(ToP64(x2, y2), snapMm)));
+                return;
+            }
+
+            double R = L / (2.0 * sinHalf);
+            double Rabs = Math.Abs(R);
+
+            double mx = (x1 + x2) / 2.0;
+            double my = (y1 + y2) / 2.0;
+
+            double d = Math.Sqrt(Math.Max(0.0, Rabs * Rabs - (L / 2.0) * (L / 2.0)));
+
+            // left normal
+            double nx = -dy / L;
+            double ny = dx / L;
+
+            // bulge sign controls center side
+            double sign = b >= 0 ? 1.0 : -1.0;
+
+            double cx = mx + sign * nx * d;
+            double cy = my + sign * ny * d;
+
+            double a1 = Math.Atan2(y1 - cy, x1 - cx);
+            // sweep = theta
+            int segCount = Math.Max(8, (int)Math.Ceiling((Rabs * Math.Abs(theta)) / Math.Max(0.10, chordMm)));
+            segCount = Math.Min(segCount, 720);
+
+            double step = theta / segCount;
+
+            Point64 prev = Snap(ToP64(x1, y1), snapMm);
+            for (int i = 1; i <= segCount; i++)
+            {
+                double ang = a1 + step * i;
+                double px = cx + Rabs * Math.Cos(ang);
+                double py = cy + Rabs * Math.Sin(ang);
+
+                var cur = Snap(ToP64(px, py), snapMm);
+                segs.Add((prev, cur));
+                prev = cur;
+            }
+        }
+
+        private static void AddArcSegments(
+            List<(Point64 A, Point64 B)> segs,
+            XYZ center,
+            double radius,
+            double startAngle,
+            double endAngle,
+            double chordMm,
+            double snapMm)
+        {
+            // DXF arc angles are generally degrees; SolidWorks exports usually degrees.
+            // If your file is radians, you can switch here.
+            double sa = DegreesToRadiansIfNeeded(startAngle);
+            double ea = DegreesToRadiansIfNeeded(endAngle);
+
+            // CCW sweep
+            double sweep = ea - sa;
+            while (sweep < 0) sweep += 2.0 * Math.PI;
+            if (sweep <= 1e-12) sweep = 2.0 * Math.PI;
+
+            double r = Math.Abs(radius);
+            if (r <= 1e-9) return;
+
+            int segCount = Math.Max(8, (int)Math.Ceiling((r * sweep) / Math.Max(0.10, chordMm)));
+            segCount = Math.Min(segCount, 1440);
+
+            Point64 prev = Snap(ToP64(center.X + r * Math.Cos(sa), center.Y + r * Math.Sin(sa)), snapMm);
+
+            for (int i = 1; i <= segCount; i++)
+            {
+                double ang = sa + sweep * i / segCount;
+                var cur = Snap(ToP64(center.X + r * Math.Cos(ang), center.Y + r * Math.Sin(ang)), snapMm);
+                segs.Add((prev, cur));
+                prev = cur;
+            }
+        }
+
+        private static void AddCircleSegments(List<(Point64 A, Point64 B)> segs, XYZ center, double radius, double chordMm, double snapMm)
+        {
+            double r = Math.Abs(radius);
+            if (r <= 1e-9) return;
+
+            double sweep = 2.0 * Math.PI;
+            int segCount = Math.Max(16, (int)Math.Ceiling((r * sweep) / Math.Max(0.10, chordMm)));
+            segCount = Math.Min(segCount, 2880);
+
+            Point64 first = Snap(ToP64(center.X + r, center.Y), snapMm);
+            Point64 prev = first;
+
+            for (int i = 1; i <= segCount; i++)
+            {
+                double ang = sweep * i / segCount;
+                var cur = Snap(ToP64(center.X + r * Math.Cos(ang), center.Y + r * Math.Sin(ang)), snapMm);
+                segs.Add((prev, cur));
+                prev = cur;
+            }
+        }
+
+        private static double DegreesToRadiansIfNeeded(double angle)
+        {
+            // If value is > 2π by a lot, assume degrees.
+            if (Math.Abs(angle) > 10.0) // 10 rad ~ 572°
+                return angle * Math.PI / 180.0;
+
+            // Many SolidWorks exports have 0/90/180/270 => >10 triggers degrees, so OK.
+            // Small angles could be ambiguous; leave as-is.
+            return angle;
+        }
+
+        // -----------------------------------------
+        // Polygon helpers (Clipper units)
+        // -----------------------------------------
+        private static long ToInt(double mm) => (long)Math.Round(mm * SCALE);
+
+        private static Point64 ToP64(XYZ p) => new Point64(ToInt(p.X), ToInt(p.Y));
+        private static Point64 ToP64(double x, double y) => new Point64(ToInt(x), ToInt(y));
+
+        private static Point64 Snap(Point64 p, double snapMm)
+        {
+            long grid = Math.Max(1, (long)Math.Round(snapMm * SCALE));
+            long sx = (long)Math.Round((double)p.X / grid) * grid;
+            long sy = (long)Math.Round((double)p.Y / grid) * grid;
+            return new Point64(sx, sy);
+        }
+
+        private static Path64 CleanPath(Path64 path)
+        {
+            if (path == null || path.Count == 0)
+                return path;
+
+            var res = new Path64();
+            Point64 prev = path[0];
+            res.Add(prev);
+
+            for (int i = 1; i < path.Count; i++)
+            {
+                var cur = path[i];
+                if (cur.X == prev.X && cur.Y == prev.Y)
+                    continue;
+
+                res.Add(cur);
+                prev = cur;
+            }
+
+            // If last == first, drop last
+            if (res.Count > 1 && res[0].X == res[res.Count - 1].X && res[0].Y == res[res.Count - 1].Y)
+                res.RemoveAt(res.Count - 1);
+
+            return res.Count >= 3 ? res : res;
+        }
+
+        private static Path64 MakeRectPolyScaled(double minX, double minY, double maxX, double maxY)
+        {
+            long x1 = ToInt(minX);
+            long y1 = ToInt(minY);
+            long x2 = ToInt(maxX);
+            long y2 = ToInt(maxY);
+
+            var p = new Path64
+            {
+                new Point64(x1, y1),
+                new Point64(x2, y1),
+                new Point64(x2, y2),
+                new Point64(x1, y2)
+            };
+            return p;
+        }
+
+        private static Path64 RotatePoly(Path64 p, int rotDeg)
+        {
+            if (p == null) return null;
+            rotDeg = ((rotDeg % 360) + 360) % 360;
+
+            var r = new Path64(p.Count);
+
+            foreach (var pt in p)
+            {
+                long x = pt.X;
+                long y = pt.Y;
+
+                switch (rotDeg)
+                {
+                    case 0:
+                        r.Add(new Point64(x, y));
+                        break;
+                    case 90:
+                        r.Add(new Point64(-y, x));
+                        break;
+                    case 180:
+                        r.Add(new Point64(-x, -y));
+                        break;
+                    case 270:
+                        r.Add(new Point64(y, -x));
+                        break;
+                    default:
+                        // should never happen in our rotations list
+                        double rad = rotDeg * Math.PI / 180.0;
+                        long xr = (long)Math.Round(x * Math.Cos(rad) - y * Math.Sin(rad));
+                        long yr = (long)Math.Round(x * Math.Sin(rad) + y * Math.Cos(rad));
+                        r.Add(new Point64(xr, yr));
+                        break;
+                }
+            }
+
+            return r;
+        }
+
+        private static Path64 OffsetLargest(Path64 poly, double delta)
+        {
+            if (poly == null || poly.Count < 3)
+                return null;
+
+            var co = new ClipperOffset();
+            // Round is safer for offsets (reduces spikes on acute angles)
+            co.AddPath(poly, JoinType.Round, EndType.Polygon);
+
+            var sol = new Paths64();
+            co.Execute(delta, sol);
+
+            if (sol == null || sol.Count == 0)
+                return null;
+
+            // pick largest abs area
+            Path64 best = null;
+            long bestArea = 0;
+
+            foreach (var p in sol)
+            {
+                long a2 = Area2Abs(p);
+                if (a2 > bestArea)
+                {
+                    bestArea = a2;
+                    best = p;
+                }
+            }
+
+            return best;
+        }
+
+        private static LongRect GetBounds(Path64 p)
+        {
+            long minX = long.MaxValue, minY = long.MaxValue;
+            long maxX = long.MinValue, maxY = long.MinValue;
+
+            foreach (var pt in p)
+            {
+                if (pt.X < minX) minX = pt.X;
+                if (pt.Y < minY) minY = pt.Y;
+                if (pt.X > maxX) maxX = pt.X;
+                if (pt.Y > maxY) maxY = pt.Y;
+            }
+
+            return new LongRect { MinX = minX, MinY = minY, MaxX = maxX, MaxY = maxY };
+        }
+
+        private static Point64[] GetAnchors(Path64 p)
+        {
+            // anchors based on extremes
+            Point64 bl = p[0], br = p[0], tl = p[0], tr = p[0];
+
+            foreach (var pt in p)
+            {
+                if (pt.Y < bl.Y || (pt.Y == bl.Y && pt.X < bl.X)) bl = pt;
+                if (pt.Y < br.Y || (pt.Y == br.Y && pt.X > br.X)) br = pt;
+                if (pt.Y > tl.Y || (pt.Y == tl.Y && pt.X < tl.X)) tl = pt;
+                if (pt.Y > tr.Y || (pt.Y == tr.Y && pt.X > tr.X)) tr = pt;
+            }
+
+            return new[] { bl, br, tl, tr };
+        }
+
+        private static Path64 TranslatePath(Path64 p, long dx, long dy)
+        {
+            var r = new Path64(p.Count);
+            foreach (var pt in p)
+                r.Add(new Point64(pt.X + dx, pt.Y + dy));
+            return r;
+        }
+
+        private static bool RectsOverlap(LongRect a, LongRect b)
+        {
+            return !(a.MaxX <= b.MinX || b.MaxX <= a.MinX || a.MaxY <= b.MinY || b.MaxY <= a.MinY);
+        }
+
+        private static bool PolygonsOverlapAreaPositive(Path64 a, Path64 b)
+        {
+            // Intersection area > 0 => overlap
+            var clipper = new Clipper64();
+            clipper.AddSubject(a);
+            clipper.AddClip(b);
+
+            var sol = new Paths64();
+            clipper.Execute(ClipperClipType.Intersection, FillRule.NonZero, sol);
+
+            if (sol == null || sol.Count == 0)
+                return false;
+
+            foreach (var p in sol)
+            {
+                if (Area2Abs(p) > 0)
+                    return true;
+            }
+
+            return false;
+        }
+
+        private static long Area2Abs(Path64 p)
+        {
+            if (p == null || p.Count < 3)
+                return 0;
+
+            long sum = 0;
+            int n = p.Count;
+
+            for (int i = 0; i < n; i++)
+            {
+                var a = p[i];
+                var b = p[(i + 1) % n];
+
+                // cross
+                sum += a.X * b.Y - b.X * a.Y;
+            }
+
+            return Math.Abs(sum);
+        }
+
+        private static Path64 ConvexHull(List<Point64> pts)
+        {
+            if (pts == null)
+                return null;
+
+            // remove duplicates
+            var uniq = pts.Distinct().ToList();
+            if (uniq.Count < 3)
+                return null;
+
+            uniq.Sort((a, b) =>
+            {
+                int c = a.X.CompareTo(b.X);
+                if (c != 0) return c;
+                return a.Y.CompareTo(b.Y);
+            });
+
+            long Cross(Point64 o, Point64 a, Point64 b)
+                => (a.X - o.X) * (b.Y - o.Y) - (a.Y - o.Y) * (b.X - o.X);
+
+            var lower = new List<Point64>();
+            foreach (var p in uniq)
+            {
+                while (lower.Count >= 2 && Cross(lower[lower.Count - 2], lower[lower.Count - 1], p) <= 0)
+                    lower.RemoveAt(lower.Count - 1);
+                lower.Add(p);
+            }
+
+            var upper = new List<Point64>();
+            for (int i = uniq.Count - 1; i >= 0; i--)
+            {
+                var p = uniq[i];
+                while (upper.Count >= 2 && Cross(upper[upper.Count - 2], upper[upper.Count - 1], p) <= 0)
+                    upper.RemoveAt(upper.Count - 1);
+                upper.Add(p);
+            }
+
+            lower.RemoveAt(lower.Count - 1);
+            upper.RemoveAt(upper.Count - 1);
+
+            var hull = new Path64();
+            hull.AddRange(lower);
+            hull.AddRange(upper);
+
+            return hull.Count >= 3 ? hull : null;
+        }
+
+        // -----------------------------------------
+        // Grouping (material exact)
+        // -----------------------------------------
         private static Dictionary<string, string> BuildGroups(List<PartDefinition> defs, LaserCutRunSettings settings)
         {
-            // key = normalized string used for grouping (case-insensitive compare)
-            // value = the exact (pretty) label we will show / use in outputs
             var groups = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
             if (!settings.SeparateByMaterialExact || !settings.OutputOneDwgPerMaterial)
@@ -678,15 +2152,21 @@ namespace SW2026RibbonAddin.Commands
 
             foreach (var d in defs)
             {
-                string mat = MaterialNameCodec.Normalize(d.MaterialExact);
-                if (!groups.ContainsKey(mat))
-                    groups[mat] = mat;
+                string key = NormalizeKey(d.MaterialExact);
+                if (!groups.ContainsKey(key))
+                    groups[key] = d.MaterialExact;
             }
 
             if (groups.Count == 0)
                 groups["UNKNOWN"] = "UNKNOWN";
 
             return groups;
+        }
+
+        private static string NormalizeKey(string s)
+        {
+            s = (s ?? "").Trim();
+            return string.IsNullOrWhiteSpace(s) ? "UNKNOWN" : s.ToUpperInvariant();
         }
 
         private static double? TryGetPlateThicknessFromFileName(string sourceDwgPath)
@@ -718,107 +2198,37 @@ namespace SW2026RibbonAddin.Commands
             return null;
         }
 
-        private static IEnumerable<PartDefinition> LoadPartDefinitions(CadDocument doc)
-        {
-            if (doc == null)
-                yield break;
-
-            foreach (var br in doc.BlockRecords)
-            {
-                var block = br;
-                if (block == null)
-                    continue;
-
-                string name = block.Name ?? "";
-                if (!name.StartsWith("P_", StringComparison.OrdinalIgnoreCase))
-                    continue;
-
-                int qIndex = name.LastIndexOf("_Q", StringComparison.OrdinalIgnoreCase);
-                if (qIndex < 0)
-                    continue;
-
-                int qty = 1;
-                string qtyToken = name.Substring(qIndex + 2);
-                if (!int.TryParse(qtyToken, NumberStyles.Integer, CultureInfo.InvariantCulture, out qty))
-                    qty = 1;
-
-                // material exact from token in block name
-                string material = "UNKNOWN";
-                MaterialNameCodec.TryExtractFromBlockName(name, out material);
-
-                // bbox of entities inside the block (local coords)
-                double minX = double.MaxValue, minY = double.MaxValue;
-                double maxX = double.MinValue, maxY = double.MinValue;
-
-                foreach (var ent in block.Entities)
-                {
-                    try
-                    {
-                        var bb = ent.GetBoundingBox();
-                        XYZ bbMin = bb.Min;
-                        XYZ bbMax = bb.Max;
-
-                        if (bbMin.X < minX) minX = bbMin.X;
-                        if (bbMin.Y < minY) minY = bbMin.Y;
-                        if (bbMax.X > maxX) maxX = bbMax.X;
-                        if (bbMax.Y > maxY) maxY = bbMax.Y;
-                    }
-                    catch
-                    {
-                        // ignore entities without bbox
-                    }
-                }
-
-                if (minX == double.MaxValue || maxX == double.MinValue)
-                    continue;
-
-                double w = maxX - minX;
-                double h = maxY - minY;
-
-                if (w <= 0.0 || h <= 0.0)
-                    continue;
-
-                yield return new PartDefinition
-                {
-                    Block = block,
-                    BlockName = name,
-                    MaterialExact = material,
-                    MinX = minX,
-                    MinY = minY,
-                    MaxX = maxX,
-                    MaxY = maxY,
-                    Width = w,
-                    Height = h,
-                    Quantity = Math.Max(1, qty)
-                };
-            }
-        }
-
+        // -----------------------------------------
+        // Option 2 preview filtering
+        // -----------------------------------------
         private static void FilterSourcePreviewToTheseBlocks(CadDocument doc, HashSet<string> keepBlockNames)
         {
             if (doc == null || keepBlockNames == null || keepBlockNames.Count == 0)
                 return;
 
             BlockRecord modelSpace;
-            try
+            try { modelSpace = doc.BlockRecords["*Model_Space"]; }
+            catch { return; }
+
+            var inserts = modelSpace.Entities.OfType<Insert>().ToList();
+
+            var keepRanges = new List<(double minX, double maxX)>();
+
+            // Build lookup bbox per block
+            var defMap = new Dictionary<string, (double minX, double minY, double maxX, double maxY)>(StringComparer.OrdinalIgnoreCase);
+            foreach (var br in doc.BlockRecords)
             {
-                modelSpace = doc.BlockRecords["*Model_Space"];
+                if (br == null) continue;
+                string n = br.Name ?? "";
+                if (!n.StartsWith("P_", StringComparison.OrdinalIgnoreCase)) continue;
+
+                if (TryGetBlockBbox(br, out double mnX, out double mnY, out double mxX, out double mxY))
+                    defMap[n] = (mnX, mnY, mxX, mxY);
             }
-            catch
+
+            foreach (var ins in inserts)
             {
-                return;
-            }
-
-            // Remove inserts of plate blocks that are NOT in the keep set.
-            // Keep MTexts only if their X falls near any kept insert bbox.
-            var allInserts = modelSpace.Entities.OfType<Insert>().ToList();
-
-            // Build world X-ranges for kept inserts
-            var keepXRanges = new List<(double minX, double maxX)>();
-
-            foreach (var ins in allInserts)
-            {
-                var blk = ins?.Block;
+                var blk = ins.Block;
                 if (blk == null) continue;
 
                 string bn = blk.Name ?? "";
@@ -828,25 +2238,21 @@ namespace SW2026RibbonAddin.Commands
                 if (!keepBlockNames.Contains(bn))
                     continue;
 
-                // Combined layout inserts are non-rotated; bbox in world = insert + local bbox
-                // We approximate by using the block's bbox:
-                var def = LoadPartDefinitions(doc).FirstOrDefault(d => d.BlockName.Equals(bn, StringComparison.OrdinalIgnoreCase));
-                if (def == null) continue;
+                if (!defMap.TryGetValue(bn, out var bb))
+                    continue;
 
                 double ix = ins.InsertPoint.X;
-                double minX = ix + def.MinX;
-                double maxX = ix + def.MaxX;
+                double minX = ix + bb.minX;
+                double maxX = ix + bb.maxX;
                 if (minX > maxX) { var t = minX; minX = maxX; maxX = t; }
-
-                keepXRanges.Add((minX, maxX));
+                keepRanges.Add((minX, maxX));
             }
 
-            // Pad so we keep labels that are slightly wider than geometry
-            const double pad = 80.0;
+            const double pad = 120.0;
 
-            bool IsNearKeptX(double x)
+            bool IsNear(double x)
             {
-                foreach (var r in keepXRanges)
+                foreach (var r in keepRanges)
                 {
                     if (x >= r.minX - pad && x <= r.maxX + pad)
                         return true;
@@ -854,34 +2260,33 @@ namespace SW2026RibbonAddin.Commands
                 return false;
             }
 
-            var toRemove = new List<Entity>();
+            var remove = new List<Entity>();
 
-            foreach (var ent in modelSpace.Entities)
+            foreach (var e in modelSpace.Entities)
             {
-                if (ent is Insert ins)
+                if (e is Insert ins)
                 {
                     var blk = ins.Block;
                     if (blk == null) continue;
 
                     string bn = blk.Name ?? "";
                     if (bn.StartsWith("P_", StringComparison.OrdinalIgnoreCase) && !keepBlockNames.Contains(bn))
-                        toRemove.Add(ent);
+                        remove.Add(e);
                 }
-            }
-
-            foreach (var ent in modelSpace.Entities)
-            {
-                if (ent is MText mt)
+                else if (e is MText mt)
                 {
-                    double x = mt.InsertPoint.X;
-                    if (!IsNearKeptX(x))
-                        toRemove.Add(ent);
+                    if (!IsNear(mt.InsertPoint.X))
+                        remove.Add(e);
+                }
+                else
+                {
+                    // keep other entities (axes, etc.) to avoid removing useful stuff
                 }
             }
 
-            foreach (var ent in toRemove.Distinct())
+            foreach (var e in remove.Distinct())
             {
-                try { modelSpace.Entities.Remove(ent); } catch { }
+                try { modelSpace.Entities.Remove(e); } catch { }
             }
         }
 
@@ -893,273 +2298,116 @@ namespace SW2026RibbonAddin.Commands
             maxY = double.MinValue;
 
             BlockRecord modelSpace;
-            try
-            {
-                modelSpace = doc.BlockRecords["*Model_Space"];
-            }
+            try { modelSpace = doc.BlockRecords["*Model_Space"]; }
             catch
             {
                 minX = minY = maxX = maxY = 0.0;
                 return;
             }
 
+            bool any = false;
+
             foreach (var ent in modelSpace.Entities)
             {
                 try
                 {
                     var bb = ent.GetBoundingBox();
-                    XYZ a = bb.Min;
-                    XYZ b = bb.Max;
+                    var a = bb.Min;
+                    var b = bb.Max;
 
                     if (a.X < minX) minX = a.X;
                     if (a.Y < minY) minY = a.Y;
                     if (b.X > maxX) maxX = b.X;
                     if (b.Y > maxY) maxY = b.Y;
+
+                    any = true;
                 }
-                catch
-                {
-                    // ignore
-                }
+                catch { }
             }
 
-            if (minX == double.MaxValue || maxX == double.MinValue)
-            {
+            if (!any || minX == double.MaxValue || maxX == double.MinValue)
                 minX = minY = maxX = maxY = 0.0;
-            }
         }
 
-        private static int NestFreeRectangles(
-            List<PartDefinition> instances,
+        // -----------------------------------------
+        // DWG visuals (sheet outline + labels)
+        // -----------------------------------------
+        private static void DrawSheetOutline(
+            double originXmm,
+            double originYmm,
+            double sheetWmm,
+            double sheetHmm,
             BlockRecord modelSpace,
-            double sheetWidth,
-            double sheetHeight,
-            double placementMargin,
-            double sheetGap,
-            double partGap,
-            double startOriginX,
-            double baseOriginY,
-            LaserCutProgressForm progress,
-            int totalInstances,
-            string materialLabel)
+            string materialLabel,
+            int sheetIndex,
+            NestingMode mode)
         {
-            var sheets = new List<SheetState>();
+            modelSpace.Entities.Add(new Line { StartPoint = new XYZ(originXmm, originYmm, 0), EndPoint = new XYZ(originXmm + sheetWmm, originYmm, 0) });
+            modelSpace.Entities.Add(new Line { StartPoint = new XYZ(originXmm + sheetWmm, originYmm, 0), EndPoint = new XYZ(originXmm + sheetWmm, originYmm + sheetHmm, 0) });
+            modelSpace.Entities.Add(new Line { StartPoint = new XYZ(originXmm + sheetWmm, originYmm + sheetHmm, 0), EndPoint = new XYZ(originXmm, originYmm + sheetHmm, 0) });
+            modelSpace.Entities.Add(new Line { StartPoint = new XYZ(originXmm, originYmm + sheetHmm, 0), EndPoint = new XYZ(originXmm, originYmm, 0) });
 
-            SheetState NewSheet()
+            string title =
+                $"Sheet {sheetIndex}" +
+                (string.IsNullOrWhiteSpace(materialLabel) || materialLabel.Equals("ALL", StringComparison.OrdinalIgnoreCase) ? "" : $" | {materialLabel}") +
+                $" | {mode}";
+
+            modelSpace.Entities.Add(new MText
             {
-                var sheet = new SheetState
-                {
-                    Index = sheets.Count + 1,
-                    OriginX = startOriginX + sheets.Count * (sheetWidth + sheetGap),
-                    OriginY = baseOriginY
-                };
-
-                sheets.Add(sheet);
-                DrawSheetOutline(sheet, sheetWidth, sheetHeight, modelSpace, materialLabel);
-
-                sheet.FreeRects.Add(new FreeRect
-                {
-                    X = placementMargin,
-                    Y = placementMargin,
-                    Width = sheetWidth - 2 * placementMargin,
-                    Height = sheetHeight - 2 * placementMargin
-                });
-
-                return sheet;
-            }
-
-            int placed = 0;
-            var sheetState = NewSheet();
-
-            foreach (var inst in instances)
-            {
-                while (true)
-                {
-                    if (TryPlaceOnSheet(sheetState, inst, partGap, modelSpace, ref placed, totalInstances, progress))
-                        break;
-
-                    sheetState = NewSheet();
-                }
-            }
-
-            return sheets.Count;
+                Value = title,
+                InsertPoint = new XYZ(originXmm + 10.0, originYmm + sheetHmm + 18.0, 0.0),
+                Height = 20.0
+            });
         }
 
-        private static bool TryPlaceOnSheet(
-            SheetState sheet,
-            PartDefinition part,
-            double partGap,
-            BlockRecord modelSpace,
-            ref int placed,
-            int totalInstances,
-            LaserCutProgressForm progress)
+        private static void AddSheetLabel(BlockRecord modelSpace, double originXmm, double originYmm, double sheetWmm, double sheetHmm, int sheetIndex, double fillPercent)
         {
-            if (sheet.FreeRects.Count == 0)
-                return false;
-
-            int bestIndex = -1;
-            bool bestRot90 = false;
-            double bestShortSideFit = double.MaxValue;
-            double bestLongSideFit = double.MaxValue;
-
-            for (int i = 0; i < sheet.FreeRects.Count; i++)
+            modelSpace.Entities.Add(new MText
             {
-                var fr = sheet.FreeRects[i];
-
-                Evaluate(fr, part.Width, part.Height, false, i);
-                Evaluate(fr, part.Height, part.Width, true, i);
-            }
-
-            if (bestIndex < 0)
-                return false;
-
-            var chosen = sheet.FreeRects[bestIndex];
-            bool rot90 = bestRot90;
-
-            double w = rot90 ? part.Height : part.Width;
-            double h = rot90 ? part.Width : part.Height;
-
-            double placeW = w + partGap;
-            double placeH = h + partGap;
-
-            double desiredMinLocalX = chosen.X + partGap * 0.5;
-            double desiredMinLocalY = chosen.Y + partGap * 0.5;
-
-            double insertXWorld;
-            double insertYWorld;
-            double rotationRad;
-
-            if (!rot90)
-            {
-                double worldMinX = sheet.OriginX + desiredMinLocalX;
-                double worldMinY = sheet.OriginY + desiredMinLocalY;
-
-                insertXWorld = worldMinX - part.MinX;
-                insertYWorld = worldMinY - part.MinY;
-
-                // 0 or 180 are equivalent for packing; we keep 0.
-                rotationRad = 0.0;
-            }
-            else
-            {
-                // 90° rotation around insert point:
-                // rotate (x,y)->(-y,x).
-                // bounding min after rotation about origin: (-MaxY, MinX)
-                double worldMinX = sheet.OriginX + desiredMinLocalX;
-                double worldMinY = sheet.OriginY + desiredMinLocalY;
-
-                insertXWorld = worldMinX + part.MaxY;
-                insertYWorld = worldMinY - part.MinX;
-
-                // 90 or 270 are equivalent for packing; we keep 90.
-                rotationRad = Math.PI / 2.0;
-            }
-
-            var insert = new Insert(part.Block)
-            {
-                InsertPoint = new XYZ(insertXWorld, insertYWorld, 0.0),
-                XScale = 1.0,
-                YScale = 1.0,
-                ZScale = 1.0,
-                Rotation = rotationRad
-            };
-            modelSpace.Entities.Add(insert);
-
-            SplitFreeRect(sheet, bestIndex, chosen, placeW, placeH);
-
-            placed++;
-            progress.Step($"Placed {placed} / {totalInstances} ...");
-
-            return true;
-
-            void Evaluate(FreeRect fr, double wc, double hc, bool candidateRot90, int rectIndex)
-            {
-                double pw = wc + partGap;
-                double ph = hc + partGap;
-
-                if (pw > fr.Width || ph > fr.Height)
-                    return;
-
-                double leftoverHoriz = fr.Width - pw;
-                double leftoverVert = fr.Height - ph;
-
-                double shortSideFit = Math.Min(leftoverHoriz, leftoverVert);
-                double longSideFit = Math.Max(leftoverHoriz, leftoverVert);
-
-                if (shortSideFit < bestShortSideFit ||
-                    (Math.Abs(shortSideFit - bestShortSideFit) < 1e-9 && longSideFit < bestLongSideFit))
-                {
-                    bestShortSideFit = shortSideFit;
-                    bestLongSideFit = longSideFit;
-                    bestIndex = rectIndex;
-                    bestRot90 = candidateRot90;
-                }
-            }
+                Value = $"Fill: {fillPercent:0.0}%",
+                InsertPoint = new XYZ(originXmm + sheetWmm - 220.0, originYmm + sheetHmm + 18.0, 0.0),
+                Height = 18.0
+            });
         }
 
-        private static void SplitFreeRect(SheetState sheet, int rectIndex, FreeRect usedRect, double usedWidth, double usedHeight)
+        // -----------------------------------------
+        // Log
+        // -----------------------------------------
+        private static void AppendNestLog(
+            string logPath,
+            string thicknessFile,
+            string material,
+            double sheetW,
+            double sheetH,
+            double thicknessMm,
+            double gapMm,
+            double marginMm,
+            int sheets,
+            int parts,
+            string outDwg,
+            NestingMode mode)
         {
-            sheet.FreeRects.RemoveAt(rectIndex);
-
-            const double minSize = 1.0;
-
-            double rightWidth = usedRect.Width - usedWidth;
-            if (rightWidth > minSize)
+            try
             {
-                sheet.FreeRects.Add(new FreeRect
-                {
-                    X = usedRect.X + usedWidth,
-                    Y = usedRect.Y,
-                    Width = rightWidth,
-                    Height = usedRect.Height
-                });
+                var sb = new StringBuilder();
+                sb.AppendLine("Nest run:");
+                sb.AppendLine("  Thickness file: " + Path.GetFileName(thicknessFile));
+                sb.AppendLine("  Material: " + material);
+                sb.AppendLine($"  Mode: {mode}");
+                sb.AppendLine($"  Sheet: {sheetW:0.###} x {sheetH:0.###} mm");
+                sb.AppendLine($"  Thickness(mm): {thicknessMm:0.###}");
+                sb.AppendLine($"  Gap(mm): {gapMm:0.###}  (auto >= thickness)");
+                sb.AppendLine($"  Margin(mm): {marginMm:0.###}");
+                sb.AppendLine($"  Sheets used: {sheets}");
+                sb.AppendLine($"  Total parts: {parts}");
+                sb.AppendLine("  Output: " + Path.GetFileName(outDwg));
+                sb.AppendLine(new string('-', 70));
+
+                File.AppendAllText(logPath, sb.ToString(), Encoding.UTF8);
             }
-
-            double topHeight = usedRect.Height - usedHeight;
-            if (topHeight > minSize)
+            catch
             {
-                sheet.FreeRects.Add(new FreeRect
-                {
-                    X = usedRect.X,
-                    Y = usedRect.Y + usedHeight,
-                    Width = usedWidth,
-                    Height = topHeight
-                });
-            }
-        }
-
-        private static void DrawSheetOutline(SheetState sheet, double sheetWidth, double sheetHeight, BlockRecord modelSpace, string materialLabel)
-        {
-            // Border
-            modelSpace.Entities.Add(new Line
-            {
-                StartPoint = new XYZ(sheet.OriginX, sheet.OriginY, 0.0),
-                EndPoint = new XYZ(sheet.OriginX + sheetWidth, sheet.OriginY, 0.0)
-            });
-            modelSpace.Entities.Add(new Line
-            {
-                StartPoint = new XYZ(sheet.OriginX + sheetWidth, sheet.OriginY, 0.0),
-                EndPoint = new XYZ(sheet.OriginX + sheetWidth, sheet.OriginY + sheetHeight, 0.0)
-            });
-            modelSpace.Entities.Add(new Line
-            {
-                StartPoint = new XYZ(sheet.OriginX + sheetWidth, sheet.OriginY + sheetHeight, 0.0),
-                EndPoint = new XYZ(sheet.OriginX, sheet.OriginY + sheetHeight, 0.0)
-            });
-            modelSpace.Entities.Add(new Line
-            {
-                StartPoint = new XYZ(sheet.OriginX, sheet.OriginY + sheetHeight, 0.0),
-                EndPoint = new XYZ(sheet.OriginX, sheet.OriginY, 0.0)
-            });
-
-            // Title (material)
-            if (!string.IsNullOrWhiteSpace(materialLabel) && !materialLabel.Equals("ALL", StringComparison.OrdinalIgnoreCase))
-            {
-                modelSpace.Entities.Add(new MText
-                {
-                    Value = $"Material: {materialLabel}",
-                    InsertPoint = new XYZ(sheet.OriginX + 10.0, sheet.OriginY + sheetHeight + 15.0, 0.0),
-                    Height = 20.0
-                });
+                // ignore logging failures
             }
         }
     }

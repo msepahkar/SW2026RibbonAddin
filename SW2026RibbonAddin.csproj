@@ -49,6 +49,9 @@
     <Reference Include="ACadSharp, Version=3.3.7.0, Culture=neutral, PublicKeyToken=835670d357149d36, processorArchitecture=MSIL">
       <HintPath>packages\ACadSharp.3.3.7\lib\net48\ACadSharp.dll</HintPath>
     </Reference>
+    <Reference Include="Clipper2Lib, Version=2.0.0.0, Culture=neutral, PublicKeyToken=ddeb3f68c442d6e4, processorArchitecture=MSIL">
+      <HintPath>packages\Clipper2.2.0.0\lib\netstandard2.0\Clipper2Lib.dll</HintPath>
+    </Reference>
     <Reference Include="SolidWorks.Interop.swcommands">
       <HintPath>$(SwApiRedistDir)SolidWorks.Interop.swcommands.dll</HintPath>
       <EmbedInteropTypes>True</EmbedInteropTypes>
