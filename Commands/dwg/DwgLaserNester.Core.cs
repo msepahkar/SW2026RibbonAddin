@@ -563,46 +563,12 @@ namespace SW2026RibbonAddin.Commands
             if (job.Sheet.WidthMm <= 0 || job.Sheet.HeightMm <= 0)
                 throw new InvalidOperationException("Invalid sheet size for job: " + job.MaterialExact);
 
-            CadDocument doc;
-            using (var reader = new DwgReader(job.ThicknessFilePath))
-                doc = reader.Read();
+            string thicknessFileName = Path.GetFileName(job.ThicknessFilePath) ?? job.ThicknessFilePath;
 
             double thicknessMm = job.ThicknessMm > 0 ? job.ThicknessMm : (TryGetPlateThicknessFromFileName(job.ThicknessFilePath) ?? 0.0);
             string thkKey = ThicknessKey(thicknessMm);
 
-            // Activate CSV index for this file so LoadPartDefinitions can resolve material per block
-            var idx = TryGetAllPartsIndexForFolder(Path.GetDirectoryName(job.ThicknessFilePath) ?? "");
-            var prevIdx = _activeAllPartsIndex;
-            var prevKey = _activeThicknessKey;
-            _activeAllPartsIndex = idx;
-            _activeThicknessKey = thkKey;
-
-            List<PartDefinition> defsAll;
-            try
-            {
-                defsAll = LoadPartDefinitions(doc, settings).ToList();
-            }
-            finally
-            {
-                _activeAllPartsIndex = prevIdx;
-                _activeThicknessKey = prevKey;
-            }
-
             string material = NormalizeMaterialLabel(job.MaterialExact);
-
-            var defs = defsAll
-                .Where(d => string.Equals(NormalizeMaterialLabel(d.MaterialExact), material, StringComparison.Ordinal))
-                .ToList();
-
-            int totalInstances = defs.Sum(d => d.Quantity);
-            if (totalInstances <= 0)
-            {
-                // If we can't match (because CSV mapping couldn't match block names),
-                // fall back to "place everything" rather than producing empty output.
-                // But still keep job material in file name so user sees the issue.
-                defs = defsAll;
-                totalInstances = defs.Sum(d => d.Quantity);
-            }
 
             double gapMm = 3.0;
             if (thicknessMm > gapMm) gapMm = thicknessMm;
@@ -610,93 +576,180 @@ namespace SW2026RibbonAddin.Commands
             double marginMm = 10.0;
             if (thicknessMm > marginMm) marginMm = thicknessMm;
 
-            BlockRecord modelSpace = doc.BlockRecords["*Model_Space"];
-
-            // Filter preview to only this material's blocks (forced true)
-            if (defs != null && defs.Count > 0)
+            // Local function: load fresh doc + defs for this job/material
+            (CadDocument doc, BlockRecord modelSpace, List<PartDefinition> defs, int totalInstances, double baseSheetOriginX, double baseSheetOriginY) PrepareFresh()
             {
-                var keepSet = new HashSet<string>(defs.Select(d => d.BlockName), StringComparer.OrdinalIgnoreCase);
-                FilterSourcePreviewToTheseBlocks(doc, keepSet);
+                CadDocument d;
+                using (var reader = new DwgReader(job.ThicknessFilePath))
+                    d = reader.Read();
+
+                // Activate CSV material index for this thickness while scanning blocks
+                var idx = TryGetAllPartsIndexForFolder(Path.GetDirectoryName(job.ThicknessFilePath) ?? "");
+                var prevIdx = _activeAllPartsIndex;
+                var prevKey = _activeThicknessKey;
+                _activeAllPartsIndex = idx;
+                _activeThicknessKey = thkKey;
+
+                List<PartDefinition> defsAll;
+                try
+                {
+                    defsAll = LoadPartDefinitions(d, settings).ToList();
+                }
+                finally
+                {
+                    _activeAllPartsIndex = prevIdx;
+                    _activeThicknessKey = prevKey;
+                }
+
+                var defsFiltered = defsAll
+                    .Where(dd => string.Equals(NormalizeMaterialLabel(dd.MaterialExact), material, StringComparison.Ordinal))
+                    .ToList();
+
+                int total = defsFiltered.Sum(dd => dd.Quantity);
+
+                // If mapping failed, fall back to placing everything (still produces output)
+                if (total <= 0)
+                {
+                    defsFiltered = defsAll;
+                    total = defsFiltered.Sum(dd => dd.Quantity);
+                }
+
+                BlockRecord ms = d.BlockRecords["*Model_Space"];
+
+                // Filter preview to only this job's blocks
+                if (defsFiltered.Count > 0)
+                {
+                    var keepSet = new HashSet<string>(defsFiltered.Select(dd => dd.BlockName), StringComparer.OrdinalIgnoreCase);
+                    FilterSourcePreviewToTheseBlocks(d, keepSet);
+                }
+
+                GetModelSpaceExtents(d, out double srcMinX, out _, out _, out double srcMaxY);
+
+                double baseX = srcMinX;
+                double baseY = srcMaxY + 200.0;
+
+                return (d, ms, defsFiltered, total, baseX, baseY);
             }
 
-            GetModelSpaceExtents(doc, out double srcMinX, out double srcMinY, out double srcMaxX, out double srcMaxY);
+            // Prepare first attempt
+            var prep = PrepareFresh();
 
-            double baseSheetOriginX = srcMinX;
-            double baseSheetOriginY = srcMaxY + 200.0;
+            NestingMode finalMode = settings.Mode;
+            int sheetsUsed = 0;
 
+            // show task header
             progress.BeginTask(
                 taskIndex,
                 totalTasks,
-                Path.GetFileName(job.ThicknessFilePath),
+                thicknessFileName,
                 material,
                 thicknessMm,
-                totalInstances,
+                prep.totalInstances,
                 settings.Mode,
                 job.Sheet.WidthMm,
                 job.Sheet.HeightMm);
 
-            int sheetsUsed;
-
-            if (settings.Mode == NestingMode.FastRectangles)
+            try
             {
-                sheetsUsed = NestFastRectangles(
-                    defs,
-                    modelSpace,
-                    job.Sheet.WidthMm,
-                    job.Sheet.HeightMm,
-                    marginMm,
-                    gapMm,
-                    baseSheetOriginX,
-                    baseSheetOriginY,
-                    material,
-                    progress,
-                    totalInstances);
+                if (settings.Mode == NestingMode.FastRectangles)
+                {
+                    sheetsUsed = NestFastRectangles(
+                        prep.defs,
+                        prep.modelSpace,
+                        job.Sheet.WidthMm,
+                        job.Sheet.HeightMm,
+                        marginMm,
+                        gapMm,
+                        prep.baseSheetOriginX,
+                        prep.baseSheetOriginY,
+                        material,
+                        progress,
+                        prep.totalInstances);
+                }
+                else if (settings.Mode == NestingMode.ContourLevel1)
+                {
+                    sheetsUsed = NestContourLevel1(
+                        prep.defs,
+                        prep.modelSpace,
+                        job.Sheet.WidthMm,
+                        job.Sheet.HeightMm,
+                        marginMm,
+                        gapMm,
+                        prep.baseSheetOriginX,
+                        prep.baseSheetOriginY,
+                        material,
+                        progress,
+                        prep.totalInstances,
+                        chordMm: Math.Max(0.10, settings.ContourChordMm),
+                        snapMm: Math.Max(0.01, settings.ContourSnapMm),
+                        maxCandidates: Math.Max(500, settings.MaxCandidatesPerTry));
+                }
+                else
+                {
+                    // Level 2 attempt
+                    sheetsUsed = NestContourLevel2_Nfp(
+                        prep.defs,
+                        prep.modelSpace,
+                        job.Sheet.WidthMm,
+                        job.Sheet.HeightMm,
+                        marginMm,
+                        gapMm,
+                        prep.baseSheetOriginX,
+                        prep.baseSheetOriginY,
+                        material,
+                        progress,
+                        prep.totalInstances,
+                        chordMm: Math.Max(0.10, settings.ContourChordMm),
+                        snapMm: Math.Max(0.01, settings.ContourSnapMm),
+                        maxCandidates: Math.Max(500, settings.MaxCandidatesPerTry),
+                        maxPartners: Math.Max(10, settings.MaxNfpPartnersPerTry));
+                }
             }
-            else if (settings.Mode == NestingMode.ContourLevel1)
+            catch (Level2TimeoutException)
             {
+                // Automatic fallback
+                finalMode = NestingMode.ContourLevel1;
+                progress.SetStatus("Level 2 is too slow here → falling back to Level 1 for this job...");
+
+                // reload clean DWG and redo in Level1
+                prep = PrepareFresh();
+
+                progress.BeginTask(
+                    taskIndex,
+                    totalTasks,
+                    thicknessFileName,
+                    material,
+                    thicknessMm,
+                    prep.totalInstances,
+                    finalMode,
+                    job.Sheet.WidthMm,
+                    job.Sheet.HeightMm);
+
                 sheetsUsed = NestContourLevel1(
-                    defs,
-                    modelSpace,
+                    prep.defs,
+                    prep.modelSpace,
                     job.Sheet.WidthMm,
                     job.Sheet.HeightMm,
                     marginMm,
                     gapMm,
-                    baseSheetOriginX,
-                    baseSheetOriginY,
+                    prep.baseSheetOriginX,
+                    prep.baseSheetOriginY,
                     material,
                     progress,
-                    totalInstances,
+                    prep.totalInstances,
                     chordMm: Math.Max(0.10, settings.ContourChordMm),
                     snapMm: Math.Max(0.01, settings.ContourSnapMm),
                     maxCandidates: Math.Max(500, settings.MaxCandidatesPerTry));
             }
-            else
-            {
-                sheetsUsed = NestContourLevel2_Nfp(
-                    defs,
-                    modelSpace,
-                    job.Sheet.WidthMm,
-                    job.Sheet.HeightMm,
-                    marginMm,
-                    gapMm,
-                    baseSheetOriginX,
-                    baseSheetOriginY,
-                    material,
-                    progress,
-                    totalInstances,
-                    chordMm: Math.Max(0.10, settings.ContourChordMm),
-                    snapMm: Math.Max(0.01, settings.ContourSnapMm),
-                    maxCandidates: Math.Max(500, settings.MaxCandidatesPerTry),
-                    maxPartners: Math.Max(10, settings.MaxNfpPartnersPerTry));
-            }
 
+            // Write output
             string dir = Path.GetDirectoryName(job.ThicknessFilePath) ?? "";
             string nameNoExt = Path.GetFileNameWithoutExtension(job.ThicknessFilePath) ?? "thickness";
 
             string safeMat = MakeSafeFileToken(material);
             string outPath = Path.Combine(dir, $"{nameNoExt}_nested_{safeMat}.dwg");
 
-            using (var writer = new DwgWriter(outPath, doc))
+            using (var writer = new DwgWriter(outPath, prep.doc))
                 writer.Write();
 
             string logPath = Path.Combine(dir, $"{nameNoExt}_nest_log.txt");
@@ -710,9 +763,21 @@ namespace SW2026RibbonAddin.Commands
                 gapMm,
                 marginMm,
                 sheetsUsed,
-                totalInstances,
+                prep.totalInstances,
                 outPath,
-                settings.Mode);
+                finalMode);
+
+            if (finalMode != settings.Mode)
+            {
+                try
+                {
+                    File.AppendAllText(logPath,
+                        $"  NOTE: Requested {settings.Mode} but used {finalMode} (timeout fallback).\r\n" +
+                        new string('-', 70) + "\r\n",
+                        Encoding.UTF8);
+                }
+                catch { }
+            }
 
             return new NestRunResult
             {
@@ -720,8 +785,8 @@ namespace SW2026RibbonAddin.Commands
                 MaterialExact = material,
                 OutputDwg = outPath,
                 SheetsUsed = sheetsUsed,
-                TotalParts = totalInstances,
-                Mode = settings.Mode
+                TotalParts = prep.totalInstances,
+                Mode = finalMode
             };
         }
 
