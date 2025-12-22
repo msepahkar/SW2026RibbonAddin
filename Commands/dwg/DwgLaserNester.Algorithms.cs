@@ -1,27 +1,44 @@
-﻿using System;
+﻿using ACadSharp.Entities;
+using ACadSharp.Tables;
+using Clipper2Lib;
+using CSMath;
+using SW2026RibbonAddin.Commands.SW2026RibbonAddin.Commands;
+using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
 using System.Linq;
-
-using ACadSharp.Entities;
-using ACadSharp.Tables;
-using CSMath;
-using Clipper2Lib;
 
 namespace SW2026RibbonAddin.Commands
 {
     internal static partial class DwgLaserNester
     {
         // ============================
-        // Level 2 safety rails (tune here)
+        // Level 2 production settings
         // ============================
-        private const int LEVEL2_JOB_TIMEOUT_SECONDS = 120;     // <- change if you want
-        private const int LEVEL2_MAX_CANDIDATES_CAP = 800;      // hard cap on candidates per try
-        private const int LEVEL2_MAX_PARTNERS_CAP = 20;         // hard cap on NFP partners per try
-        private const int LEVEL2_NFP_MAX_POINTS = 180;          // decimate polygons used for Minkowski
+        private const int LEVEL2_JOB_TIMEOUT_SECONDS = 120; // hard safety: job-level time budget
+        private const int LEVEL2_MAX_CANDIDATES_CAP = 800;
+        private const int LEVEL2_MAX_PARTNERS_CAP = 20;
+        private const int LEVEL2_NFP_MAX_POINTS = 180;
 
-        private sealed class Level2TimeoutException : Exception
+        // HYBRID: use Level2 for “big parts”, then Level1 for the rest (fast & safe)
+        private const int LEVEL2_HYBRID_MIN_TOPN = 10;
+        private const int LEVEL2_HYBRID_MAX_TOPN = 60;
+        private const int LEVEL2_HYBRID_DIVISOR = 5; // total/5 => 20%
+
+        private static int ComputeHybridTopN(int totalInstances)
+        {
+            totalInstances = Math.Max(0, totalInstances);
+            if (totalInstances <= 0) return 0;
+
+            int byFraction = totalInstances / LEVEL2_HYBRID_DIVISOR;
+            int top = Math.Max(LEVEL2_HYBRID_MIN_TOPN, byFraction);
+            top = Math.Min(top, LEVEL2_HYBRID_MAX_TOPN);
+            top = Math.Min(top, totalInstances);
+            return top;
+        }
+
+        internal sealed class Level2TimeoutException : Exception
         {
             public Level2TimeoutException(string msg) : base(msg) { }
         }
@@ -55,6 +72,8 @@ namespace SW2026RibbonAddin.Commands
             LaserCutProgressForm progress,
             int totalInstances)
         {
+            progress.ThrowIfCancelled();
+
             double placementMargin = marginMm + gapMm;
 
             double usableW = sheetWmm - 2 * placementMargin;
@@ -97,6 +116,8 @@ namespace SW2026RibbonAddin.Commands
 
             foreach (var part in instances)
             {
+                progress.ThrowIfCancelled();
+
                 while (true)
                 {
                     if (TryPlaceRect(cur, part, gapMm, modelSpace))
@@ -129,11 +150,9 @@ namespace SW2026RibbonAddin.Commands
             {
                 var fr = sheet.Free[frIndex];
 
-                // 0 deg
                 if (TryPlaceRectOrientation(sheet, part, frIndex, fr, part.Width, part.Height, 0.0, gapMm, modelSpace))
                     return true;
 
-                // 90 deg
                 if (TryPlaceRectOrientation(sheet, part, frIndex, fr, part.Height, part.Width, Math.PI / 2.0, gapMm, modelSpace))
                     return true;
             }
@@ -174,7 +193,6 @@ namespace SW2026RibbonAddin.Commands
             }
             else
             {
-                // (x,y)->(-y,x) around origin
                 insertX = worldMinX + part.MaxY;
                 insertY = worldMinY - part.MinX;
             }
@@ -221,6 +239,8 @@ namespace SW2026RibbonAddin.Commands
             double snapMm,
             int maxCandidates)
         {
+            progress.ThrowIfCancelled();
+
             double boundaryBufferMm = marginMm + gapMm / 2.0;
 
             double usableWmm = sheetWmm - 2 * boundaryBufferMm;
@@ -254,20 +274,31 @@ namespace SW2026RibbonAddin.Commands
             }
 
             var cur = NewSheet();
-            int placed = 0;
 
+            int placed = 0;
             progress.ReportPlaced(0, totalInstances, sheets.Count);
 
             foreach (var part in instances)
             {
+                progress.ThrowIfCancelled();
+
                 bool placedThis = false;
 
                 for (int si = 0; si < sheets.Count; si++)
                 {
-                    if (TryPlaceContourOnSheet_Level1(sheets[si], part, usableW, usableH, maxCandidates, GetRot, out var placement))
+                    if (TryPlaceContourOnSheet_Level1(sheets[si], part, usableW, usableH, maxCandidates, GetRot, progress, out var placement))
                     {
                         AddPlacedToDwg(modelSpace, part, sheets[si], boundaryBufferMm, placement.InsertX, placement.InsertY, placement.RotRad);
-                        sheets[si].Placed.Add(new PlacedContour { OffsetPoly = placement.OffsetPolyTranslated, BBox = placement.OffsetBBoxTranslated });
+
+                        var decNfp = CleanPath(DecimatePath(placement.OffsetPolyTranslated, LEVEL2_NFP_MAX_POINTS));
+
+                        sheets[si].Placed.Add(new PlacedContour
+                        {
+                            OffsetPoly = placement.OffsetPolyTranslated,
+                            OffsetPolyNfp = decNfp,
+                            BBox = placement.OffsetBBoxTranslated
+                        });
+
                         sheets[si].PlacedCount++;
                         sheets[si].UsedArea2Abs += placement.RotArea2Abs;
 
@@ -284,11 +315,20 @@ namespace SW2026RibbonAddin.Commands
                 cur = NewSheet();
                 progress.ReportPlaced(placed, totalInstances, sheets.Count);
 
-                if (!TryPlaceContourOnSheet_Level1(cur, part, usableW, usableH, maxCandidates, GetRot, out var placement2))
+                if (!TryPlaceContourOnSheet_Level1(cur, part, usableW, usableH, maxCandidates, GetRot, progress, out var placement2))
                     throw new InvalidOperationException("Failed to place a part even on a fresh sheet. Sheet too small?");
 
                 AddPlacedToDwg(modelSpace, part, cur, boundaryBufferMm, placement2.InsertX, placement2.InsertY, placement2.RotRad);
-                cur.Placed.Add(new PlacedContour { OffsetPoly = placement2.OffsetPolyTranslated, BBox = placement2.OffsetBBoxTranslated });
+
+                var decNfp2 = CleanPath(DecimatePath(placement2.OffsetPolyTranslated, LEVEL2_NFP_MAX_POINTS));
+
+                cur.Placed.Add(new PlacedContour
+                {
+                    OffsetPoly = placement2.OffsetPolyTranslated,
+                    OffsetPolyNfp = decNfp2,
+                    BBox = placement2.OffsetBBoxTranslated
+                });
+
                 cur.PlacedCount++;
                 cur.UsedArea2Abs += placement2.RotArea2Abs;
 
@@ -307,12 +347,15 @@ namespace SW2026RibbonAddin.Commands
             long usableH,
             int maxCandidates,
             Func<PartDefinition, int, RotatedPoly> getRot,
+            LaserCutProgressForm progress,
             out ContourPlacement placement)
         {
             placement = default;
 
             foreach (int rotDeg in RotationsDeg)
             {
+                progress.ThrowIfCancelled();
+
                 var rp = getRot(part, rotDeg);
 
                 long offW = rp.OffsetBounds.MaxX - rp.OffsetBounds.MinX;
@@ -323,8 +366,13 @@ namespace SW2026RibbonAddin.Commands
                 var candidates = GenerateCandidates_Level1(sheet, rp, usableW, usableH, maxCandidates);
                 candidates.Sort((a, b) => CandidateCompare(a, b, rp));
 
-                foreach (var cand in candidates)
+                for (int i = 0; i < candidates.Count; i++)
                 {
+                    if ((i & 127) == 0)
+                        progress.ThrowIfCancelled();
+
+                    var cand = candidates[i];
+
                     if (!CandidateFits(cand, rp, usableW, usableH, out var movedBBox))
                         continue;
 
@@ -431,7 +479,7 @@ namespace SW2026RibbonAddin.Commands
         }
 
         // ---------------------------
-        // CONTOUR LEVEL 2 (NFP/Minkowski) - now bounded + timeout
+        // CONTOUR LEVEL 2 (HYBRID L2 then L1)
         // ---------------------------
         private static int NestContourLevel2_Nfp(
             List<PartDefinition> defs,
@@ -450,11 +498,16 @@ namespace SW2026RibbonAddin.Commands
             int maxCandidates,
             int maxPartners)
         {
+            progress.ThrowIfCancelled();
+
+            // hard caps
+            maxCandidates = Math.Min(Math.Max(200, maxCandidates), LEVEL2_MAX_CANDIDATES_CAP);
+            maxPartners = Math.Min(Math.Max(5, maxPartners), LEVEL2_MAX_PARTNERS_CAP);
+
+            // deadline (if exceeded -> we still finish job by falling back to Level1 internally)
             long deadlineTicks = MakeDeadlineTicks(LEVEL2_JOB_TIMEOUT_SECONDS);
 
-            // Hard caps (prevents “hours”)
-            maxCandidates = Math.Min(maxCandidates, LEVEL2_MAX_CANDIDATES_CAP);
-            maxPartners = Math.Min(maxPartners, LEVEL2_MAX_PARTNERS_CAP);
+            int hybridTopN = ComputeHybridTopN(totalInstances);
 
             double boundaryBufferMm = marginMm + gapMm / 2.0;
 
@@ -489,45 +542,116 @@ namespace SW2026RibbonAddin.Commands
             }
 
             var cur = NewSheet();
+
             int placed = 0;
+            bool level2DisabledByTime = false;
 
             progress.ReportPlaced(0, totalInstances, sheets.Count);
 
             foreach (var part in instances)
             {
-                ThrowIfDeadlineExceeded(deadlineTicks);
+                progress.ThrowIfCancelled();
+
+                bool wantLevel2 = !level2DisabledByTime && (placed < hybridTopN);
+
+                if (wantLevel2 && Stopwatch.GetTimestamp() > deadlineTicks)
+                {
+                    level2DisabledByTime = true;
+                    wantLevel2 = false;
+                    progress.SetStatus($"Level 2 budget used ({LEVEL2_JOB_TIMEOUT_SECONDS}s) → switching to Level 1 for the rest...");
+                }
 
                 bool placedThis = false;
 
                 for (int si = 0; si < sheets.Count; si++)
                 {
-                    if (TryPlaceContourOnSheet_Level2Nfp(sheets[si], part, usableW, usableH, maxCandidates, maxPartners, GetRot, deadlineTicks, out var placement))
+                    if (wantLevel2)
                     {
-                        AddPlacedToDwg(modelSpace, part, sheets[si], boundaryBufferMm, placement.InsertX, placement.InsertY, placement.RotRad);
-                        sheets[si].Placed.Add(new PlacedContour { OffsetPoly = placement.OffsetPolyTranslated, BBox = placement.OffsetBBoxTranslated });
-                        sheets[si].PlacedCount++;
-                        sheets[si].UsedArea2Abs += placement.RotArea2Abs;
+                        // Try Level2 first, then Level1 fallback for this part
+                        try
+                        {
+                            if (TryPlaceContourOnSheet_Level2Nfp(sheets[si], part, usableW, usableH, maxCandidates, maxPartners, GetRot, progress, deadlineTicks, out var placementL2))
+                            {
+                                CommitPlaced(modelSpace, part, sheets[si], boundaryBufferMm, placementL2);
+                                placed++;
+                                progress.ReportPlaced(placed, totalInstances, sheets.Count);
+                                placedThis = true;
+                                break;
+                            }
+                        }
+                        catch (Level2TimeoutException)
+                        {
+                            level2DisabledByTime = true;
+                            wantLevel2 = false;
+                            progress.SetStatus($"Level 2 timeout → switching to Level 1 for the rest...");
+                        }
 
-                        placed++;
-                        progress.ReportPlaced(placed, totalInstances, sheets.Count);
-                        placedThis = true;
-                        break;
+                        if (!placedThis)
+                        {
+                            if (TryPlaceContourOnSheet_Level1(sheets[si], part, usableW, usableH, maxCandidates, GetRot, progress, out var placementL1))
+                            {
+                                CommitPlaced(modelSpace, part, sheets[si], boundaryBufferMm, placementL1);
+                                placed++;
+                                progress.ReportPlaced(placed, totalInstances, sheets.Count);
+                                placedThis = true;
+                                break;
+                            }
+                        }
+                    }
+                    else
+                    {
+                        if (TryPlaceContourOnSheet_Level1(sheets[si], part, usableW, usableH, maxCandidates, GetRot, progress, out var placementL1))
+                        {
+                            CommitPlaced(modelSpace, part, sheets[si], boundaryBufferMm, placementL1);
+                            placed++;
+                            progress.ReportPlaced(placed, totalInstances, sheets.Count);
+                            placedThis = true;
+                            break;
+                        }
                     }
                 }
 
                 if (placedThis)
                     continue;
 
+                // Need a new sheet
                 cur = NewSheet();
                 progress.ReportPlaced(placed, totalInstances, sheets.Count);
 
-                if (!TryPlaceContourOnSheet_Level2Nfp(cur, part, usableW, usableH, maxCandidates, maxPartners, GetRot, deadlineTicks, out var placement2))
-                    throw new InvalidOperationException("Failed to place a part even on a fresh sheet. Sheet too small?");
+                // On fresh sheet, Level1 must always work if the sheet is large enough
+                // Try Level2 if still desired, else do Level1
+                if (wantLevel2 && !level2DisabledByTime)
+                {
+                    bool ok = false;
+                    try
+                    {
+                        ok = TryPlaceContourOnSheet_Level2Nfp(cur, part, usableW, usableH, maxCandidates, maxPartners, GetRot, progress, deadlineTicks, out var placementFreshL2);
+                        if (ok)
+                        {
+                            CommitPlaced(modelSpace, part, cur, boundaryBufferMm, placementFreshL2);
+                        }
+                    }
+                    catch (Level2TimeoutException)
+                    {
+                        level2DisabledByTime = true;
+                        ok = false;
+                    }
 
-                AddPlacedToDwg(modelSpace, part, cur, boundaryBufferMm, placement2.InsertX, placement2.InsertY, placement2.RotRad);
-                cur.Placed.Add(new PlacedContour { OffsetPoly = placement2.OffsetPolyTranslated, BBox = placement2.OffsetBBoxTranslated });
-                cur.PlacedCount++;
-                cur.UsedArea2Abs += placement2.RotArea2Abs;
+                    if (!ok)
+                    {
+                        if (!TryPlaceContourOnSheet_Level1(cur, part, usableW, usableH, maxCandidates, GetRot, progress, out var placementFreshL1))
+                            throw new InvalidOperationException("Failed to place a part even on a fresh sheet. Sheet too small?");
+
+                        CommitPlaced(modelSpace, part, cur, boundaryBufferMm, placementFreshL1);
+                    }
+                }
+                else
+                {
+                    if (!TryPlaceContourOnSheet_Level1(cur, part, usableW, usableH, maxCandidates, GetRot, progress, out var placementFreshL1))
+                        throw new InvalidOperationException("Failed to place a part even on a fresh sheet. Sheet too small?");
+
+                    CommitPlaced(modelSpace, part, cur, boundaryBufferMm, placementFreshL1);
+                }
 
                 placed++;
                 progress.ReportPlaced(placed, totalInstances, sheets.Count);
@@ -535,6 +659,24 @@ namespace SW2026RibbonAddin.Commands
 
             AddFillLabels(modelSpace, sheets, usableW, usableH, sheetWmm, sheetHmm);
             return sheets.Count;
+        }
+
+        private static void CommitPlaced(BlockRecord modelSpace, PartDefinition part, SheetContourState sheet, double boundaryBufferMm, ContourPlacement placement)
+        {
+            AddPlacedToDwg(modelSpace, part, sheet, boundaryBufferMm, placement.InsertX, placement.InsertY, placement.RotRad);
+
+            // cache NFP simplified contour once
+            var dec = CleanPath(DecimatePath(placement.OffsetPolyTranslated, LEVEL2_NFP_MAX_POINTS));
+
+            sheet.Placed.Add(new PlacedContour
+            {
+                OffsetPoly = placement.OffsetPolyTranslated,
+                OffsetPolyNfp = dec,
+                BBox = placement.OffsetBBoxTranslated
+            });
+
+            sheet.PlacedCount++;
+            sheet.UsedArea2Abs += placement.RotArea2Abs;
         }
 
         private static bool TryPlaceContourOnSheet_Level2Nfp(
@@ -545,6 +687,7 @@ namespace SW2026RibbonAddin.Commands
             int maxCandidates,
             int maxPartners,
             Func<PartDefinition, int, RotatedPoly> getRot,
+            LaserCutProgressForm progress,
             long deadlineTicks,
             out ContourPlacement placement)
         {
@@ -552,6 +695,7 @@ namespace SW2026RibbonAddin.Commands
 
             foreach (int rotDeg in RotationsDeg)
             {
+                progress.ThrowIfCancelled();
                 ThrowIfDeadlineExceeded(deadlineTicks);
 
                 var rp = getRot(part, rotDeg);
@@ -561,13 +705,16 @@ namespace SW2026RibbonAddin.Commands
                 if (offW <= 0 || offH <= 0 || offW > usableW || offH > usableH)
                     continue;
 
-                var candidates = GenerateCandidates_Level2Nfp(sheet, rp, usableW, usableH, maxCandidates, maxPartners, deadlineTicks);
+                var candidates = GenerateCandidates_Level2Nfp(sheet, rp, usableW, usableH, maxCandidates, maxPartners, progress, deadlineTicks);
                 candidates.Sort((a, b) => CandidateCompare(a, b, rp));
 
                 for (int i = 0; i < candidates.Count; i++)
                 {
                     if ((i & 63) == 0)
+                    {
+                        progress.ThrowIfCancelled();
                         ThrowIfDeadlineExceeded(deadlineTicks);
+                    }
 
                     var cand = candidates[i];
 
@@ -602,6 +749,7 @@ namespace SW2026RibbonAddin.Commands
             long usableH,
             int maxCandidates,
             int maxPartners,
+            LaserCutProgressForm progress,
             long deadlineTicks)
         {
             var result = new List<CandidateIns>(Math.Min(maxCandidates, 2048));
@@ -626,13 +774,13 @@ namespace SW2026RibbonAddin.Commands
                 result.Add(new CandidateIns { InsX = ix, InsY = iy });
             }
 
-            // Always include bottom-left
+            // bottom-left
             Add(-rp.OffsetBounds.MinX, -rp.OffsetBounds.MinY);
 
             if (sheet.Placed.Count == 0)
                 return result;
 
-            // 1) Small skyline set (bounded)
+            // small skyline fallback (bounded)
             {
                 var xSet = new HashSet<long> { 0 };
                 var ySet = new HashSet<long> { 0 };
@@ -662,30 +810,26 @@ namespace SW2026RibbonAddin.Commands
             if (result.Count >= maxCandidates)
                 return result;
 
-            // 2) NFP candidates (Minkowski) — decimated polygons to prevent blowups
-            ThrowIfDeadlineExceeded(deadlineTicks);
-
-            Path64 movingForNfp = DecimatePath(rp.PolyOffset, LEVEL2_NFP_MAX_POINTS);
-            movingForNfp = CleanPath(movingForNfp);
-            var negA = NegatePath(movingForNfp);
-
+            // NFP candidates: MinkowskiSum(placed, -moving) using cached simplified polygons
             int partnerCount = Math.Min(maxPartners, sheet.Placed.Count);
 
             for (int pi = sheet.Placed.Count - 1; pi >= 0 && partnerCount > 0; pi--, partnerCount--)
             {
-                ThrowIfDeadlineExceeded(deadlineTicks);
+                if ((pi & 3) == 0)
+                {
+                    progress.ThrowIfCancelled();
+                    ThrowIfDeadlineExceeded(deadlineTicks);
+                }
 
                 var placed = sheet.Placed[pi];
-                if (placed.OffsetPoly == null || placed.OffsetPoly.Count < 3)
+                var placedPoly = placed.OffsetPolyNfp ?? placed.OffsetPoly;
+                if (placedPoly == null || placedPoly.Count < 3)
                     continue;
-
-                Path64 placedForNfp = DecimatePath(placed.OffsetPoly, LEVEL2_NFP_MAX_POINTS);
-                placedForNfp = CleanPath(placedForNfp);
 
                 Paths64 nfpPaths;
                 try
                 {
-                    nfpPaths = MinkowskiSumSafe(placedForNfp, negA, true);
+                    nfpPaths = MinkowskiSumSafe(placedPoly, rp.PolyOffsetNfpNeg, true);
                 }
                 catch
                 {
@@ -700,7 +844,6 @@ namespace SW2026RibbonAddin.Commands
                     if (p == null || p.Count < 3)
                         continue;
 
-                    // sample vertices (bounded)
                     int step = Math.Max(1, p.Count / 25);
                     for (int i = 0; i < p.Count; i += step)
                     {
@@ -739,7 +882,7 @@ namespace SW2026RibbonAddin.Commands
         }
 
         // ---------------------------
-        // Shared helpers (unchanged)
+        // Shared helpers
         // ---------------------------
         private static int SortByAreaDesc(PartDefinition a, PartDefinition b)
         {
@@ -775,12 +918,21 @@ namespace SW2026RibbonAddin.Commands
             var anchors = GetAnchors(offset);
             long area2Abs = Area2Abs(rotPoly);
 
+            // Cache NFP simplified + negated once per (part,rot,gap)
+            var nfp = CleanPath(DecimatePath(offset, LEVEL2_NFP_MAX_POINTS));
+            var nfpNeg = NegatePath(nfp);
+
             rp = new RotatedPoly
             {
                 RotDeg = rotDeg,
                 RotRad = rotDeg * Math.PI / 180.0,
+
                 PolyRot = rotPoly,
                 PolyOffset = offset,
+
+                PolyOffsetNfp = nfp,
+                PolyOffsetNfpNeg = nfpNeg,
+
                 OffsetBounds = bbox,
                 Anchors = anchors,
                 RotArea2Abs = area2Abs

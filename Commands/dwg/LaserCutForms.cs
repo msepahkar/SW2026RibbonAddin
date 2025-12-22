@@ -464,116 +464,209 @@ namespace SW2026RibbonAddin.Commands
         }
     }
 
-    internal sealed class LaserCutProgressForm : Form
+
+namespace SW2026RibbonAddin.Commands
     {
-        private readonly Label _line1;
-        private readonly Label _line2;
-        private readonly Label _line3;
-
-        private readonly ProgressBar _barTask;
-        private readonly ProgressBar _barOverall;
-
-        private int _totalTasks;
-
-        public LaserCutProgressForm()
+        internal sealed class LaserCutProgressForm : Form
         {
-            Text = "Nesting...";
-            FormBorderStyle = FormBorderStyle.FixedDialog;
-            StartPosition = FormStartPosition.CenterScreen;
-            MaximizeBox = false;
-            MinimizeBox = false;
-            ShowInTaskbar = false;
+            private readonly Label _lblHeader;
+            private readonly Label _lblTask;
+            private readonly Label _lblCounts;
+            private readonly Label _lblStatus;
+            private readonly ProgressBar _bar;
+            private readonly Button _btnCancel;
 
-            ClientSize = new Size(720, 170);
+            private volatile bool _cancelRequested;
 
-            _line1 = new Label { Left = 12, Top = 12, Width = 696, Height = 20, Text = "Preparing..." };
-            _line2 = new Label { Left = 12, Top = 36, Width = 696, Height = 20, Text = "" };
-            _line3 = new Label { Left = 12, Top = 60, Width = 696, Height = 20, Text = "" };
+            private int _batchTotal;
+            private int _batchIndex;
 
-            Controls.Add(_line1);
-            Controls.Add(_line2);
-            Controls.Add(_line3);
+            private int _totalParts;
+            private int _placedParts;
+            private int _sheetsUsed;
 
-            Controls.Add(new Label { Left = 12, Top = 86, Width = 160, Height = 18, Text = "Current task:" });
-            _barTask = new ProgressBar { Left = 120, Top = 84, Width = 588, Height = 18, Minimum = 0, Maximum = 1, Value = 0 };
-            Controls.Add(_barTask);
+            private string _file;
+            private string _material;
+            private double _thickness;
+            private NestingMode _mode;
+            private double _sheetW;
+            private double _sheetH;
 
-            Controls.Add(new Label { Left = 12, Top = 118, Width = 160, Height = 18, Text = "Overall:" });
-            _barOverall = new ProgressBar { Left = 120, Top = 116, Width = 588, Height = 18, Minimum = 0, Maximum = 1, Value = 0 };
-            Controls.Add(_barOverall);
+            public bool IsCancellationRequested => _cancelRequested;
+
+            public LaserCutProgressForm()
+            {
+                Text = "Nesting...";
+                FormBorderStyle = FormBorderStyle.FixedDialog;
+                MaximizeBox = false;
+                MinimizeBox = false;
+                StartPosition = FormStartPosition.CenterScreen;
+                Width = 520;
+                Height = 190;
+
+                _lblHeader = new Label { Left = 12, Top = 10, Width = 480, Height = 18, Text = "Nesting..." };
+                _lblTask = new Label { Left = 12, Top = 32, Width = 480, Height = 36, Text = "" };
+                _lblCounts = new Label { Left = 12, Top = 70, Width = 480, Height = 18, Text = "" };
+
+                _bar = new ProgressBar { Left = 12, Top = 92, Width = 480, Height = 18, Minimum = 0, Maximum = 100, Value = 0 };
+
+                _lblStatus = new Label { Left = 12, Top = 114, Width = 480, Height = 18, Text = "" };
+
+                _btnCancel = new Button { Left = 402, Top = 136, Width = 90, Height = 26, Text = "Cancel" };
+                _btnCancel.Click += (s, e) => RequestCancel();
+
+                Controls.Add(_lblHeader);
+                Controls.Add(_lblTask);
+                Controls.Add(_lblCounts);
+                Controls.Add(_bar);
+                Controls.Add(_lblStatus);
+                Controls.Add(_btnCancel);
+
+                // If user clicks [X], treat as cancel request (don’t kill the process abruptly)
+                FormClosing += (s, e) =>
+                {
+                    if (!_cancelRequested)
+                    {
+                        _cancelRequested = true;
+                        _btnCancel.Enabled = false;
+                        _lblStatus.Text = "Cancelling...";
+                        PumpUI();
+                    }
+                    // allow closing
+                };
+            }
+
+            public void BeginBatch(int totalTasks)
+            {
+                UI(() =>
+                {
+                    _batchTotal = Math.Max(1, totalTasks);
+                    _batchIndex = 0;
+
+                    _lblHeader.Text = "Nesting batch started";
+                    _lblStatus.Text = "";
+                    _bar.Value = 0;
+                    _btnCancel.Enabled = true;
+                });
+            }
+
+            public void BeginTask(
+                int taskIndex,
+                int totalTasks,
+                string thicknessFileName,
+                string materialExact,
+                double thicknessMm,
+                int totalParts,
+                NestingMode mode,
+                double sheetWmm,
+                double sheetHmm)
+            {
+                UI(() =>
+                {
+                    _batchIndex = Math.Max(1, taskIndex);
+                    _batchTotal = Math.Max(1, totalTasks);
+
+                    _file = thicknessFileName ?? "";
+                    _material = materialExact ?? "UNKNOWN";
+                    _thickness = thicknessMm;
+                    _mode = mode;
+                    _sheetW = sheetWmm;
+                    _sheetH = sheetHmm;
+
+                    _totalParts = Math.Max(0, totalParts);
+                    _placedParts = 0;
+                    _sheetsUsed = 1;
+
+                    _lblHeader.Text = $"Nesting...  Task {_batchIndex}/{_batchTotal}";
+                    _lblTask.Text =
+                        $"{_file}\r\n" +
+                        $"{_material} | {(_thickness > 0 ? _thickness.ToString("0.###") : "?")} mm | {_mode} | Sheet {_sheetW:0.###}×{_sheetH:0.###}";
+
+                    _lblCounts.Text = $"Placed {_placedParts}/{_totalParts}   Sheets: {_sheetsUsed}";
+                    _lblStatus.Text = "";
+
+                    _bar.Minimum = 0;
+                    _bar.Maximum = Math.Max(1, _totalParts);
+                    _bar.Value = 0;
+
+                    _btnCancel.Enabled = true;
+                });
+            }
+
+            public void ReportPlaced(int placed, int total, int sheetsUsed)
+            {
+                UI(() =>
+                {
+                    _placedParts = Math.Max(0, placed);
+                    _totalParts = Math.Max(0, total);
+                    _sheetsUsed = Math.Max(1, sheetsUsed);
+
+                    if (_bar.Maximum != Math.Max(1, _totalParts))
+                        _bar.Maximum = Math.Max(1, _totalParts);
+
+                    _bar.Value = Math.Min(_bar.Maximum, Math.Max(_bar.Minimum, _placedParts));
+                    _lblCounts.Text = $"Placed {_placedParts}/{_totalParts}   Sheets: {_sheetsUsed}";
+                });
+
+                ThrowIfCancelled();
+            }
+
+            public void EndTask(int doneTasks)
+            {
+                UI(() =>
+                {
+                    _lblStatus.Text = $"Finished task {doneTasks}/{_batchTotal}";
+                });
+
+                ThrowIfCancelled();
+            }
+
+            public void SetStatus(string message)
+            {
+                UI(() =>
+                {
+                    _lblStatus.Text = message ?? "";
+                });
+
+                ThrowIfCancelled();
+            }
+
+            public void ThrowIfCancelled()
+            {
+                if (_cancelRequested)
+                    throw new OperationCanceledException("User cancelled nesting.");
+            }
+
+            private void RequestCancel()
+            {
+                _cancelRequested = true;
+                UI(() =>
+                {
+                    _btnCancel.Enabled = false;
+                    _lblStatus.Text = "Cancelling...";
+                });
+            }
+
+            private void UI(Action action)
+            {
+                if (IsDisposed) return;
+
+                if (InvokeRequired)
+                {
+                    try { BeginInvoke(action); } catch { }
+                    return;
+                }
+
+                action();
+                PumpUI();
+            }
+
+            private void PumpUI()
+            {
+                // IMPORTANT: keeps the form responsive when nesting runs on the same thread
+                try { System.Windows.Forms.Application.DoEvents(); } catch { }
+            }
         }
-
-        public void BeginBatch(int totalTasks)
-        {
-            _totalTasks = Math.Max(1, totalTasks);
-
-            _barOverall.Minimum = 0;
-            _barOverall.Maximum = _totalTasks;
-            _barOverall.Value = 0;
-
-            _line1.Text = $"Starting batch... ({_totalTasks} task(s))";
-            _line2.Text = "";
-            _line3.Text = "";
-
-            RefreshUi();
-        }
-
-        public void BeginTask(int taskIndex, int totalTasks, string thicknessFileName, string material, double thicknessMm, int totalParts, NestingMode mode, double sheetW, double sheetH)
-        {
-            totalTasks = Math.Max(1, totalTasks);
-            totalParts = Math.Max(1, totalParts);
-
-            _barTask.Minimum = 0;
-            _barTask.Maximum = totalParts;
-            _barTask.Value = 0;
-
-            _line1.Text = $"Task {taskIndex}/{totalTasks}: {thicknessFileName}";
-            _line2.Text = $"Material: {material}   |   Thickness: {(thicknessMm > 0 ? thicknessMm.ToString("0.###") : "?")} mm";
-            _line3.Text = $"Mode: {mode}   |   Sheet: {sheetW:0.###} x {sheetH:0.###} mm";
-
-            RefreshUi();
-        }
-
-        public void ReportPlaced(int placed, int totalParts, int sheetsUsed)
-        {
-            totalParts = Math.Max(1, totalParts);
-            placed = Math.Max(0, Math.Min(placed, totalParts));
-
-            _barTask.Maximum = totalParts;
-            _barTask.Value = placed;
-
-            _line3.Text = $"Placed: {placed}/{totalParts}   |   Sheets used: {sheetsUsed}";
-
-            RefreshUi();
-        }
-
-        public void EndTask(int tasksDone)
-        {
-            tasksDone = Math.Max(0, Math.Min(tasksDone, _barOverall.Maximum));
-            _barOverall.Value = tasksDone;
-            RefreshUi();
-        }
-
-        private void RefreshUi()
-        {
-            _line1.Refresh();
-            _line2.Refresh();
-            _line3.Refresh();
-            _barTask.Refresh();
-            _barOverall.Refresh();
-
-            System.Windows.Forms.Application.DoEvents();
-        }
-
-        // Compatibility with older code that calls SetStatus/Step
-        public void SetStatus(string message)
-        {
-            if (!string.IsNullOrWhiteSpace(message))
-                _line1.Text = message;
-            RefreshUi();
-        }
-
-        public void Step(string message) => SetStatus(message);
     }
 
     internal static class LaserCutUiMemory
