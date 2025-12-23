@@ -93,11 +93,9 @@
     <Compile Include="ArabicNoteCodec.cs" />
     <Compile Include="ArabicTextUtils.cs" />
     <Compile Include="Commands\dwg\BatchCombineNestButton.cs" />
-    <Compile Include="Commands\dwg\CombineDwgButton.cs" />
     <Compile Include="Commands\dwg\LaserCutForms.cs">
       <SubType>Form</SubType>
     </Compile>
-    <Compile Include="Commands\dwg\LaserCutButton.cs" />
     <Compile Include="Commands\dwg\LaserCutSettings.cs" />
     <Compile Include="Commands\farsi\AddFarsiNoteButton.cs" />
     <Compile Include="Commands\general\AddinContext.cs" />
