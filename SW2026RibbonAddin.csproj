@@ -167,10 +167,6 @@
     <EmbeddedResource Include="Resources\combine_dwg_32.png" />
   </ItemGroup>
   <ItemGroup>
-    <EmbeddedResource Include="Resources\laser_cut_20.png" />
-    <EmbeddedResource Include="Resources\laser_cut_32.png" />
-  </ItemGroup>
-  <ItemGroup>
     <EmbeddedResource Include="Resources\std_screw_20.png" />
     <EmbeddedResource Include="Resources\std_screw_32.png" />
   </ItemGroup>
