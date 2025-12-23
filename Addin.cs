@@ -171,50 +171,84 @@ namespace SW2026RibbonAddin
         {
             _buttons.Clear();
 
+            var buttonType = typeof(IMehdiRibbonButton);
+            var asm = Assembly.GetExecutingAssembly();
+
+            IEnumerable<Type> types = Enumerable.Empty<Type>();
+
             try
             {
-                var buttonType = typeof(IMehdiRibbonButton);
-                var asm = Assembly.GetExecutingAssembly();
-
-                var types = asm.GetTypes()
+                types = asm.GetTypes()
                     .Where(t =>
+                        t != null &&
                         !t.IsAbstract &&
                         buttonType.IsAssignableFrom(t) &&
-                        t.GetConstructor(Type.EmptyTypes) != null);
+                        t.GetConstructor(Type.EmptyTypes) != null)
+                    // Ensure stable ordering across machines/CLR versions
+                    .OrderBy(t => t.FullName, StringComparer.Ordinal);
+            }
+            catch (ReflectionTypeLoadException rtle)
+            {
+                // Partial type-load failures shouldn't break the whole ribbon.
+                // We'll still load what we can and log loader exceptions for troubleshooting.
+                Debug.WriteLine("InitializeButtons: ReflectionTypeLoadException: " + rtle);
 
-                foreach (var t in types)
+                if (rtle.LoaderExceptions != null)
+                {
+                    foreach (var le in rtle.LoaderExceptions)
+                        Debug.WriteLine("  LoaderException: " + le);
+                }
+
+                types = (rtle.Types ?? Array.Empty<Type>())
+                    .Where(t =>
+                        t != null &&
+                        !t.IsAbstract &&
+                        buttonType.IsAssignableFrom(t) &&
+                        t.GetConstructor(Type.EmptyTypes) != null)
+                    .OrderBy(t => t.FullName, StringComparer.Ordinal);
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine("InitializeButtons: GetTypes() failed: " + ex);
+                types = Enumerable.Empty<Type>();
+            }
+
+            foreach (var t in types)
+            {
+                try
                 {
                     if (Activator.CreateInstance(t) is IMehdiRibbonButton button)
                         _buttons.Add(button);
                 }
-
-                // Fallback if reflection fails
-                if (_buttons.Count == 0)
+                catch (Exception ex)
                 {
-                    _buttons.Add(new HelloButton());
-                    _buttons.Add(new AddFarsiNoteButton());
-                    _buttons.Add(new EditSelectedFarsiNoteButton());
-                    _buttons.Add(new UpdateFarsiNotesButton());
-                    _buttons.Add(new DwgButton());
+                    // One broken button must not prevent the rest of the add-in UI from loading.
+                    Debug.WriteLine($"InitializeButtons: failed to instantiate '{t?.FullName}': {ex}");
                 }
-
-                // Sort by section, then section order, then display name
-                _buttons.Sort((a, b) =>
-                {
-                    int sectionCompare = a.Section.CompareTo(b.Section);
-                    if (sectionCompare != 0) return sectionCompare;
-
-                    int orderCompare = a.SectionOrder.CompareTo(b.SectionOrder);
-                    if (orderCompare != 0) return orderCompare;
-
-                    return string.Compare(a.DisplayName, b.DisplayName,
-                        StringComparison.CurrentCultureIgnoreCase);
-                });
             }
-            catch (Exception ex)
+
+            // Fallback if reflection fails / yields nothing usable
+            if (_buttons.Count == 0)
             {
-                Debug.WriteLine("InitializeButtons failed: " + ex);
+                _buttons.Add(new HelloButton());
+                _buttons.Add(new AddFarsiNoteButton());
+                _buttons.Add(new EditSelectedFarsiNoteButton());
+                _buttons.Add(new UpdateFarsiNotesButton());
+                _buttons.Add(new DwgButton());
             }
+
+            // Sort by section, then section order, then display name
+            _buttons.Sort((a, b) =>
+            {
+                int sectionCompare = a.Section.CompareTo(b.Section);
+                if (sectionCompare != 0) return sectionCompare;
+
+                int orderCompare = a.SectionOrder.CompareTo(b.SectionOrder);
+                if (orderCompare != 0) return orderCompare;
+
+                return string.Compare(a.DisplayName, b.DisplayName,
+                    StringComparison.CurrentCultureIgnoreCase);
+            });
         }
 
         #endregion

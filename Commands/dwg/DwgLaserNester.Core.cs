@@ -34,9 +34,16 @@ namespace SW2026RibbonAddin.Commands
                 new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         }
 
+        private sealed class AllPartsIndexCacheEntry
+        {
+            public string CsvPath;
+            public DateTime LastWriteTimeUtc;
+            public AllPartsIndex Index;
+        }
+
         private static readonly object _indexLock = new object();
-        private static readonly Dictionary<string, AllPartsIndex> _allPartsIndexCache =
-            new Dictionary<string, AllPartsIndex>(StringComparer.OrdinalIgnoreCase);
+        private static readonly Dictionary<string, AllPartsIndexCacheEntry> _allPartsIndexCache =
+            new Dictionary<string, AllPartsIndexCacheEntry>(StringComparer.OrdinalIgnoreCase);
 
         [ThreadStatic] private static AllPartsIndex _activeAllPartsIndex;
         [ThreadStatic] private static string _activeThicknessKey;
@@ -77,21 +84,34 @@ namespace SW2026RibbonAddin.Commands
             try { full = Path.GetFullPath(folder); }
             catch { full = folder; }
 
-            lock (_indexLock)
-            {
-                if (_allPartsIndexCache.TryGetValue(full, out var cached))
-                    return cached;
-            }
-
+            // IMPORTANT:
+            // 1) Do NOT negative-cache "not found" forever. all_parts.csv may be created later (e.g., after Combine).
+            // 2) If the CSV changes (timestamp), reload the index.
             var csvPath = FindAllPartsCsv(full);
             if (csvPath == null)
             {
                 lock (_indexLock)
-                    _allPartsIndexCache[full] = null;
+                    _allPartsIndexCache.Remove(full);
                 return null;
             }
 
-            AllPartsIndex idx = null;
+            DateTime lastWriteUtc;
+            try { lastWriteUtc = File.GetLastWriteTimeUtc(csvPath); }
+            catch { lastWriteUtc = DateTime.MinValue; }
+
+            lock (_indexLock)
+            {
+                if (_allPartsIndexCache.TryGetValue(full, out var entry) && entry != null)
+                {
+                    if (string.Equals(entry.CsvPath, csvPath, StringComparison.OrdinalIgnoreCase) &&
+                        entry.LastWriteTimeUtc == lastWriteUtc)
+                    {
+                        return entry.Index;
+                    }
+                }
+            }
+
+            AllPartsIndex idx;
             try
             {
                 idx = LoadAllPartsIndex(csvPath);
@@ -103,9 +123,35 @@ namespace SW2026RibbonAddin.Commands
             }
 
             lock (_indexLock)
-                _allPartsIndexCache[full] = idx;
+            {
+                _allPartsIndexCache[full] = new AllPartsIndexCacheEntry
+                {
+                    CsvPath = csvPath,
+                    LastWriteTimeUtc = lastWriteUtc,
+                    Index = idx
+                };
+            }
 
             return idx;
+        }
+
+        internal static void ClearAllPartsIndexCache()
+        {
+            lock (_indexLock)
+                _allPartsIndexCache.Clear();
+        }
+
+        internal static void ClearAllPartsIndexCacheForFolder(string folder)
+        {
+            if (string.IsNullOrWhiteSpace(folder))
+                return;
+
+            string full;
+            try { full = Path.GetFullPath(folder); }
+            catch { full = folder; }
+
+            lock (_indexLock)
+                _allPartsIndexCache.Remove(full);
         }
 
         private static AllPartsIndex LoadAllPartsIndex(string csvPath)
