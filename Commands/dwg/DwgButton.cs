@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
 using System.IO;
+using System.Security.Cryptography;
 using System.Text;
 using System.Windows.Forms;
 
@@ -145,7 +146,13 @@ namespace SW2026RibbonAddin.Commands
             };
 
             var dwgFileNames = new List<string>();
-            int failures = ExportFlatPatternsForPart(model, modelPath, jobFolder, dwgFileNames);
+            int failures = ExportFlatPatternsForPart(
+                model,
+                modelPath,
+                jobFolder,
+                uniquePartToken: null,
+                globalUsedNames: null,
+                dwgFileNames: dwgFileNames);
 
             int exported = dwgFileNames.Count;
             int totalBodies = exported + failures;
@@ -204,6 +211,9 @@ namespace SW2026RibbonAddin.Commands
             int failed = 0;
             int totalBodies = 0;
 
+            // Prevent silent overwrites when different parts share the same base filename.
+            var globalUsedNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
             foreach (var kvp in usage)
             {
                 var info = kvp.Value;
@@ -237,7 +247,15 @@ namespace SW2026RibbonAddin.Commands
                         material = GetMaterialName(partModel, info.ConfigName);
 
                     var dwgFileNames = new List<string>();
-                    int failuresForPart = ExportFlatPatternsForPart(partModel, partPath, jobFolder, dwgFileNames);
+                    string uniqueToken = ComputeShortHash(partPath + "||" + (info.ConfigName ?? ""), hexChars: 8);
+
+                    int failuresForPart = ExportFlatPatternsForPart(
+                        partModel,
+                        partPath,
+                        jobFolder,
+                        uniquePartToken: uniqueToken,
+                        globalUsedNames: globalUsedNames,
+                        dwgFileNames: dwgFileNames);
 
                     int exportedForPart = dwgFileNames.Count;
                     int totalForPart = exportedForPart + failuresForPart;
@@ -286,6 +304,8 @@ namespace SW2026RibbonAddin.Commands
             IModelDoc2 partModel,
             string modelPath,
             string folder,
+            string uniquePartToken,
+            HashSet<string> globalUsedNames,
             List<string> dwgFileNames)
         {
             if (partModel == null)
@@ -306,7 +326,8 @@ namespace SW2026RibbonAddin.Commands
                 if (string.IsNullOrEmpty(baseName))
                     baseName = "SheetMetal";
 
-                string dwgName = baseName + ".dwg";
+                string stem = MakeExportStem(baseName, uniquePartToken);
+                string dwgName = ReserveUniqueFileName(stem + ".dwg", globalUsedNames);
                 string outPath = Path.Combine(folder, dwgName);
 
                 if (ExportFlatPatternWithoutSelection(partDoc, modelPath, outPath))
@@ -326,6 +347,8 @@ namespace SW2026RibbonAddin.Commands
             int idx = 1;
             var usedNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
+            string stemPrefix = MakeExportStem(partBaseName, uniquePartToken);
+
             foreach (Feature flatFeat in flatPatterns)
             {
                 if (flatFeat == null)
@@ -339,14 +362,8 @@ namespace SW2026RibbonAddin.Commands
 
                 suffix = MakeSafeFilePart(suffix);
 
-                string candidate = $"{partBaseName}_{suffix}.dwg";
-                string finalName = candidate;
-                int n = 1;
-                while (!usedNames.Add(finalName))
-                {
-                    finalName = $"{partBaseName}_{suffix}_{n}.dwg";
-                    n++;
-                }
+                string candidate = $"{stemPrefix}_{suffix}.dwg";
+                string finalName = ReserveUniqueFileName(candidate, globalUsedNames, usedNames);
 
                 string outPath = Path.Combine(folder, finalName);
 
@@ -360,6 +377,85 @@ namespace SW2026RibbonAddin.Commands
             }
 
             return failures;
+        }
+
+        private static string MakeExportStem(string baseName, string uniquePartToken)
+        {
+            baseName = (baseName ?? "").Trim();
+            if (baseName.Length == 0)
+                baseName = "SheetMetal";
+
+            uniquePartToken = (uniquePartToken ?? "").Trim();
+            if (uniquePartToken.Length == 0)
+                return baseName;
+
+            return baseName + "__" + uniquePartToken;
+        }
+
+        private static string ReserveUniqueFileName(string candidate, HashSet<string> globalUsedNames, HashSet<string> localUsedNames = null)
+        {
+            candidate = (candidate ?? "").Trim();
+            if (candidate.Length == 0)
+                candidate = "SheetMetal.dwg";
+
+            string ext = Path.GetExtension(candidate);
+            if (string.IsNullOrEmpty(ext))
+                ext = ".dwg";
+
+            string stem = Path.GetFileNameWithoutExtension(candidate);
+            if (string.IsNullOrEmpty(stem))
+                stem = "SheetMetal";
+
+            string finalName = stem + ext;
+            int nIdx = 1;
+
+            while ((localUsedNames != null && localUsedNames.Contains(finalName)) ||
+                   (globalUsedNames != null && globalUsedNames.Contains(finalName)))
+            {
+                finalName = stem + "_" + nIdx.ToString(CultureInfo.InvariantCulture) + ext;
+                nIdx++;
+            }
+
+            if (localUsedNames != null)
+                localUsedNames.Add(finalName);
+            if (globalUsedNames != null)
+                globalUsedNames.Add(finalName);
+
+            return finalName;
+        }
+
+        private static string ComputeShortHash(string input, int hexChars)
+        {
+            input = input ?? "";
+            if (hexChars <= 0)
+                hexChars = 8;
+
+            try
+            {
+                using (var sha = SHA256.Create())
+                {
+                    byte[] bytes = Encoding.UTF8.GetBytes(input);
+                    byte[] hash = sha.ComputeHash(bytes);
+
+                    var sb = new StringBuilder(hash.Length * 2);
+                    foreach (byte b in hash)
+                    {
+                        sb.Append(b.ToString("X2"));
+                        if (sb.Length >= hexChars)
+                            break;
+                    }
+
+                    if (sb.Length > hexChars)
+                        sb.Length = hexChars;
+
+                    return sb.ToString();
+                }
+            }
+            catch
+            {
+                // Worst-case fallback: stable-ish sanitization of the input.
+                return Math.Abs(input.GetHashCode()).ToString("X");
+            }
         }
 
         private static bool ExportFlatPatternWithoutSelection(IPartDoc partDoc, string modelPath, string outFile)

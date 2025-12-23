@@ -465,8 +465,6 @@ namespace SW2026RibbonAddin.Commands
     }
 
 
-namespace SW2026RibbonAddin.Commands
-    {
         internal sealed class LaserCutProgressForm : Form
         {
             private readonly Label _lblHeader;
@@ -667,7 +665,6 @@ namespace SW2026RibbonAddin.Commands
                 try { System.Windows.Forms.Application.DoEvents(); } catch { }
             }
         }
-    }
 
     internal static class LaserCutUiMemory
     {

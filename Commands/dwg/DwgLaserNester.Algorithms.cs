@@ -2,7 +2,6 @@
 using ACadSharp.Tables;
 using Clipper2Lib;
 using CSMath;
-using SW2026RibbonAddin.Commands.SW2026RibbonAddin.Commands;
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;

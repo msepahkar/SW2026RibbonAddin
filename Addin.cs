@@ -123,6 +123,14 @@ namespace SW2026RibbonAddin
 
             try
             {
+                // Remove the command tabs as well, so users aren't left with empty "Mehdi" tabs
+                // if the add-in is unloaded mid-session.
+                RemoveAllTabsNamed(TAB_NAME);
+            }
+            catch { }
+
+            try
+            {
                 if (_cmdMgr != null && _cmdGroup != null)
                     _cmdMgr.RemoveCommandGroup(MAIN_CMD_GROUP_ID);
             }

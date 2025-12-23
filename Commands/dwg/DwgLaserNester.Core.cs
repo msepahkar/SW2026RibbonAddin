@@ -4,7 +4,6 @@ using ACadSharp.IO;
 using ACadSharp.Tables;
 using Clipper2Lib;
 using CSMath;
-using SW2026RibbonAddin.Commands.SW2026RibbonAddin.Commands;
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -258,7 +257,61 @@ namespace SW2026RibbonAddin.Commands
 
             token = blockName.Substring(start, len);
             token = (token ?? "").Trim();
+            if (token.Length == 0)
+                return false;
+
+            // If the block name includes an embedded material token (e.g. __MATB64_<token>__),
+            // strip it out so CSV-based lookups (keyed by the original part base name) still work.
+            token = StripEmbeddedMaterialToken(token);
+
             return token.Length > 0;
+        }
+
+        private static string StripEmbeddedMaterialToken(string token)
+        {
+            if (string.IsNullOrWhiteSpace(token))
+                return token;
+
+            // New reversible token used by the combiner.
+            token = RemoveTokenSegment(token, MaterialNameCodec.BlockTokenPrefix, MaterialNameCodec.BlockTokenSuffix);
+
+            // Legacy (pre-b64) token formats the nester already supported.
+            token = RemoveTokenSegment(token, "__MAT_", "__");
+
+            // Cosmetic cleanup (helps MakeLooseKey match better).
+            while (token.Contains("__"))
+                token = token.Replace("__", "_");
+
+            return token.Trim('_', ' ');
+        }
+
+        private static string RemoveTokenSegment(string s, string prefix, string suffix)
+        {
+            if (string.IsNullOrEmpty(s) || string.IsNullOrEmpty(prefix) || string.IsNullOrEmpty(suffix))
+                return s;
+
+            int p = s.IndexOf(prefix, StringComparison.OrdinalIgnoreCase);
+            if (p < 0)
+                return s;
+
+            int start = p;
+            int afterPrefix = p + prefix.Length;
+            int end = s.IndexOf(suffix, afterPrefix, StringComparison.OrdinalIgnoreCase);
+
+            // If we can't find the closing suffix, strip to end (defensive against truncated names)
+            if (end >= 0)
+                end += suffix.Length;
+            else
+                end = s.Length;
+
+            try
+            {
+                return s.Remove(start, end - start);
+            }
+            catch
+            {
+                return s;
+            }
         }
 
         // ============================
@@ -790,11 +843,15 @@ namespace SW2026RibbonAddin.Commands
 
                 string material = "UNKNOWN";
 
-                if (TryExtractMaterialFromBlockName(name, out var matFromName))
-                {
+                bool gotMatFromName = TryExtractMaterialFromBlockName(name, out var matFromName);
+                if (gotMatFromName)
                     material = NormalizeMaterialLabel(matFromName);
-                }
-                else if (_activeAllPartsIndex != null && !string.IsNullOrWhiteSpace(_activeThicknessKey))
+
+                // If the block-name material is missing/unknown (e.g. legacy blocks or truncated tokens),
+                // fall back to all_parts.csv mapping (base-name + thickness).
+                bool isUnknown = string.Equals(material, "UNKNOWN", StringComparison.OrdinalIgnoreCase);
+
+                if ((!gotMatFromName || isUnknown) && _activeAllPartsIndex != null && !string.IsNullOrWhiteSpace(_activeThicknessKey))
                 {
                     if (TryExtractPartTokenFromBlockName(name, out var token))
                     {
@@ -900,6 +957,22 @@ namespace SW2026RibbonAddin.Commands
 
             if (string.IsNullOrWhiteSpace(blockName))
                 return false;
+
+            // Preferred (new) format: the combiner encodes the *exact* SolidWorks material
+            // into the block name using a reversible Base64Url token.
+            // Example: P_PART__MATB64_<token>___Q10
+            try
+            {
+                if (MaterialNameCodec.TryExtractFromBlockName(blockName, out var exact))
+                {
+                    material = exact;
+                    return true;
+                }
+            }
+            catch
+            {
+                // Defensive: fall back to legacy heuristics below.
+            }
 
             string[] markers = new[]
             {

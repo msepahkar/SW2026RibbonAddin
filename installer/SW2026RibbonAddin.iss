@@ -54,9 +54,9 @@ Root: HKCU; Subkey: "Software\SolidWorks\AddinsStartup\{#AddinGuid}"; ValueType:
 ; UPDATED: Added extra outer quotes around the parameters.
 ; This prevents the "The filename, directory name... syntax is incorrect" error in cmd.exe.
 Filename: "{cmd}"; \
-  Parameters: "/k """"{code:GetRegAsm64}"" ""{app}\{#AddinDll}"" /codebase /nologo"""""; \
+  Parameters: "/c """"{code:GetRegAsm64}"" ""{app}\{#AddinDll}"" /codebase /nologo"""""; \
   WorkingDir: "{app}"; \
-  StatusMsg: "Registering... (Close the command window to continue)"; Flags: waituntilterminated
+  StatusMsg: "Registering add-in..."; Flags: runhidden waituntilterminated
 
 [UninstallRun]
 ; Unregister on uninstall — triggers [ComUnregisterFunction]
