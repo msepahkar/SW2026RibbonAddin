@@ -103,6 +103,7 @@
     <Compile Include="Commands\dwg\DwgButton.cs" />
     <Compile Include="Commands\farsi\EditSelectedFarsiNoteButton.cs" />
     <Compile Include="Commands\general\HelloButton.cs" />
+    <Compile Include="Commands\general\RegistrationButton.cs" />
     <Compile Include="Commands\general\IMehdiRibbonButton.cs" />
     <Compile Include="Commands\general\RibbonSection.cs" />
     <Compile Include="Commands\dwg\SheetMetalAssemblyHelper.cs" />
@@ -148,6 +149,8 @@
     <EmbeddedResource Include="Resources\farsi_32.png" />
     <EmbeddedResource Include="Resources\hello_20.png" />
     <EmbeddedResource Include="Resources\hello_32.png" />
+    <EmbeddedResource Include="Resources\license_20.png" />
+    <EmbeddedResource Include="Resources\license_32.png" />
     <EmbeddedResource Include="Resources\update_20.png" />
     <EmbeddedResource Include="Resources\update_32.png" />
   </ItemGroup>
