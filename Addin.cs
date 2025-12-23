@@ -141,17 +141,22 @@ namespace SW2026RibbonAddin
 
         private void InitializeLicenseState()
         {
+            // In DEBUG builds we intentionally bypass licensing so development/testing is frictionless.
+            // In RELEASE builds we enforce licensing.
+#if DEBUG
+            _licenseState = LicenseState.Licensed;
+#else
             try
             {
-                if (LicenseGate.IsLicensed)
-                    _licenseState = LicenseState.Licensed;
-                else
-                    _licenseState = LicenseState.TrialActive;
+                _licenseState = LicenseGate.IsLicensed
+                    ? LicenseState.Licensed
+                    : LicenseState.Unlicensed;
             }
             catch
             {
-                _licenseState = LicenseState.TrialActive;
+                _licenseState = LicenseState.Unlicensed;
             }
+#endif
         }
 
         private void InitializeButtons()
@@ -581,25 +586,73 @@ namespace SW2026RibbonAddin
 
                 var context = new AddinContext(this, _swApp);
 
+                // Free features are always allowed.
                 if (button.IsFreeFeature)
                 {
                     button.Execute(context);
                     return;
                 }
 
-                switch (_licenseState)
-                {
-                    case LicenseState.Licensed:
-                    case LicenseState.TrialActive:
-                        button.Execute(context);
-                        break;
+                // Licensing policy:
+                //  - DEBUG builds: bypass licensing entirely.
+                //  - RELEASE builds: require activation for any non-free feature.
+#if DEBUG
+                button.Execute(context);
+                return;
+#else
+                // Re-check activation on every execution so users can activate mid-session.
+                VerifiedLicense lic;
+                string why;
+                bool activated;
 
-                    case LicenseState.TrialExpired:
-                    case LicenseState.Unlicensed:
-                        // For now we still run; hook trial-expired UI here later if needed
-                        button.Execute(context);
-                        break;
+                try
+                {
+                    activated = LicenseGate.IsActivated(out lic, out why);
                 }
+                catch (Exception ex)
+                {
+                    activated = false;
+                    why = ex.Message;
+                }
+
+                if (activated)
+                {
+                    _licenseState = LicenseState.Licensed;
+                    button.Execute(context);
+                    return;
+                }
+
+                _licenseState = LicenseState.Unlicensed;
+
+                // No valid license: give the user a chance to activate.
+                var msg =
+                    "This feature requires an activated license.\r\n\r\n" +
+                    (string.IsNullOrWhiteSpace(why) ? "" : ("Status: " + why.Trim() + "\r\n\r\n")) +
+                    "Would you like to activate now?";
+
+                var choice = MessageBox.Show(
+                    msg,
+                    "License Required",
+                    MessageBoxButtons.YesNo,
+                    MessageBoxIcon.Information);
+
+                if (choice != DialogResult.Yes)
+                    return;
+
+                try
+                {
+                    LicenseGate.ShowRegistrationDialog();
+                }
+                catch
+                {
+                    // Ignore UI errors; activation state will remain false.
+                }
+
+                // Refresh state after the dialog.
+                InitializeLicenseState();
+                if (_licenseState == LicenseState.Licensed)
+                    button.Execute(context);
+#endif
             }
             catch (Exception ex)
             {

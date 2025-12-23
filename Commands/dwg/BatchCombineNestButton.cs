@@ -30,7 +30,16 @@ namespace SW2026RibbonAddin.Commands
             try
             {
                 // 1) Combine
-                DwgBatchCombiner.Combine(mainFolder);
+                var combine = DwgBatchCombiner.Combine(mainFolder, showUi: false);
+                if (combine != null && !string.IsNullOrWhiteSpace(combine.ErrorMessage))
+                {
+                    MessageBox.Show(
+                        combine.ErrorMessage,
+                        "Batch Combine + Nest",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Warning);
+                    return;
+                }
 
                 // 2) Scan nesting jobs (Material x Thickness)
                 var jobs = DwgLaserNester.ScanJobsForFolder(mainFolder);
