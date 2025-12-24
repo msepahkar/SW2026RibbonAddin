@@ -2319,25 +2319,9 @@ namespace SW2026RibbonAddin.Commands
 
             // Bottom info bar (separate layer)
             double barH = NEST_INFO_BAR_HEIGHT_MM;
-            double bx1 = originXmm;
-            double by1 = originYmm - barH;
-            double bx2 = originXmm + sheetWmm;
-            double by2 = originYmm;
 
-            var bl = new Line { StartPoint = new XYZ(bx1, by1, 0.0), EndPoint = new XYZ(bx2, by1, 0.0) };
-            var br = new Line { StartPoint = new XYZ(bx2, by1, 0.0), EndPoint = new XYZ(bx2, by2, 0.0) };
-            var bt = new Line { StartPoint = new XYZ(bx2, by2, 0.0), EndPoint = new XYZ(bx1, by2, 0.0) };
-            var bL = new Line { StartPoint = new XYZ(bx1, by2, 0.0), EndPoint = new XYZ(bx1, by1, 0.0) };
+            // NOTE: No bottom bar lines are drawn (text only under sheet).
 
-            TrySetLayer(bl, _layerNestBottomBar);
-            TrySetLayer(br, _layerNestBottomBar);
-            TrySetLayer(bt, _layerNestBottomBar);
-            TrySetLayer(bL, _layerNestBottomBar);
-
-            modelSpace.Entities.Add(bl);
-            modelSpace.Entities.Add(br);
-            modelSpace.Entities.Add(bt);
-            modelSpace.Entities.Add(bL);
 
             string title =
                 $"Sheet {sheetIndex}" +
