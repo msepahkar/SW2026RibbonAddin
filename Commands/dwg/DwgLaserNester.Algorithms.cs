@@ -73,6 +73,11 @@ namespace SW2026RibbonAddin.Commands
         {
             progress.ThrowIfCancelled();
 
+            // Width-first packing:
+            // Pack rectangles in horizontal shelves (rows) from left->right, bottom->top.
+            // This tends to keep the remaining unused part of the sheet as a full-width strip
+            // so it can be reused later for other jobs.
+
             double placementMargin = marginMm + gapMm;
 
             double usableW = sheetWmm - 2 * placementMargin;
@@ -80,8 +85,14 @@ namespace SW2026RibbonAddin.Commands
             if (usableW <= 0 || usableH <= 0)
                 throw new InvalidOperationException("Sheet is too small after margins/gap.");
 
-            var instances = ExpandInstances(defs);
-            instances.Sort((a, b) => (b.Width * b.Height).CompareTo(a.Width * a.Height));
+            double minX = placementMargin;
+            double minY = placementMargin;
+            double maxX = sheetWmm - placementMargin;
+            double maxY = sheetHmm - placementMargin;
+
+            var remaining = ExpandInstances(defs);
+            // Start with larger parts first, then fill gaps within each row.
+            remaining.Sort((a, b) => (b.Width * b.Height).CompareTo(a.Width * a.Height));
 
             var sheets = new List<SheetRectState>();
 
@@ -96,16 +107,151 @@ namespace SW2026RibbonAddin.Commands
 
                 DrawSheetOutline(s.OriginXmm, s.OriginYmm, sheetWmm, sheetHmm, modelSpace, materialLabel, s.Index, NestingMode.FastRectangles);
 
-                s.Free.Add(new FreeRect
-                {
-                    X = placementMargin,
-                    Y = placementMargin,
-                    W = sheetWmm - 2 * placementMargin,
-                    H = sheetHmm - 2 * placementMargin
-                });
-
                 sheets.Add(s);
                 return s;
+            }
+
+            bool TryChooseForNewShelf(PartDefinition part, double availW, double availH,
+                                      out double usedW, out double usedH, out double rotRad)
+            {
+                // usedW/usedH include the gap.
+                usedW = 0;
+                usedH = 0;
+                rotRad = 0;
+
+                double w0 = part.Width + gapMm;
+                double h0 = part.Height + gapMm;
+
+                double w90 = part.Height + gapMm;
+                double h90 = part.Width + gapMm;
+
+                bool fit0 = w0 <= availW && h0 <= availH;
+                bool fit90 = w90 <= availW && h90 <= availH;
+
+                if (!fit0 && !fit90)
+                    return false;
+
+                if (fit0 && fit90)
+                {
+                    // Prefer the orientation with smaller shelf height.
+                    if (h90 < h0 - 1e-9)
+                    {
+                        usedW = w90;
+                        usedH = h90;
+                        rotRad = Math.PI / 2.0;
+                        return true;
+                    }
+                    if (h0 < h90 - 1e-9)
+                    {
+                        usedW = w0;
+                        usedH = h0;
+                        rotRad = 0;
+                        return true;
+                    }
+
+                    // Same height: prefer larger width (helps fill width).
+                    if (w90 > w0)
+                    {
+                        usedW = w90;
+                        usedH = h90;
+                        rotRad = Math.PI / 2.0;
+                    }
+                    else
+                    {
+                        usedW = w0;
+                        usedH = h0;
+                        rotRad = 0;
+                    }
+
+                    return true;
+                }
+
+                if (fit0)
+                {
+                    usedW = w0;
+                    usedH = h0;
+                    rotRad = 0;
+                    return true;
+                }
+
+                usedW = w90;
+                usedH = h90;
+                rotRad = Math.PI / 2.0;
+                return true;
+            }
+
+            bool TryChooseForExistingShelf(PartDefinition part, double availW, double shelfH,
+                                           out double usedW, out double usedH, out double rotRad)
+            {
+                usedW = 0;
+                usedH = 0;
+                rotRad = 0;
+
+                double bestLeftover = double.PositiveInfinity;
+                bool found = false;
+
+                // 0 deg
+                double w0 = part.Width + gapMm;
+                double h0 = part.Height + gapMm;
+                if (w0 <= availW && h0 <= shelfH)
+                {
+                    double leftover = availW - w0;
+                    bestLeftover = leftover;
+                    usedW = w0;
+                    usedH = h0;
+                    rotRad = 0;
+                    found = true;
+                }
+
+                // 90 deg
+                double w90 = part.Height + gapMm;
+                double h90 = part.Width + gapMm;
+                if (w90 <= availW && h90 <= shelfH)
+                {
+                    double leftover = availW - w90;
+                    if (!found || leftover < bestLeftover - 1e-9 || (Math.Abs(leftover - bestLeftover) < 1e-9 && w90 > usedW))
+                    {
+                        bestLeftover = leftover;
+                        usedW = w90;
+                        usedH = h90;
+                        rotRad = Math.PI / 2.0;
+                        found = true;
+                    }
+                }
+
+                return found;
+            }
+
+            void PlaceAt(SheetRectState sheet, PartDefinition part, double slotX, double slotY, double rotRad)
+            {
+                // slotX/slotY are the min corner of the used rectangle (including the gap).
+                double localMinX = slotX + gapMm * 0.5;
+                double localMinY = slotY + gapMm * 0.5;
+
+                double worldMinX = sheet.OriginXmm + localMinX;
+                double worldMinY = sheet.OriginYmm + localMinY;
+
+                double insertX, insertY;
+
+                if (Math.Abs(rotRad) < 1e-12)
+                {
+                    insertX = worldMinX - part.MinX;
+                    insertY = worldMinY - part.MinY;
+                }
+                else
+                {
+                    // 90° CCW about insertion point (origin)
+                    insertX = worldMinX + part.MaxY;
+                    insertY = worldMinY - part.MinX;
+                }
+
+                var ins = new Insert(part.Block)
+                {
+                    InsertPoint = new XYZ(insertX, insertY, 0),
+                    Rotation = rotRad
+                };
+
+                modelSpace.Entities.Add(ins);
             }
 
             var cur = NewSheet();
@@ -113,22 +259,127 @@ namespace SW2026RibbonAddin.Commands
             int placedParts = 0;
             progress.ReportPlaced(0, totalInstances, sheets.Count);
 
-            foreach (var part in instances)
+            while (remaining.Count > 0)
             {
                 progress.ThrowIfCancelled();
 
-                while (true)
+                double shelfY = minY;
+                bool placedAnything = false;
+
+                while (remaining.Count > 0)
                 {
-                    if (TryPlaceRect(cur, part, gapMm, modelSpace))
-                    {
-                        placedParts += Math.Max(1, part.PartCountWeight);
-                        progress.ReportPlaced(placedParts, totalInstances, sheets.Count);
+                    progress.ThrowIfCancelled();
+
+                    double availH = maxY - shelfY;
+                    if (availH <= 1e-6)
                         break;
+
+                    // Start a new shelf: take the first (largest-first) remaining part that fits.
+                    int startIndex = -1;
+                    double startUsedW = 0, startUsedH = 0, startRot = 0;
+
+                    for (int i = 0; i < remaining.Count; i++)
+                    {
+                        var p = remaining[i];
+                        if (TryChooseForNewShelf(p, usableW, availH, out var uW, out var uH, out var r))
+                        {
+                            startIndex = i;
+                            startUsedW = uW;
+                            startUsedH = uH;
+                            startRot = r;
+                            break;
+                        }
                     }
 
-                    cur = NewSheet();
+                    if (startIndex < 0)
+                        break;
+
+                    var startPart = remaining[startIndex];
+                    remaining.RemoveAt(startIndex);
+
+                    double shelfX = minX;
+                    double shelfH = startUsedH;
+
+                    PlaceAt(cur, startPart, shelfX, shelfY, startRot);
+                    placedAnything = true;
+
+                    shelfX += startUsedW;
+
+                    placedParts += Math.Max(1, startPart.PartCountWeight);
                     progress.ReportPlaced(placedParts, totalInstances, sheets.Count);
+
+                    // Fill the shelf: pick the best fit part for remaining width.
+                    while (remaining.Count > 0)
+                    {
+                        progress.ThrowIfCancelled();
+
+                        double availW = maxX - shelfX;
+                        if (availW <= 1e-6)
+                            break;
+
+                        int bestIdx = -1;
+                        double bestUsedW = 0, bestRot = 0;
+                        double bestLeftover = double.PositiveInfinity;
+
+                        for (int i = 0; i < remaining.Count; i++)
+                        {
+                            var p = remaining[i];
+                            if (!TryChooseForExistingShelf(p, availW, shelfH, out var uW, out var uH, out var r))
+                                continue;
+
+                            double leftover = availW - uW;
+                            if (bestIdx < 0 || leftover < bestLeftover - 1e-9 || (Math.Abs(leftover - bestLeftover) < 1e-9 && uW > bestUsedW))
+                            {
+                                bestIdx = i;
+                                bestUsedW = uW;
+                                bestRot = r;
+                                bestLeftover = leftover;
+                            }
+
+                            // perfect fit
+                            if (bestLeftover <= 1e-9)
+                                break;
+                        }
+
+                        if (bestIdx < 0)
+                            break;
+
+                        var pBest = remaining[bestIdx];
+                        remaining.RemoveAt(bestIdx);
+
+                        PlaceAt(cur, pBest, shelfX, shelfY, bestRot);
+                        shelfX += bestUsedW;
+
+                        placedParts += Math.Max(1, pBest.PartCountWeight);
+                        progress.ReportPlaced(placedParts, totalInstances, sheets.Count);
+                    }
+
+                    shelfY += shelfH;
                 }
+
+                if (remaining.Count == 0)
+                    break;
+
+                // If we couldn't place anything on a fresh sheet, the sheet is too small.
+                if (!placedAnything)
+                {
+                    bool canFitAny = false;
+                    foreach (var p in remaining)
+                    {
+                        if (TryChooseForNewShelf(p, usableW, usableH, out _, out _, out _))
+                        {
+                            canFitAny = true;
+                            break;
+                        }
+                    }
+
+                    if (!canFitAny)
+                        throw new InvalidOperationException("Failed to place a part even on a fresh sheet. Sheet too small after margins/gap?");
+                }
+
+                // Next sheet
+                cur = NewSheet();
+                progress.ReportPlaced(placedParts, totalInstances, sheets.Count);
             }
 
             return sheets.Count;

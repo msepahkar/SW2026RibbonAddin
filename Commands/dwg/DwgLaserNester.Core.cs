@@ -1231,26 +1231,18 @@ namespace SW2026RibbonAddin.Commands
                     if (normDec == null || normDec.Count < 3)
                         continue;
 
-                    // Ensure snapped decimated shape is also anchored at 0,0.
-                    var bDec = GetBounds(normDec);
-                    if (bDec.MinX != 0 || bDec.MinY != 0)
-                        normDec = CleanPath(TranslatePath(normDec, -bDec.MinX, -bDec.MinY));
-
-                    if (normDec == null || normDec.Count < 3)
-                        continue;
+                    // IMPORTANT:
+                    // Do NOT re-anchor using the decimated bounds.
+                    // We want hashing to remain stable relative to the *full* rotated bounds (0..w, 0..h),
+                    // otherwise two mirrored parts can shift differently after decimation and stop matching.
 
                     ulong key = HashPathCanonical(normDec);
                     if (key == 0UL)
                         continue;
 
-                    var bHash = GetBounds(normDec);
-                    long wHash = bHash.MaxX - bHash.MinX;
-                    long hHash = bHash.MaxY - bHash.MinY;
-                    if (wHash <= 0 || hHash <= 0)
-                        continue;
-
-                    var mx = MirrorX(normDec, wHash);
-                    var my = MirrorY(normDec, hHash);
+                    // Mirror around the FULL bounds (w/h), not the decimated bounds.
+                    var mx = MirrorX(normDec, w);
+                    var my = MirrorY(normDec, h);
                     ulong kx = HashPathCanonical(mx);
                     ulong ky = HashPathCanonical(my);
 
@@ -1640,8 +1632,9 @@ namespace SW2026RibbonAddin.Commands
 
         private static bool DimsClose(long a, long b)
         {
-            // within 0.05mm (snap tolerance default) in scaled units
-            long tol = Math.Max(1, (long)Math.Round(0.05 * SCALE));
+            // Allow a bit of slack for rotated geometry rounding.
+            // 0.25mm in scaled units.
+            long tol = Math.Max(1, (long)Math.Round(0.25 * SCALE));
             return Math.Abs(a - b) <= tol;
         }
 
@@ -1668,8 +1661,9 @@ namespace SW2026RibbonAddin.Commands
                     interA2 += Area2Abs(p);
             }
 
-            // Allow tiny numerical noise (≈ 2mm^2)
-            const long interTolA2 = 4_000_000; // 2mm^2 -> 2*1e6
+            // Allow small numerical noise (rotations + rounding can create tiny overlaps).
+            // 25mm^2 => 25 * 2 * 1e6 = 50,000,000 in Area2Abs units.
+            const long interTolA2 = 50_000_000;
             if (interA2 > interTolA2)
                 return false;
 
@@ -1690,8 +1684,8 @@ namespace SW2026RibbonAddin.Commands
 
             long rectA2 = 2L * w * h;
 
-            // Relative tolerance 0.5% + small absolute tolerance
-            long absTol = 6_000_000; // 3mm^2
+            // Relative tolerance 0.5% + absolute tolerance (to absorb rounding/arc-chord noise)
+            long absTol = 50_000_000; // 25mm^2
             long relTol = (long)Math.Round(rectA2 * 0.005);
 
             long tol = Math.Max(absTol, relTol);
