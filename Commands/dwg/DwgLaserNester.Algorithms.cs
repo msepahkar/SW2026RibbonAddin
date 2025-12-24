@@ -251,7 +251,13 @@ namespace SW2026RibbonAddin.Commands
                     Rotation = rotRad
                 };
 
+                // Put placed parts on their own layer (if prepared).
+                TrySetLayer(ins, _layerNestParts);
+
                 modelSpace.Entities.Add(ins);
+
+                sheet.PlacedCount++;
+                sheet.UsedArea2Abs += GetRealArea2Abs(part);
             }
 
             var cur = NewSheet();
@@ -382,6 +388,8 @@ namespace SW2026RibbonAddin.Commands
                 progress.ReportPlaced(placedParts, totalInstances, sheets.Count);
             }
 
+            // Add per-sheet fill % labels (based on real part area, NOT bounding rectangles).
+            AddFillLabels(modelSpace, sheets, ToInt(usableW), ToInt(usableH), sheetWmm, sheetHmm);
             return sheets.Count;
         }
 
@@ -550,7 +558,8 @@ namespace SW2026RibbonAddin.Commands
                         });
 
                         sheets[si].PlacedCount++;
-                        sheets[si].UsedArea2Abs += placement.RotArea2Abs;
+                        // Fill% should be based on REAL part area (not rectangle envelopes)
+                        sheets[si].UsedArea2Abs += GetRealArea2Abs(part);
 
                         placedParts += Math.Max(1, part.PartCountWeight);
                         progress.ReportPlaced(placedParts, totalInstances, sheets.Count);
@@ -580,7 +589,8 @@ namespace SW2026RibbonAddin.Commands
                 });
 
                 cur.PlacedCount++;
-                cur.UsedArea2Abs += placement2.RotArea2Abs;
+                // Fill% should be based on REAL part area (not rectangle envelopes)
+                cur.UsedArea2Abs += GetRealArea2Abs(part);
 
                 placedParts += Math.Max(1, part.PartCountWeight);
                 progress.ReportPlaced(placedParts, totalInstances, sheets.Count);
@@ -931,7 +941,8 @@ namespace SW2026RibbonAddin.Commands
             });
 
             sheet.PlacedCount++;
-            sheet.UsedArea2Abs += placement.RotArea2Abs;
+            // Fill% should be based on REAL part area (not rectangle envelopes)
+            sheet.UsedArea2Abs += GetRealArea2Abs(part);
         }
 
         private static bool TryPlaceContourOnSheet_Level2Nfp(

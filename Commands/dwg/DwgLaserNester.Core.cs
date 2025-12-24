@@ -22,6 +22,28 @@ namespace SW2026RibbonAddin.Commands
         private static readonly int[] RotationsDeg = { 0, 90, 180, 270 };
 
         // ============================
+        // DWG output styling (layers/blocks)
+        // ============================
+
+        // Layering makes it easy to toggle visibility (sheets vs info text vs parts).
+        private const string LAYER_NEST_SHEETS = "NEST_SHEETS";
+        private const string LAYER_NEST_PARTS = "NEST_PARTS";
+        private const string LAYER_NEST_BOTTOM_BAR = "NEST_BOTTOM_BAR";
+        private const string LAYER_NEST_BOTTOM_TEXT = "NEST_BOTTOM_TEXT";
+
+        // Bottom info bar height (mm) drawn under each sheet.
+        private const double NEST_INFO_BAR_HEIGHT_MM = 55.0;
+
+        [ThreadStatic] private static Layer _layerNestSheets;
+        [ThreadStatic] private static Layer _layerNestParts;
+        [ThreadStatic] private static Layer _layerNestBottomBar;
+        [ThreadStatic] private static Layer _layerNestBottomText;
+
+        [ThreadStatic] private static BlockRecord _sheetOutlineBlock;
+
+        // (intentionally left blank)
+
+        // ============================
         // CSV-based material index
         // ============================
 
@@ -414,6 +436,30 @@ namespace SW2026RibbonAddin.Commands
             public long OuterArea2Abs;
         }
 
+        /// <summary>
+        /// Returns the best available estimate of the TRUE part material area (in "2x area" units).
+        /// We keep this separate from the placement polygon because:
+        ///  - Fast(Rectangles) packs using bounding boxes
+        ///  - Mirror-pair blocks may pack using a rectangle envelope (especially in Gap mode)
+        /// but users still want sheet fill based on real part area.
+        /// </summary>
+        private static long GetRealArea2Abs(PartDefinition part)
+        {
+            if (part == null)
+                return 0;
+
+            if (part.OuterArea2Abs > 0)
+                return part.OuterArea2Abs;
+
+            // Fallback: bounding rectangle area.
+            long w = ToInt(Math.Max(0.0, part.Width));
+            long h = ToInt(Math.Max(0.0, part.Height));
+            if (w <= 0 || h <= 0)
+                return 0;
+
+            return 2L * w * h;
+        }
+
         private sealed class FreeRect
         {
             public double X, Y, W, H;
@@ -425,6 +471,10 @@ namespace SW2026RibbonAddin.Commands
             public double OriginXmm;
             public double OriginYmm;
             public List<FreeRect> Free = new List<FreeRect>();
+
+            // For reporting (Fill %)
+            public int PlacedCount;
+            public long UsedArea2Abs;
         }
 
         private sealed class SheetContourState
@@ -873,6 +923,9 @@ namespace SW2026RibbonAddin.Commands
                 totalParts = defs.Sum(d => d.Quantity * Math.Max(1, d.PartCountWeight));
             }
 
+            // Prepare DWG output layers/blocks for this job.
+            EnsureNestOutputLayersAndBlocks(doc, job.Sheet.WidthMm, job.Sheet.HeightMm);
+
             progress.BeginTask(
                 taskIndex,
                 totalTasks,
@@ -962,6 +1015,9 @@ namespace SW2026RibbonAddin.Commands
                 GetModelSpaceExtents(doc, out srcMinX, out _, out _, out srcMaxY);
                 baseSheetOriginX = srcMinX;
                 baseSheetOriginY = srcMaxY + 200.0;
+
+                // Re-create DWG output layers/blocks for the freshly reloaded document.
+                EnsureNestOutputLayersAndBlocks(doc, job.Sheet.WidthMm, job.Sheet.HeightMm);
 
                 progress.BeginTask(
                     taskIndex,
@@ -1524,6 +1580,10 @@ namespace SW2026RibbonAddin.Commands
                 new Point64(0, rectH)
             };
 
+            long realArea2Abs = GetRealArea2Abs(A) + GetRealArea2Abs(B);
+            if (realArea2Abs <= 0)
+                realArea2Abs = Area2Abs(rect);
+
             defs.Add(new PartDefinition
             {
                 Block = pairBlock,
@@ -1540,7 +1600,9 @@ namespace SW2026RibbonAddin.Commands
                 Height = hMm,
 
                 OuterContour0 = rect,
-                OuterArea2Abs = Area2Abs(rect)
+                // IMPORTANT: fill% must be based on real part area (A+B), NOT the rectangle envelope
+                // (especially in Gap mode where the envelope includes an internal air strip).
+                OuterArea2Abs = realArea2Abs
             });
 
             createdPairs++;
@@ -2106,6 +2168,111 @@ namespace SW2026RibbonAddin.Commands
                 minX = minY = maxX = maxY = 0.0;
         }
 
+        private static void EnsureNestOutputLayersAndBlocks(CadDocument doc, double sheetWmm, double sheetHmm)
+        {
+            if (doc == null)
+                return;
+
+            // Layers
+            _layerNestSheets = GetOrCreateLayer(doc, LAYER_NEST_SHEETS);
+            _layerNestParts = GetOrCreateLayer(doc, LAYER_NEST_PARTS);
+            _layerNestBottomBar = GetOrCreateLayer(doc, LAYER_NEST_BOTTOM_BAR);
+            _layerNestBottomText = GetOrCreateLayer(doc, LAYER_NEST_BOTTOM_TEXT);
+
+            // Blocks
+            _sheetOutlineBlock = GetOrCreateSheetOutlineBlock(doc, sheetWmm, sheetHmm);
+        }
+
+        private static Layer GetOrCreateLayer(CadDocument doc, string layerName)
+        {
+            if (doc == null || string.IsNullOrWhiteSpace(layerName))
+                return null;
+
+            try
+            {
+                return doc.Layers[layerName];
+            }
+            catch { }
+
+            try
+            {
+                var layer = new Layer(layerName);
+                doc.Layers.Add(layer);
+                return layer;
+            }
+            catch
+            {
+                try { return doc.Layers[layerName]; } catch { return null; }
+            }
+        }
+
+        private static string MakeSafeBlockName(string s)
+        {
+            s = MakeSafeFileToken(s);
+            s = (s ?? "BLOCK").Replace('.', 'p').Replace('-', '_');
+            if (s.Length > 120)
+                s = s.Substring(0, 120);
+            return string.IsNullOrWhiteSpace(s) ? "BLOCK" : s;
+        }
+
+        private static BlockRecord GetOrCreateSheetOutlineBlock(CadDocument doc, double sheetWmm, double sheetHmm)
+        {
+            if (doc == null)
+                return null;
+
+            // One block per (job sheet size) keeps the model clean.
+            string name = MakeSafeBlockName($"NEST_SHEET_{sheetWmm:0.###}x{sheetHmm:0.###}mm");
+
+            try
+            {
+                return doc.BlockRecords[name];
+            }
+            catch { }
+
+            var br = new BlockRecord(name);
+
+            // Put geometry on Layer 0 so it inherits the insert layer.
+            Layer layer0 = null;
+            try { layer0 = doc.Layers["0"]; } catch { }
+
+            Line L(double x1, double y1, double x2, double y2)
+            {
+                var ln = new Line
+                {
+                    StartPoint = new XYZ(x1, y1, 0.0),
+                    EndPoint = new XYZ(x2, y2, 0.0)
+                };
+                if (layer0 != null)
+                    ln.Layer = layer0;
+                return ln;
+            }
+
+            br.Entities.Add(L(0.0, 0.0, sheetWmm, 0.0));
+            br.Entities.Add(L(sheetWmm, 0.0, sheetWmm, sheetHmm));
+            br.Entities.Add(L(sheetWmm, sheetHmm, 0.0, sheetHmm));
+            br.Entities.Add(L(0.0, sheetHmm, 0.0, 0.0));
+
+            try
+            {
+                doc.BlockRecords.Add(br);
+            }
+            catch
+            {
+                // ignore (might already exist)
+            }
+
+            // Prefer returning the registered table entry.
+            try { return doc.BlockRecords[name]; } catch { return br; }
+        }
+
+        private static void TrySetLayer(Entity entity, Layer layer)
+        {
+            if (entity == null || layer == null)
+                return;
+
+            try { entity.Layer = layer; } catch { }
+        }
+
         private static void DrawSheetOutline(
             double originXmm,
             double originYmm,
@@ -2116,37 +2283,114 @@ namespace SW2026RibbonAddin.Commands
             int sheetIndex,
             NestingMode mode)
         {
-            modelSpace.Entities.Add(new Line { StartPoint = new XYZ(originXmm, originYmm, 0), EndPoint = new XYZ(originXmm + sheetWmm, originYmm, 0) });
-            modelSpace.Entities.Add(new Line { StartPoint = new XYZ(originXmm + sheetWmm, originYmm, 0), EndPoint = new XYZ(originXmm + sheetWmm, originYmm + sheetHmm, 0) });
-            modelSpace.Entities.Add(new Line { StartPoint = new XYZ(originXmm + sheetWmm, originYmm + sheetHmm, 0), EndPoint = new XYZ(originXmm, originYmm + sheetHmm, 0) });
-            modelSpace.Entities.Add(new Line { StartPoint = new XYZ(originXmm, originYmm + sheetHmm, 0), EndPoint = new XYZ(originXmm, originYmm, 0) });
+            // Sheet outline as a block (requested):
+            // - ModelSpace only gets one INSERT per sheet
+            // - Easier selection/editing in CAD
+            if (_sheetOutlineBlock != null)
+            {
+                var sheetIns = new Insert(_sheetOutlineBlock)
+                {
+                    InsertPoint = new XYZ(originXmm, originYmm, 0.0),
+                    Rotation = 0.0,
+                    XScale = 1.0,
+                    YScale = 1.0,
+                    ZScale = 1.0
+                };
+
+                TrySetLayer(sheetIns, _layerNestSheets);
+                modelSpace.Entities.Add(sheetIns);
+            }
+            else
+            {
+                // Fallback (should not happen): draw 4 lines.
+                var a = new Line { StartPoint = new XYZ(originXmm, originYmm, 0.0), EndPoint = new XYZ(originXmm + sheetWmm, originYmm, 0.0) };
+                var b = new Line { StartPoint = new XYZ(originXmm + sheetWmm, originYmm, 0.0), EndPoint = new XYZ(originXmm + sheetWmm, originYmm + sheetHmm, 0.0) };
+                var c = new Line { StartPoint = new XYZ(originXmm + sheetWmm, originYmm + sheetHmm, 0.0), EndPoint = new XYZ(originXmm, originYmm + sheetHmm, 0.0) };
+                var d = new Line { StartPoint = new XYZ(originXmm, originYmm + sheetHmm, 0.0), EndPoint = new XYZ(originXmm, originYmm, 0.0) };
+                TrySetLayer(a, _layerNestSheets);
+                TrySetLayer(b, _layerNestSheets);
+                TrySetLayer(c, _layerNestSheets);
+                TrySetLayer(d, _layerNestSheets);
+                modelSpace.Entities.Add(a);
+                modelSpace.Entities.Add(b);
+                modelSpace.Entities.Add(c);
+                modelSpace.Entities.Add(d);
+            }
+
+            // Bottom info bar (separate layer)
+            double barH = NEST_INFO_BAR_HEIGHT_MM;
+            double bx1 = originXmm;
+            double by1 = originYmm - barH;
+            double bx2 = originXmm + sheetWmm;
+            double by2 = originYmm;
+
+            var bl = new Line { StartPoint = new XYZ(bx1, by1, 0.0), EndPoint = new XYZ(bx2, by1, 0.0) };
+            var br = new Line { StartPoint = new XYZ(bx2, by1, 0.0), EndPoint = new XYZ(bx2, by2, 0.0) };
+            var bt = new Line { StartPoint = new XYZ(bx2, by2, 0.0), EndPoint = new XYZ(bx1, by2, 0.0) };
+            var bL = new Line { StartPoint = new XYZ(bx1, by2, 0.0), EndPoint = new XYZ(bx1, by1, 0.0) };
+
+            TrySetLayer(bl, _layerNestBottomBar);
+            TrySetLayer(br, _layerNestBottomBar);
+            TrySetLayer(bt, _layerNestBottomBar);
+            TrySetLayer(bL, _layerNestBottomBar);
+
+            modelSpace.Entities.Add(bl);
+            modelSpace.Entities.Add(br);
+            modelSpace.Entities.Add(bt);
+            modelSpace.Entities.Add(bL);
 
             string title =
                 $"Sheet {sheetIndex}" +
                 (string.IsNullOrWhiteSpace(materialLabel) ? "" : $" | {materialLabel}") +
                 $" | {mode}";
 
-            modelSpace.Entities.Add(new MText
+            var titleText = new MText
             {
                 Value = title,
-                InsertPoint = new XYZ(originXmm + 10.0, originYmm + sheetHmm + 18.0, 0.0),
-                Height = 20.0
-            });
+                InsertPoint = new XYZ(originXmm + 10.0, originYmm - barH + 10.0, 0.0),
+                Height = 18.0
+            };
+
+            TrySetLayer(titleText, _layerNestBottomText);
+            modelSpace.Entities.Add(titleText);
         }
 
         private static void AddFillLabels(BlockRecord modelSpace, List<SheetContourState> sheets, long usableW, long usableH, double sheetWmm, double sheetHmm)
         {
-            long usableArea2 = usableW * usableH;
+            // NOTE: UsedArea2Abs is in "2x area" units (shoelace sum). Sheet area must match.
+            long usableArea2Abs = 2L * usableW * usableH;
             foreach (var s in sheets)
             {
-                double fill = usableArea2 > 0 ? (double)s.UsedArea2Abs / usableArea2 * 100.0 : 0.0;
+                double fill = usableArea2Abs > 0 ? (double)s.UsedArea2Abs / usableArea2Abs * 100.0 : 0.0;
 
-                modelSpace.Entities.Add(new MText
+                var mt = new MText
                 {
                     Value = $"Fill: {fill:0.0}%",
-                    InsertPoint = new XYZ(s.OriginXmm + sheetWmm - 220.0, s.OriginYmm + sheetHmm + 18.0, 0.0),
+                    InsertPoint = new XYZ(s.OriginXmm + sheetWmm - 260.0, s.OriginYmm - NEST_INFO_BAR_HEIGHT_MM + 10.0, 0.0),
                     Height = 18.0
-                });
+                };
+
+                TrySetLayer(mt, _layerNestBottomText);
+                modelSpace.Entities.Add(mt);
+            }
+        }
+
+        private static void AddFillLabels(BlockRecord modelSpace, List<SheetRectState> sheets, long usableW, long usableH, double sheetWmm, double sheetHmm)
+        {
+            long usableArea2Abs = 2L * usableW * usableH;
+            foreach (var s in sheets)
+            {
+                double fill = usableArea2Abs > 0 ? (double)s.UsedArea2Abs / usableArea2Abs * 100.0 : 0.0;
+
+                var mt = new MText
+                {
+                    Value = $"Fill: {fill:0.0}%",
+                    InsertPoint = new XYZ(s.OriginXmm + sheetWmm - 260.0, s.OriginYmm - NEST_INFO_BAR_HEIGHT_MM + 10.0, 0.0),
+                    Height = 18.0
+                };
+
+                TrySetLayer(mt, _layerNestBottomText);
+                modelSpace.Entities.Add(mt);
             }
         }
 
@@ -2170,6 +2414,8 @@ namespace SW2026RibbonAddin.Commands
                 YScale = 1.0,
                 ZScale = 1.0
             };
+
+            TrySetLayer(ins, _layerNestParts);
             modelSpace.Entities.Add(ins);
         }
 
