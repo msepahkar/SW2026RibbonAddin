@@ -110,7 +110,7 @@ namespace SW2026RibbonAddin.Commands
 
             var cur = NewSheet();
 
-            int placed = 0;
+            int placedParts = 0;
             progress.ReportPlaced(0, totalInstances, sheets.Count);
 
             foreach (var part in instances)
@@ -121,13 +121,13 @@ namespace SW2026RibbonAddin.Commands
                 {
                     if (TryPlaceRect(cur, part, gapMm, modelSpace))
                     {
-                        placed++;
-                        progress.ReportPlaced(placed, totalInstances, sheets.Count);
+                        placedParts += Math.Max(1, part.PartCountWeight);
+                        progress.ReportPlaced(placedParts, totalInstances, sheets.Count);
                         break;
                     }
 
                     cur = NewSheet();
-                    progress.ReportPlaced(placed, totalInstances, sheets.Count);
+                    progress.ReportPlaced(placedParts, totalInstances, sheets.Count);
                 }
             }
 
@@ -274,7 +274,7 @@ namespace SW2026RibbonAddin.Commands
 
             var cur = NewSheet();
 
-            int placed = 0;
+            int placedParts = 0;
             progress.ReportPlaced(0, totalInstances, sheets.Count);
 
             foreach (var part in instances)
@@ -301,8 +301,8 @@ namespace SW2026RibbonAddin.Commands
                         sheets[si].PlacedCount++;
                         sheets[si].UsedArea2Abs += placement.RotArea2Abs;
 
-                        placed++;
-                        progress.ReportPlaced(placed, totalInstances, sheets.Count);
+                        placedParts += Math.Max(1, part.PartCountWeight);
+                        progress.ReportPlaced(placedParts, totalInstances, sheets.Count);
                         placedThis = true;
                         break;
                     }
@@ -312,7 +312,7 @@ namespace SW2026RibbonAddin.Commands
                     continue;
 
                 cur = NewSheet();
-                progress.ReportPlaced(placed, totalInstances, sheets.Count);
+                progress.ReportPlaced(placedParts, totalInstances, sheets.Count);
 
                 if (!TryPlaceContourOnSheet_Level1(cur, part, usableW, usableH, maxCandidates, GetRot, progress, out var placement2))
                     throw new InvalidOperationException("Failed to place a part even on a fresh sheet. Sheet too small?");
@@ -331,8 +331,8 @@ namespace SW2026RibbonAddin.Commands
                 cur.PlacedCount++;
                 cur.UsedArea2Abs += placement2.RotArea2Abs;
 
-                placed++;
-                progress.ReportPlaced(placed, totalInstances, sheets.Count);
+                placedParts += Math.Max(1, part.PartCountWeight);
+                progress.ReportPlaced(placedParts, totalInstances, sheets.Count);
             }
 
             AddFillLabels(modelSpace, sheets, usableW, usableH, sheetWmm, sheetHmm);
@@ -506,8 +506,6 @@ namespace SW2026RibbonAddin.Commands
             // deadline (if exceeded -> we still finish job by falling back to Level1 internally)
             long deadlineTicks = MakeDeadlineTicks(LEVEL2_JOB_TIMEOUT_SECONDS);
 
-            int hybridTopN = ComputeHybridTopN(totalInstances);
-
             double boundaryBufferMm = marginMm + gapMm / 2.0;
 
             double usableWmm = sheetWmm - 2 * boundaryBufferMm;
@@ -520,6 +518,8 @@ namespace SW2026RibbonAddin.Commands
 
             var instances = ExpandInstances(defs);
             instances.Sort((a, b) => SortByAreaDesc(a, b));
+
+            int hybridTopN = ComputeHybridTopN(instances.Count);
 
             var polyCache = new Dictionary<string, RotatedPoly>(StringComparer.OrdinalIgnoreCase);
             RotatedPoly GetRot(PartDefinition part, int rotDeg) => GetOrCreateRotated(part, rotDeg, gapMm, polyCache);
@@ -542,7 +542,8 @@ namespace SW2026RibbonAddin.Commands
 
             var cur = NewSheet();
 
-            int placed = 0;
+            int placedInstances = 0;
+            int placedParts = 0;
             bool level2DisabledByTime = false;
 
             progress.ReportPlaced(0, totalInstances, sheets.Count);
@@ -551,7 +552,7 @@ namespace SW2026RibbonAddin.Commands
             {
                 progress.ThrowIfCancelled();
 
-                bool wantLevel2 = !level2DisabledByTime && (placed < hybridTopN);
+                bool wantLevel2 = !level2DisabledByTime && (placedInstances < hybridTopN);
 
                 if (wantLevel2 && Stopwatch.GetTimestamp() > deadlineTicks)
                 {
@@ -572,8 +573,9 @@ namespace SW2026RibbonAddin.Commands
                             if (TryPlaceContourOnSheet_Level2Nfp(sheets[si], part, usableW, usableH, maxCandidates, maxPartners, GetRot, progress, deadlineTicks, out var placementL2))
                             {
                                 CommitPlaced(modelSpace, part, sheets[si], boundaryBufferMm, placementL2);
-                                placed++;
-                                progress.ReportPlaced(placed, totalInstances, sheets.Count);
+                                placedInstances++;
+                                placedParts += Math.Max(1, part.PartCountWeight);
+                                progress.ReportPlaced(placedParts, totalInstances, sheets.Count);
                                 placedThis = true;
                                 break;
                             }
@@ -590,8 +592,9 @@ namespace SW2026RibbonAddin.Commands
                             if (TryPlaceContourOnSheet_Level1(sheets[si], part, usableW, usableH, maxCandidates, GetRot, progress, out var placementL1))
                             {
                                 CommitPlaced(modelSpace, part, sheets[si], boundaryBufferMm, placementL1);
-                                placed++;
-                                progress.ReportPlaced(placed, totalInstances, sheets.Count);
+                                placedInstances++;
+                                placedParts += Math.Max(1, part.PartCountWeight);
+                                progress.ReportPlaced(placedParts, totalInstances, sheets.Count);
                                 placedThis = true;
                                 break;
                             }
@@ -602,8 +605,9 @@ namespace SW2026RibbonAddin.Commands
                         if (TryPlaceContourOnSheet_Level1(sheets[si], part, usableW, usableH, maxCandidates, GetRot, progress, out var placementL1))
                         {
                             CommitPlaced(modelSpace, part, sheets[si], boundaryBufferMm, placementL1);
-                            placed++;
-                            progress.ReportPlaced(placed, totalInstances, sheets.Count);
+                            placedInstances++;
+                            placedParts += Math.Max(1, part.PartCountWeight);
+                            progress.ReportPlaced(placedParts, totalInstances, sheets.Count);
                             placedThis = true;
                             break;
                         }
@@ -615,7 +619,7 @@ namespace SW2026RibbonAddin.Commands
 
                 // Need a new sheet
                 cur = NewSheet();
-                progress.ReportPlaced(placed, totalInstances, sheets.Count);
+                progress.ReportPlaced(placedParts, totalInstances, sheets.Count);
 
                 // On fresh sheet, Level1 must always work if the sheet is large enough
                 // Try Level2 if still desired, else do Level1
@@ -652,8 +656,9 @@ namespace SW2026RibbonAddin.Commands
                     CommitPlaced(modelSpace, part, cur, boundaryBufferMm, placementFreshL1);
                 }
 
-                placed++;
-                progress.ReportPlaced(placed, totalInstances, sheets.Count);
+                placedInstances++;
+                placedParts += Math.Max(1, part.PartCountWeight);
+                progress.ReportPlaced(placedParts, totalInstances, sheets.Count);
             }
 
             AddFillLabels(modelSpace, sheets, usableW, usableH, sheetWmm, sheetHmm);

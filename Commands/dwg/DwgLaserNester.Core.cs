@@ -403,6 +403,8 @@ namespace SW2026RibbonAddin.Commands
             public BlockRecord Block;
             public string BlockName;
             public int Quantity;
+            public int PartCountWeight = 1;
+
             public string MaterialExact;
 
             public double MinX, MinY, MaxX, MaxY;
@@ -839,13 +841,13 @@ namespace SW2026RibbonAddin.Commands
                 .Where(d => string.Equals(NormalizeMaterialLabel(d.MaterialExact), material, StringComparison.Ordinal))
                 .ToList();
 
-            int totalInstances = defs.Sum(d => d.Quantity);
+            int totalParts = defs.Sum(d => d.Quantity * Math.Max(1, d.PartCountWeight));
 
             // if mapping failed, fallback to all (still produce output)
-            if (totalInstances <= 0)
+            if (totalParts <= 0)
             {
                 defs = defsAll;
-                totalInstances = defs.Sum(d => d.Quantity);
+                totalParts = defs.Sum(d => d.Quantity * Math.Max(1, d.PartCountWeight));
             }
 
             BlockRecord modelSpace = doc.BlockRecords["*Model_Space"];
@@ -862,11 +864,20 @@ namespace SW2026RibbonAddin.Commands
             double baseSheetOriginX = srcMinX;
             double baseSheetOriginY = srcMaxY + 200.0;
 
+
+            // Optional optimization: mirror-pair parts that together fill a rectangle
+            // (common-line). This is OFF by default (see UI checkbox).
+            if (settings.MirrorPairing != MirrorPairingMode.Off)
+            {
+                ApplyMirrorPairingToRectangles(doc, defs, material, settings.MirrorPairing, gapMm);
+                totalParts = defs.Sum(d => d.Quantity * Math.Max(1, d.PartCountWeight));
+            }
+
             progress.BeginTask(
                 taskIndex,
                 totalTasks,
                 job,
-                totalInstances,
+                totalParts,
                 settings.Mode,
                 job.Sheet.WidthMm,
                 job.Sheet.HeightMm);
@@ -889,7 +900,7 @@ namespace SW2026RibbonAddin.Commands
                         baseSheetOriginY,
                         material,
                         progress,
-                        totalInstances);
+                        totalParts);
                 }
                 else if (settings.Mode == NestingMode.ContourLevel1)
                 {
@@ -904,7 +915,7 @@ namespace SW2026RibbonAddin.Commands
                         baseSheetOriginY,
                         material,
                         progress,
-                        totalInstances,
+                        totalParts,
                         chordMm: Math.Max(0.10, settings.ContourChordMm),
                         snapMm: Math.Max(0.01, settings.ContourSnapMm),
                         maxCandidates: Math.Max(500, settings.MaxCandidatesPerTry));
@@ -923,7 +934,7 @@ namespace SW2026RibbonAddin.Commands
                         baseSheetOriginY,
                         material,
                         progress,
-                        totalInstances,
+                        totalParts,
                         chordMm: Math.Max(0.10, settings.ContourChordMm),
                         snapMm: Math.Max(0.01, settings.ContourSnapMm),
                         maxCandidates: Math.Max(500, settings.MaxCandidatesPerTry),
@@ -956,7 +967,7 @@ namespace SW2026RibbonAddin.Commands
                     taskIndex,
                     totalTasks,
                     job,
-                    totalInstances,
+                    totalParts,
                     finalMode,
                     job.Sheet.WidthMm,
                     job.Sheet.HeightMm);
@@ -972,7 +983,7 @@ namespace SW2026RibbonAddin.Commands
                     baseSheetOriginY,
                     material,
                     progress,
-                    totalInstances,
+                    totalParts,
                     chordMm: Math.Max(0.10, settings.ContourChordMm),
                     snapMm: Math.Max(0.01, settings.ContourSnapMm),
                     maxCandidates: Math.Max(500, settings.MaxCandidatesPerTry));
@@ -1000,7 +1011,7 @@ namespace SW2026RibbonAddin.Commands
                 gapMm,
                 marginMm,
                 sheetsUsed,
-                totalInstances,
+                totalParts,
                 outPath,
                 finalMode);
 
@@ -1010,7 +1021,7 @@ namespace SW2026RibbonAddin.Commands
                 MaterialExact = material,
                 OutputDwg = outPath,
                 SheetsUsed = sheetsUsed,
-                TotalParts = totalInstances,
+                TotalParts = totalParts,
                 Mode = finalMode
             };
         }
@@ -1117,6 +1128,494 @@ namespace SW2026RibbonAddin.Commands
                     OuterArea2Abs = area2Abs
                 };
             }
+        }
+
+
+        // ============================
+        // Mirror-pair optimization
+        private enum MirrorPairAxis { X = 0, Y = 1 }
+
+        // ============================
+        private sealed class _MirrorShapeInfo
+        {
+            public PartDefinition Part;
+            public Path64 PolyNormFull;
+            public Path64 PolyNormDec;
+            public LongRect Bounds0;
+            public long Width;
+            public long Height;
+            public ulong Key;
+            public ulong MirrorXKey;
+            public ulong MirrorYKey;
+        }
+
+        /// <summary>
+        /// Attempts to detect mirrored part pairs that, when overlaid in the same bounding box,
+        /// form a full rectangle (no overlap area, union fills the rectangle).
+        ///
+        /// If found, it creates a new "PAIR_*" block (containing two inserts) and adds a
+        /// synthetic PartDefinition with PartCountWeight=2 and a rectangular contour.
+        ///
+        /// This is especially helpful for Fast(Rectangles) mode when individual parts have
+        /// large bounding-box waste (L shapes, triangles, etc.).
+        /// </summary>
+        private static void ApplyMirrorPairingToRectangles(CadDocument doc, List<PartDefinition> defs, string materialLabel, MirrorPairingMode mode, double pairGapMm)
+        {
+            if (doc == null || defs == null || defs.Count < 2)
+                return;
+
+            // Only consider parts with positive qty.
+            var parts = defs.Where(d => d != null && d.Quantity > 0).ToList();
+            if (parts.Count < 2)
+                return;
+
+            const int HASH_MAX_POINTS = 220;
+
+            // Precompute normalized polys + hash keys.
+            var infos = new Dictionary<PartDefinition, _MirrorShapeInfo>();
+            var byKey = new Dictionary<ulong, List<_MirrorShapeInfo>>();
+
+            foreach (var p in parts)
+            {
+                Path64 poly = p.OuterContour0;
+                if (poly == null || poly.Count < 3)
+                    poly = MakeRectPolyScaled(p.MinX, p.MinY, p.MaxX, p.MaxY);
+
+                poly = CleanPath(poly);
+                if (poly == null || poly.Count < 3)
+                    continue;
+
+                var b = GetBounds(poly);
+                long w = b.MaxX - b.MinX;
+                long h = b.MaxY - b.MinY;
+                if (w <= 0 || h <= 0)
+                    continue;
+
+                var normFull = TranslatePath(poly, -b.MinX, -b.MinY);
+                var normDec = CleanPath(DecimatePath(normFull, HASH_MAX_POINTS));
+
+                ulong key = HashPathCanonical(normDec);
+
+                if (key == 0UL)
+                    continue;
+
+                var mx = MirrorX(normDec, w);
+                var my = MirrorY(normDec, h);
+                ulong kx = HashPathCanonical(mx);
+                ulong ky = HashPathCanonical(my);
+
+                var info = new _MirrorShapeInfo
+                {
+                    Part = p,
+                    PolyNormFull = normFull,
+                    PolyNormDec = normDec,
+                    Bounds0 = b,
+                    Width = w,
+                    Height = h,
+                    Key = key,
+                    MirrorXKey = kx,
+                    MirrorYKey = ky
+                };
+
+                infos[p] = info;
+
+                if (!byKey.TryGetValue(key, out var list))
+                {
+                    list = new List<_MirrorShapeInfo>();
+                    byKey[key] = list;
+                }
+                list.Add(info);
+            }
+
+            if (infos.Count < 2)
+                return;
+
+            // Process bigger rectangles first (more benefit).
+            var ordered = infos.Values
+                .OrderByDescending(i => i.Width * i.Height)
+                .ToList();
+
+            int createdPairs = 0;
+
+            foreach (var a in ordered)
+            {
+                var A = a.Part;
+                if (A == null || A.Quantity <= 0)
+                    continue;
+
+                // Try mirror-X, then mirror-Y (either/both can contribute depending on quantities).
+                TryConsumeMirrorPairs(doc, defs, materialLabel, a, a.MirrorXKey, byKey, mode, pairGapMm, MirrorPairAxis.X, ref createdPairs);
+                TryConsumeMirrorPairs(doc, defs, materialLabel, a, a.MirrorYKey, byKey, mode, pairGapMm, MirrorPairAxis.Y, ref createdPairs);
+            }
+
+            // Remove zero-qty originals (keeps list smaller for placement)
+            defs.RemoveAll(d => d == null || d.Quantity <= 0);
+        }
+
+        private static bool TryConsumeMirrorPairs(
+            CadDocument doc,
+            List<PartDefinition> defs,
+            string materialLabel,
+            _MirrorShapeInfo a,
+            ulong mirrorKey,
+            Dictionary<ulong, List<_MirrorShapeInfo>> byKey,
+            MirrorPairingMode mode,
+            double pairGapMm,
+            MirrorPairAxis axis,
+            ref int createdPairs)
+        {
+            if (a == null || a.Part == null || a.Part.Quantity <= 0)
+                return false;
+
+            if (!byKey.TryGetValue(mirrorKey, out var candidates) || candidates == null || candidates.Count == 0)
+                return false;
+
+            bool anyPaired = false;
+
+            // Prefer candidates with available quantity and same bbox dims.
+            foreach (var b in candidates)
+            {
+                var B = b?.Part;
+                if (B == null)
+                    continue;
+
+                if (ReferenceEquals(B, a.Part))
+                    continue;
+
+                if (a.Part.Quantity <= 0)
+                    break;
+
+                if (B.Quantity <= 0)
+                    continue;
+
+                // Must match bounding box dims very closely.
+                if (!DimsClose(a.Width, b.Width) || !DimsClose(a.Height, b.Height))
+                    continue;
+
+                // Expensive verify: union fills the rectangle and intersection area is ~0.
+                if (!VerifyRectangleUnionNoOverlap(a.PolyNormFull, b.PolyNormFull, a.Width, a.Height))
+                    continue;
+
+                int pairCount = Math.Min(a.Part.Quantity, B.Quantity);
+                if (pairCount <= 0)
+                    continue;
+
+                // Create a new pair block definition once per A-B match.
+                string pairBlockName = BuildPairBlockName(a.Part.BlockName, B.BlockName, createdPairs + 1);
+
+                BlockRecord pairBlock = null;
+                string nameTry = pairBlockName;
+
+                for (int attempt = 0; attempt < 200; attempt++)
+                {
+                    try
+                    {
+                        pairBlock = new BlockRecord(nameTry);
+                        doc.BlockRecords.Add(pairBlock);
+                        break;
+                    }
+                    catch
+                    {
+                        nameTry = pairBlockName + "_" + (attempt + 1).ToString(CultureInfo.InvariantCulture);
+                        pairBlock = null;
+                    }
+                }
+
+                if (pairBlock == null)
+                    continue;
+
+                // Place both parts into the same rectangle bbox (normalized to min=0,0).
+                // CommonLine: the two parts touch (common-line) and together form an exact rectangle.
+                // WithGap: keep an internal gap (use auto gap) by shifting one half, and grow the outer rectangle by that gap.
+                long gapScaled = 0;
+                if (mode == MirrorPairingMode.WithGap && pairGapMm > 0)
+                    gapScaled = (long)Math.Round(pairGapMm * SCALE);
+
+                long rectW = a.Width;
+                long rectH = a.Height;
+
+                double extraBx = 0.0;
+                double extraBy = 0.0;
+
+                if (gapScaled > 0)
+                {
+                    if (axis == MirrorPairAxis.X)
+                    {
+                        rectW = a.Width + gapScaled;
+                        extraBx = (double)gapScaled / SCALE;
+                    }
+                    else if (axis == MirrorPairAxis.Y)
+                    {
+                        rectH = a.Height + gapScaled;
+                        extraBy = (double)gapScaled / SCALE;
+                    }
+                }
+
+                double ax = -(double)a.Bounds0.MinX / SCALE;
+                double ay = -(double)a.Bounds0.MinY / SCALE;
+                double bx = -(double)b.Bounds0.MinX / SCALE + extraBx;
+                double by = -(double)b.Bounds0.MinY / SCALE + extraBy;
+
+                pairBlock.Entities.Add(new Insert(a.Part.Block)
+                {
+                    InsertPoint = new XYZ(ax, ay, 0.0),
+                    Rotation = 0.0,
+                    XScale = 1.0,
+                    YScale = 1.0,
+                    ZScale = 1.0
+                });
+
+                pairBlock.Entities.Add(new Insert(B.Block)
+                {
+                    InsertPoint = new XYZ(bx, by, 0.0),
+                    Rotation = 0.0,
+                    XScale = 1.0,
+                    YScale = 1.0,
+                    ZScale = 1.0
+                });
+
+                // New synthetic part def representing a rectangle that yields TWO parts.
+                double wMm = (double)rectW / SCALE;
+                double hMm = (double)rectH / SCALE;
+
+                var rect = new Path64
+                {
+                    new Point64(0, 0),
+                    new Point64(rectW, 0),
+                    new Point64(rectW, rectH),
+                    new Point64(0, rectH)
+                };
+
+                defs.Add(new PartDefinition
+                {
+                    Block = pairBlock,
+                    BlockName = pairBlock.Name,
+                    Quantity = pairCount,
+                    PartCountWeight = 2,
+                    MaterialExact = materialLabel ?? "UNKNOWN",
+
+                    MinX = 0.0,
+                    MinY = 0.0,
+                    MaxX = wMm,
+                    MaxY = hMm,
+                    Width = wMm,
+                    Height = hMm,
+
+                    OuterContour0 = rect,
+                    OuterArea2Abs = Area2Abs(rect)
+                });
+
+                // Consume quantities
+                a.Part.Quantity -= pairCount;
+                B.Quantity -= pairCount;
+
+                createdPairs++;
+                anyPaired = true;
+
+                // Keep pairing A with other candidates if it still has qty.
+            }
+
+            return anyPaired;
+        }
+
+        private static bool DimsClose(long a, long b)
+        {
+            // within 0.05mm (snap tolerance default) in scaled units
+            long tol = Math.Max(1, (long)Math.Round(0.05 * SCALE));
+            return Math.Abs(a - b) <= tol;
+        }
+
+        private static bool VerifyRectangleUnionNoOverlap(Path64 aNorm, Path64 bNorm, long w, long h)
+        {
+            if (aNorm == null || bNorm == null || aNorm.Count < 3 || bNorm.Count < 3)
+                return false;
+
+            if (w <= 0 || h <= 0)
+                return false;
+
+            // Intersection area should be ~0
+            var clip = new Clipper64();
+            clip.AddSubject(aNorm);
+            clip.AddClip(bNorm);
+
+            var inter = new Paths64();
+            clip.Execute(Clipper2Lib.ClipType.Intersection, FillRule.NonZero, inter);
+
+            long interA2 = 0;
+            if (inter != null)
+            {
+                foreach (var p in inter)
+                    interA2 += Area2Abs(p);
+            }
+
+            // Allow tiny numerical noise (≈ 2mm^2)
+            const long interTolA2 = 4_000_000; // 2mm^2 -> 2*1e6
+            if (interA2 > interTolA2)
+                return false;
+
+            // Union area should be ~= rectangle area
+            var clipU = new Clipper64();
+            clipU.AddSubject(aNorm);
+            clipU.AddSubject(bNorm);
+
+            var uni = new Paths64();
+            clipU.Execute(Clipper2Lib.ClipType.Union, FillRule.NonZero, uni);
+
+            long uniA2 = 0;
+            if (uni != null)
+            {
+                foreach (var p in uni)
+                    uniA2 += Area2Abs(p);
+            }
+
+            long rectA2 = 2L * w * h;
+
+            // Relative tolerance 0.5% + small absolute tolerance
+            long absTol = 6_000_000; // 3mm^2
+            long relTol = (long)Math.Round(rectA2 * 0.005);
+
+            long tol = Math.Max(absTol, relTol);
+
+            return Math.Abs(uniA2 - rectA2) <= tol;
+        }
+
+        private static Path64 MirrorX(Path64 p, long width)
+        {
+            if (p == null) return p;
+
+            var r = new Path64(p.Count);
+            foreach (var pt in p)
+                r.Add(new Point64(width - pt.X, pt.Y));
+
+            return CleanPath(r);
+        }
+
+        private static Path64 MirrorY(Path64 p, long height)
+        {
+            if (p == null) return p;
+
+            var r = new Path64(p.Count);
+            foreach (var pt in p)
+                r.Add(new Point64(pt.X, height - pt.Y));
+
+            return CleanPath(r);
+        }
+
+        private static string BuildPairBlockName(string aName, string bName, int index)
+        {
+            string Clean(string s, int maxLen)
+            {
+                s = (s ?? "").Trim();
+                if (s.Length == 0) return "X";
+
+                var sb = new StringBuilder(s.Length);
+                foreach (char c in s)
+                {
+                    if (char.IsLetterOrDigit(c))
+                        sb.Append(c);
+                    else if (c == '_' || c == '-')
+                        sb.Append('_');
+                }
+
+                var t = sb.ToString();
+                if (t.Length == 0) t = "X";
+                if (t.Length > maxLen) t = t.Substring(0, maxLen);
+                return t;
+            }
+
+            string aa = Clean(aName, 24);
+            string bb = Clean(bName, 24);
+
+            return $"PAIR_{index}_{aa}_{bb}";
+        }
+
+        // Canonical hash for a closed polygon path, invariant to start index and direction.
+        private static ulong HashPathCanonical(Path64 p)
+        {
+            if (p == null || p.Count < 3)
+                return 0UL;
+
+            p = CleanPath(p);
+            int n = p.Count;
+            if (n < 3)
+                return 0UL;
+
+            long minX = long.MaxValue;
+            long minY = long.MaxValue;
+
+            for (int i = 0; i < n; i++)
+            {
+                var pt = p[i];
+                if (pt.X < minX || (pt.X == minX && pt.Y < minY))
+                {
+                    minX = pt.X;
+                    minY = pt.Y;
+                }
+            }
+
+            var starts = new List<int>();
+            for (int i = 0; i < n; i++)
+                if (p[i].X == minX && p[i].Y == minY)
+                    starts.Add(i);
+
+            int bestStart = starts[0];
+            int bestDir = +1; // +1 forward, -1 reverse
+
+            foreach (int s in starts)
+            {
+                if (CompareCyclic(p, s, +1, bestStart, bestDir) < 0)
+                {
+                    bestStart = s;
+                    bestDir = +1;
+                }
+
+                if (CompareCyclic(p, s, -1, bestStart, bestDir) < 0)
+                {
+                    bestStart = s;
+                    bestDir = -1;
+                }
+            }
+
+            // FNV-1a 64-bit
+            ulong h = 1469598103934665603UL;
+            const ulong prime = 1099511628211UL;
+
+            for (int k = 0; k < n; k++)
+            {
+                int idx = bestDir > 0 ? (bestStart + k) % n : (bestStart - k + n) % n;
+                var pt = p[idx];
+
+                unchecked
+                {
+                    h ^= (ulong)pt.X;
+                    h *= prime;
+                    h ^= (ulong)pt.Y;
+                    h *= prime;
+                }
+            }
+
+            return h;
+        }
+
+        private static int CompareCyclic(Path64 p, int startA, int dirA, int startB, int dirB)
+        {
+            int n = p.Count;
+
+            for (int k = 0; k < n; k++)
+            {
+                int ia = dirA > 0 ? (startA + k) % n : (startA - k + n) % n;
+                int ib = dirB > 0 ? (startB + k) % n : (startB - k + n) % n;
+
+                var a = p[ia];
+                var b = p[ib];
+
+                if (a.X != b.X)
+                    return a.X < b.X ? -1 : 1;
+                if (a.Y != b.Y)
+                    return a.Y < b.Y ? -1 : 1;
+            }
+
+            return 0;
         }
 
         private static bool TryGetBlockBbox(BlockRecord block, out double minX, out double minY, out double maxX, out double maxY)

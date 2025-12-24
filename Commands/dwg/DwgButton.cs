@@ -253,19 +253,35 @@ namespace SW2026RibbonAddin.Commands
             try
             {
                 prog?.UpdateCounts(partsDone: 1, totalParts: 1, failedParts: 0, dwgOk: exported, dwgFailed: dwgFailed, platesDone: platesDone);
-                prog?.SetStatus(cancelled ? "Cancelled." : "Done.");
+                prog?.MarkFinished(cancelled);
             }
             catch { }
 
-            MessageBox.Show(
-                (cancelled ? "DWG export cancelled." : "") +
-                $"Sheet-metal bodies (plates) found: {platesDone}" +
-                $"DWG files saved: {exported}" +
-                $"DWG failures: {dwgFailed}" +
-                $"Material detected: {material}" +
-                $"Folder:{jobFolder}" +
-                (failureDetails.Count > 0 ? "See export_report.txt for details." : ""),
-                "DWG Export");
+            var msg = new StringBuilder();
+
+            if (cancelled)
+            {
+                msg.AppendLine("DWG export cancelled.");
+                msg.AppendLine();
+            }
+
+            msg.AppendLine($"Sheet-metal bodies (plates) found: {platesDone}");
+            msg.AppendLine($"DWG files saved: {exported}");
+            msg.AppendLine($"DWG failures: {dwgFailed}");
+            msg.AppendLine($"Material detected: {material}");
+            msg.AppendLine("Folder:");
+            msg.AppendLine(jobFolder);
+
+            if (failureDetails.Count > 0)
+            {
+                msg.AppendLine();
+                msg.AppendLine("See export_report.txt for details.");
+            }
+
+            if (prog != null && !prog.IsDisposed)
+                MessageBox.Show(prog, msg.ToString(), "DWG Export");
+            else
+                MessageBox.Show(msg.ToString(), "DWG Export");
         }
 
         // ------------------------------------------------------------------
@@ -482,19 +498,35 @@ namespace SW2026RibbonAddin.Commands
                 dwgFailed: dwgFailed,
                 failureDetails: failureDetails);
 
-            try { prog?.SetStatus(cancelled ? "Cancelled." : "Done."); } catch { }
+            try { prog?.MarkFinished(cancelled); } catch { }
 
-            MessageBox.Show(
-                (cancelled ? "DWG export cancelled." : "") +
-                $"Unique sheet-metal parts found: {totalParts}" +
-                $"Parts processed: {processedParts}/{totalParts}" +
-                $"Parts failed: {failedParts}" +
-                $"Total plates (DWG attempts): {totalPlates}" +
-                $"DWG files saved: {dwgOk}" +
-                $"DWG failures: {dwgFailed}" +
-                $"Folder:{jobFolder}" +
-                (failureDetails.Count > 0 ? "See export_report.txt for details." : ""),
-                "DWG Export");
+            var msg = new StringBuilder();
+
+            if (cancelled)
+            {
+                msg.AppendLine("DWG export cancelled.");
+                msg.AppendLine();
+            }
+
+            msg.AppendLine($"Unique sheet-metal parts found: {totalParts}");
+            msg.AppendLine($"Parts processed: {processedParts}/{totalParts}");
+            msg.AppendLine($"Parts failed: {failedParts}");
+            msg.AppendLine($"Total plates (DWG attempts): {totalPlates}");
+            msg.AppendLine($"DWG files saved: {dwgOk}");
+            msg.AppendLine($"DWG failures: {dwgFailed}");
+            msg.AppendLine("Folder:");
+            msg.AppendLine(jobFolder);
+
+            if (failureDetails.Count > 0)
+            {
+                msg.AppendLine();
+                msg.AppendLine("See export_report.txt for details.");
+            }
+
+            if (prog != null && !prog.IsDisposed)
+                MessageBox.Show(prog, msg.ToString(), "DWG Export");
+            else
+                MessageBox.Show(msg.ToString(), "DWG Export");
         }
 
         // ------------------------------------------------------------------
@@ -1313,6 +1345,8 @@ namespace SW2026RibbonAddin.Commands
 
         private volatile bool _cancelRequested;
 
+        private volatile bool _isCompleted;
+
         public bool IsCancellationRequested => _cancelRequested;
 
         public DwgExportProgressForm()
@@ -1323,21 +1357,31 @@ namespace SW2026RibbonAddin.Commands
             MinimizeBox = false;
             StartPosition = FormStartPosition.CenterScreen;
             ShowInTaskbar = false;
+            TopMost = true;
 
             Width = 640;
             Height = 250;
 
-            _lblHeader = new Label { Left = 12, Top = 10, Width = 600, Height = 18, Text = "DWG Export..." };
-            _lblPart = new Label { Left = 12, Top = 32, Width = 600, Height = 18, Text = "" };
-            _lblDetails = new Label { Left = 12, Top = 52, Width = 600, Height = 36, Text = "" };
-            _lblCounts = new Label { Left = 12, Top = 90, Width = 600, Height = 32, Text = "" };
+            _lblHeader = new Label { Left = 12, Top = 10, Width = 600, Height = 18, AutoSize = false, Text = "DWG Export..." };
+            _lblPart = new Label { Left = 12, Top = 32, Width = 600, Height = 18, AutoSize = false, Text = "" };
+            _lblDetails = new Label { Left = 12, Top = 52, Width = 600, Height = 36, AutoSize = false, Text = "" };
+            _lblCounts = new Label { Left = 12, Top = 90, Width = 600, Height = 32, AutoSize = false, Text = "" };
 
             _bar = new ProgressBar { Left = 12, Top = 126, Width = 600, Height = 18, Minimum = 0, Maximum = 100, Value = 0 };
 
-            _lblStatus = new Label { Left = 12, Top = 148, Width = 600, Height = 18, Text = "" };
+            _lblStatus = new Label { Left = 12, Top = 148, Width = 600, Height = 18, AutoSize = false, Text = "" };
 
             _btnCancel = new Button { Left = 522, Top = 176, Width = 90, Height = 26, Text = "Cancel" };
-            _btnCancel.Click += (s, e) => RequestCancel();
+            _btnCancel.Click += (s, e) =>
+            {
+                if (_isCompleted)
+                {
+                    try { Close(); } catch { }
+                    return;
+                }
+
+                RequestCancel();
+            };
 
             Controls.Add(_lblHeader);
             Controls.Add(_lblPart);
@@ -1350,6 +1394,9 @@ namespace SW2026RibbonAddin.Commands
             // If user clicks [X], treat as cancel request (don’t kill the process abruptly)
             FormClosing += (s, e) =>
             {
+                if (_isCompleted)
+                    return;
+
                 if (!_cancelRequested)
                 {
                     _cancelRequested = true;
@@ -1377,6 +1424,10 @@ namespace SW2026RibbonAddin.Commands
                 _bar.Value = 0;
 
                 _lblStatus.Text = "";
+
+                _cancelRequested = false;
+                _isCompleted = false;
+                _btnCancel.Text = "Cancel";
                 _btnCancel.Enabled = true;
             });
 
@@ -1439,7 +1490,7 @@ namespace SW2026RibbonAddin.Commands
                 int plates = Math.Max(0, platesDone);
 
                 _lblCounts.Text =
-                    $"Parts: {pd}/{tp}    Failed parts: {fp}" +
+                    $"Parts: {pd}/{tp}    Failed parts: {fp}\r\n" +
                     $"Plates (DWGs): {plates}    Saved: {ok}    Failed: {bad}";
             });
 
@@ -1454,6 +1505,18 @@ namespace SW2026RibbonAddin.Commands
             });
 
             ThrowIfCancelled();
+        }
+
+        public void MarkFinished(bool cancelled)
+        {
+            UI(() =>
+            {
+                _isCompleted = true;
+
+                _lblStatus.Text = cancelled ? "Cancelled." : "Done.";
+                _btnCancel.Enabled = true;
+                _btnCancel.Text = "Close";
+            });
         }
 
         public void ThrowIfCancelled()
