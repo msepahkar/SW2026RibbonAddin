@@ -10,12 +10,29 @@ using Microsoft.Win32;
 
 namespace SW2026RibbonAddin.Commands
 {
+    
     internal sealed class LaserCutOptionsForm : Form
     {
         private readonly string _folder;
         private readonly List<LaserNestJob> _jobs; // sorted
 
-        private readonly DataGridView _grid;
+        private readonly SplitContainer _split;
+        private readonly TreeView _tree;
+
+        // Details panel (per selected job)
+        private readonly Label _lblMaterial;
+        private readonly Label _lblThickness;
+        private readonly Label _lblSource;
+
+        private readonly ComboBox _cbPreset;
+        private readonly NumericUpDown _numW;
+        private readonly NumericUpDown _numH;
+
+        private readonly Button _btnApplyThickness;
+        private readonly Button _btnApplyAllSheets;
+
+        private readonly Button _btnAll;
+        private readonly Button _btnNone;
 
         private readonly RadioButton _rbFast;
         private readonly RadioButton _rbContour1;
@@ -24,11 +41,15 @@ namespace SW2026RibbonAddin.Commands
         private readonly NumericUpDown _chord;
         private readonly NumericUpDown _snap;
 
-        private readonly Button _btnAll;
-        private readonly Button _btnNone;
-
         private readonly Button _ok;
         private readonly Button _cancel;
+
+        private readonly Dictionary<LaserNestJob, TreeNode> _nodeByJob = new Dictionary<LaserNestJob, TreeNode>();
+
+        private bool _suppressTreeEvents;
+        private bool _suppressDetailEvents;
+
+        private LaserNestJob _selectedJob;
 
         private readonly List<SheetPreset> _presets = new List<SheetPreset>
         {
@@ -46,9 +67,9 @@ namespace SW2026RibbonAddin.Commands
         {
             _folder = folder ?? "";
             _jobs = (jobs ?? new List<LaserNestJob>())
-                .OrderBy(j => j.MaterialExact ?? "", StringComparer.Ordinal)
-                .ThenBy(j => j.ThicknessMm <= 0 ? double.MaxValue : j.ThicknessMm)
+                .OrderBy(j => j.ThicknessMm <= 0 ? double.MaxValue : j.ThicknessMm)
                 .ThenBy(j => j.ThicknessFileName ?? "", StringComparer.OrdinalIgnoreCase)
+                .ThenBy(j => j.MaterialExact ?? "", StringComparer.Ordinal)
                 .ToList();
 
             Text = "Laser nesting options";
@@ -66,38 +87,103 @@ namespace SW2026RibbonAddin.Commands
                 Top = 10,
                 Width = 950,
                 Height = 22,
-                Text = "Select which (Material × Thickness) runs to nest, and set sheet size per item:"
+                Text = "Select which (Thickness × Material) runs to nest, and set sheet size per item:"
             };
             Controls.Add(title);
 
-            _grid = new DataGridView
+            // Apply remembered sheets BEFORE building UI nodes
+            ApplyRememberedSheetsIntoJobs();
+
+            _split = new SplitContainer
             {
                 Left = 12,
                 Top = 38,
                 Width = 950,
                 Height = 360,
-                AllowUserToAddRows = false,
-                AllowUserToDeleteRows = false,
-                RowHeadersVisible = false,
-                SelectionMode = DataGridViewSelectionMode.FullRowSelect,
-                MultiSelect = true,
-                AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.None,
+                Orientation = Orientation.Vertical,
+                SplitterDistance = 480,
                 Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right
             };
-            Controls.Add(_grid);
+            Controls.Add(_split);
 
-            BuildGridColumns();
-            PopulateGrid();
-
-            _grid.CurrentCellDirtyStateChanged += (_, __) =>
+            _tree = new TreeView
             {
-                if (_grid.IsCurrentCellDirty)
-                    _grid.CommitEdit(DataGridViewDataErrorContexts.Commit);
+                Dock = DockStyle.Fill,
+                CheckBoxes = true,
+                HideSelection = false
             };
+            _tree.AfterCheck += Tree_AfterCheck;
+            _tree.AfterSelect += Tree_AfterSelect;
+            _split.Panel1.Controls.Add(_tree);
 
-            _grid.CellValueChanged += Grid_CellValueChanged;
-            _grid.CellEndEdit += Grid_CellEndEdit;
-            _grid.DataError += (_, __) => { /* ignore combo parse errors */ };
+            // Details panel
+            var details = new GroupBox
+            {
+                Dock = DockStyle.Fill,
+                Text = "Selected item"
+            };
+            _split.Panel2.Controls.Add(details);
+
+            _lblMaterial = new Label { Left = 12, Top = 24, Width = 430, Height = 18, Text = "Material: -" };
+            _lblThickness = new Label { Left = 12, Top = 44, Width = 430, Height = 18, Text = "Thickness: -" };
+            _lblSource = new Label { Left = 12, Top = 64, Width = 430, Height = 18, Text = "Source DWG: -" };
+
+            details.Controls.Add(_lblMaterial);
+            details.Controls.Add(_lblThickness);
+            details.Controls.Add(_lblSource);
+
+            details.Controls.Add(new Label { Left = 12, Top = 96, Width = 110, Height = 18, Text = "Sheet preset:" });
+
+            _cbPreset = new ComboBox
+            {
+                Left = 128,
+                Top = 92,
+                Width = 220,
+                DropDownStyle = ComboBoxStyle.DropDownList
+            };
+            foreach (var p in _presets)
+                _cbPreset.Items.Add(p.Name);
+            details.Controls.Add(_cbPreset);
+
+            details.Controls.Add(new Label { Left = 12, Top = 128, Width = 110, Height = 18, Text = "Width (mm):" });
+            _numW = new NumericUpDown
+            {
+                Left = 128,
+                Top = 124,
+                Width = 120,
+                DecimalPlaces = 3,
+                Minimum = 1,
+                Maximum = 200000,
+                Value = 3000,
+                Increment = 10
+            };
+            details.Controls.Add(_numW);
+
+            details.Controls.Add(new Label { Left = 260, Top = 128, Width = 90, Height = 18, Text = "Height (mm):" });
+            _numH = new NumericUpDown
+            {
+                Left = 340,
+                Top = 124,
+                Width = 120,
+                DecimalPlaces = 3,
+                Minimum = 1,
+                Maximum = 200000,
+                Value = 1500,
+                Increment = 10
+            };
+            details.Controls.Add(_numH);
+
+            _btnApplyThickness = new Button { Left = 12, Top = 160, Width = 220, Height = 28, Text = "Apply sheet to this thickness" };
+            _btnApplyAllSheets = new Button { Left = 240, Top = 160, Width = 220, Height = 28, Text = "Apply sheet to ALL jobs" };
+            details.Controls.Add(_btnApplyThickness);
+            details.Controls.Add(_btnApplyAllSheets);
+
+            _cbPreset.SelectedIndexChanged += (_, __) => OnPresetChanged();
+            _numW.ValueChanged += (_, __) => OnSheetDimChanged();
+            _numH.ValueChanged += (_, __) => OnSheetDimChanged();
+
+            _btnApplyThickness.Click += (_, __) => ApplySelectedSheetToThickness();
+            _btnApplyAllSheets.Click += (_, __) => ApplySelectedSheetToAll();
 
             _btnAll = new Button { Left = 12, Top = 406, Width = 120, Height = 28, Text = "Select All" };
             _btnNone = new Button { Left = 140, Top = 406, Width = 120, Height = 28, Text = "Select None" };
@@ -193,119 +279,124 @@ namespace SW2026RibbonAddin.Commands
 
             _ok.Click += (_, __) => OnOk();
 
-            // Ensure sheet values are loaded from last memory before user sees UI
-            ApplyRememberedSheetsIntoGrid();
-        }
+            BuildTree();
 
-        private void BuildGridColumns()
-        {
-            _grid.Columns.Clear();
-
-            var colOn = new DataGridViewCheckBoxColumn
+            // Preselect the first job so the user sees sheet controls immediately
+            if (_tree.Nodes.Count > 0)
             {
-                Name = "Enabled",
-                HeaderText = "",
-                Width = 36
-            };
-            _grid.Columns.Add(colOn);
-
-            var colMat = new DataGridViewTextBoxColumn
+                var first = _tree.Nodes[0];
+                if (first.Nodes.Count > 0)
+                    _tree.SelectedNode = first.Nodes[0];
+                else
+                    _tree.SelectedNode = first;
+            }
+            else
             {
-                Name = "Material",
-                HeaderText = "Material (EXACT from SolidWorks)",
-                Width = 320,
-                ReadOnly = true
-            };
-            _grid.Columns.Add(colMat);
-
-            var colThk = new DataGridViewTextBoxColumn
-            {
-                Name = "Thickness",
-                HeaderText = "Thk (mm)",
-                Width = 80,
-                ReadOnly = true
-            };
-            _grid.Columns.Add(colThk);
-
-            var colFile = new DataGridViewTextBoxColumn
-            {
-                Name = "File",
-                HeaderText = "Source DWG",
-                Width = 190,
-                ReadOnly = true
-            };
-            _grid.Columns.Add(colFile);
-
-            var colPreset = new DataGridViewComboBoxColumn
-            {
-                Name = "Preset",
-                HeaderText = "Sheet preset",
-                Width = 160,
-                FlatStyle = FlatStyle.Flat
-            };
-            foreach (var p in _presets)
-                colPreset.Items.Add(p.Name);
-            _grid.Columns.Add(colPreset);
-
-            var colW = new DataGridViewTextBoxColumn
-            {
-                Name = "W",
-                HeaderText = "W (mm)",
-                Width = 80
-            };
-            _grid.Columns.Add(colW);
-
-            var colH = new DataGridViewTextBoxColumn
-            {
-                Name = "H",
-                HeaderText = "H (mm)",
-                Width = 80
-            };
-            _grid.Columns.Add(colH);
-        }
-
-        private void PopulateGrid()
-        {
-            _grid.Rows.Clear();
-
-            foreach (var j in _jobs)
-            {
-                var rowIndex = _grid.Rows.Add();
-                var row = _grid.Rows[rowIndex];
-
-                row.Tag = j;
-
-                row.Cells["Enabled"].Value = true;
-                row.Cells["Material"].Value = j.MaterialExact ?? "UNKNOWN";
-                row.Cells["Thickness"].Value = j.ThicknessMm > 0 ? j.ThicknessMm.ToString("0.###", CultureInfo.InvariantCulture) : "?";
-                row.Cells["File"].Value = j.ThicknessFileName;
-
-                // placeholders; real values loaded later by ApplyRememberedSheetsIntoGrid
-                row.Cells["Preset"].Value = _presets[0].Name;
-                row.Cells["W"].Value = _presets[0].WidthMm.ToString("0.###", CultureInfo.InvariantCulture);
-                row.Cells["H"].Value = _presets[0].HeightMm.ToString("0.###", CultureInfo.InvariantCulture);
+                SetDetailsEnabled(false);
             }
         }
 
-        private void ApplyRememberedSheetsIntoGrid()
+        private void ApplyRememberedSheetsIntoJobs()
         {
-            // global default
             var global = LaserCutUiMemory.LoadGlobalDefaultSheet(_presets[0]);
 
-            foreach (DataGridViewRow row in _grid.Rows)
+            foreach (var job in _jobs)
             {
-                if (!(row.Tag is LaserNestJob job))
-                    continue;
-
                 var remembered = LaserCutUiMemory.LoadSheetFor(job.MaterialExact, job.ThicknessMm, global);
 
+                // Normalize name against our preset list (so the combo always has a valid selection)
                 int presetIdx = FindPresetIndex(remembered.WidthMm, remembered.HeightMm);
                 string presetName = presetIdx >= 0 ? _presets[presetIdx].Name : "Custom";
 
-                row.Cells["Preset"].Value = presetName;
-                row.Cells["W"].Value = remembered.WidthMm.ToString("0.###", CultureInfo.InvariantCulture);
-                row.Cells["H"].Value = remembered.HeightMm.ToString("0.###", CultureInfo.InvariantCulture);
+                double w = remembered.WidthMm > 0 ? remembered.WidthMm : global.WidthMm;
+                double h = remembered.HeightMm > 0 ? remembered.HeightMm : global.HeightMm;
+
+                if (w <= 0) w = _presets[0].WidthMm;
+                if (h <= 0) h = _presets[0].HeightMm;
+
+                job.Sheet = new SheetPreset(presetName, w, h);
             }
+        }
+
+        private void BuildTree()
+        {
+            _tree.BeginUpdate();
+            _tree.Nodes.Clear();
+            _nodeByJob.Clear();
+
+            var groups = _jobs
+                .GroupBy(j => (j.ThicknessFileName ?? ""))
+                .Select(g => new
+                {
+                    FileName = g.Key,
+                    Thickness = g.FirstOrDefault()?.ThicknessMm ?? 0.0,
+                    Jobs = g.OrderBy(j => j.MaterialExact ?? "", StringComparer.Ordinal).ToList()
+                })
+                .OrderBy(g => g.Thickness <= 0 ? double.MaxValue : g.Thickness)
+                .ThenBy(g => g.FileName ?? "", StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            foreach (var g in groups)
+            {
+                int total = g.Jobs.Count;
+                int enabled = g.Jobs.Count(j => j != null && j.Enabled);
+
+                var root = new TreeNode(BuildRootText(g.FileName, g.Thickness, enabled, total))
+                {
+                    Tag = null,
+                    Checked = total > 0 && enabled == total
+                };
+
+                foreach (var job in g.Jobs)
+                {
+                    if (job == null) continue;
+
+                    var node = new TreeNode(BuildJobText(job))
+                    {
+                        Tag = job,
+                        Checked = job.Enabled
+                    };
+
+                    root.Nodes.Add(node);
+                    _nodeByJob[job] = node;
+                }
+
+                root.Expand();
+                _tree.Nodes.Add(root);
+            }
+
+            _tree.EndUpdate();
+        }
+
+        private static string BuildRootText(string thicknessFileName, double thicknessMm, int enabled, int total)
+        {
+            string thk = thicknessMm > 0 ? thicknessMm.ToString("0.###", CultureInfo.InvariantCulture) : "?";
+            string file = string.IsNullOrWhiteSpace(thicknessFileName) ? "(no file)" : thicknessFileName.Trim();
+            return $"{file}  ({thk} mm)   [{enabled}/{total}]";
+        }
+
+        private string BuildJobText(LaserNestJob job)
+        {
+            if (job == null)
+                return "(null)";
+
+            string mat = string.IsNullOrWhiteSpace(job.MaterialExact) ? "UNKNOWN" : job.MaterialExact.Trim();
+
+            double w = job.Sheet.WidthMm;
+            double h = job.Sheet.HeightMm;
+
+            string presetName = job.Sheet.Name ?? "";
+            if (string.IsNullOrWhiteSpace(presetName))
+            {
+                int idx = FindPresetIndex(w, h);
+                presetName = idx >= 0 ? _presets[idx].Name : "Custom";
+            }
+
+            string dims = $"{w:0.###}×{h:0.###} mm";
+            if (!string.Equals(presetName, "Custom", StringComparison.OrdinalIgnoreCase))
+                return $"{mat}   —   {dims}   ({presetName})";
+
+            return $"{mat}   —   {dims}";
         }
 
         private int FindPresetIndex(double w, double h)
@@ -323,81 +414,316 @@ namespace SW2026RibbonAddin.Commands
             return -1;
         }
 
-        private void SetAllEnabled(bool enabled)
+        private void Tree_AfterCheck(object sender, TreeViewEventArgs e)
         {
-            foreach (DataGridViewRow row in _grid.Rows)
-                row.Cells["Enabled"].Value = enabled;
-        }
-
-        private void Grid_CellValueChanged(object sender, DataGridViewCellEventArgs e)
-        {
-            if (e.RowIndex < 0 || e.ColumnIndex < 0)
+            if (_suppressTreeEvents)
                 return;
 
-            var row = _grid.Rows[e.RowIndex];
-            string colName = _grid.Columns[e.ColumnIndex].Name;
+            _suppressTreeEvents = true;
 
-            if (colName == "Preset")
+            try
             {
-                string presetName = (row.Cells["Preset"].Value as string) ?? "";
-                var preset = _presets.FirstOrDefault(p => string.Equals(p.Name, presetName, StringComparison.OrdinalIgnoreCase));
-
-                if (preset.Name != null && !string.Equals(preset.Name, "Custom", StringComparison.OrdinalIgnoreCase))
+                if (e.Node?.Tag is LaserNestJob job)
                 {
-                    row.Cells["W"].Value = preset.WidthMm.ToString("0.###", CultureInfo.InvariantCulture);
-                    row.Cells["H"].Value = preset.HeightMm.ToString("0.###", CultureInfo.InvariantCulture);
+                    job.Enabled = e.Node.Checked;
+
+                    UpdateJobNode(job);
+
+                    if (e.Node.Parent != null)
+                        UpdateRootNode(e.Node.Parent);
                 }
+                else
+                {
+                    // Root node toggled => apply to children
+                    if (e.Node != null)
+                    {
+                        foreach (TreeNode child in e.Node.Nodes)
+                        {
+                            child.Checked = e.Node.Checked;
+
+                            if (child.Tag is LaserNestJob cj)
+                            {
+                                cj.Enabled = child.Checked;
+                                UpdateJobNode(cj);
+                            }
+                        }
+
+                        UpdateRootNode(e.Node);
+                    }
+                }
+            }
+            finally
+            {
+                _suppressTreeEvents = false;
             }
         }
 
-        private void Grid_CellEndEdit(object sender, DataGridViewCellEventArgs e)
+        private void Tree_AfterSelect(object sender, TreeViewEventArgs e)
         {
-            if (e.RowIndex < 0 || e.ColumnIndex < 0)
-                return;
-
-            var row = _grid.Rows[e.RowIndex];
-            string colName = _grid.Columns[e.ColumnIndex].Name;
-
-            if (colName == "W" || colName == "H")
+            if (e.Node?.Tag is LaserNestJob job)
             {
-                // validate number and auto-switch preset to Custom if mismatch
-                if (!TryParseCellDouble(row.Cells["W"].Value, out double w) || w <= 0 ||
-                    !TryParseCellDouble(row.Cells["H"].Value, out double h) || h <= 0)
-                {
-                    MessageBox.Show("Width/Height must be valid positive numbers.", "Invalid sheet size",
-                        MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                LoadJobIntoDetails(job);
+            }
+            else
+            {
+                _selectedJob = null;
+                _lblMaterial.Text = "Material: -";
+                _lblThickness.Text = "Thickness: -";
+                _lblSource.Text = "Source DWG: -";
+                SetDetailsEnabled(false);
+            }
+        }
 
-                    // reset to a safe preset
-                    row.Cells["Preset"].Value = _presets[0].Name;
-                    row.Cells["W"].Value = _presets[0].WidthMm.ToString("0.###", CultureInfo.InvariantCulture);
-                    row.Cells["H"].Value = _presets[0].HeightMm.ToString("0.###", CultureInfo.InvariantCulture);
-                    return;
-                }
+        private void LoadJobIntoDetails(LaserNestJob job)
+        {
+            _selectedJob = job;
+            if (_selectedJob == null)
+            {
+                SetDetailsEnabled(false);
+                return;
+            }
+
+            SetDetailsEnabled(true);
+
+            _suppressDetailEvents = true;
+            try
+            {
+                _lblMaterial.Text = "Material: " + (string.IsNullOrWhiteSpace(job.MaterialExact) ? "UNKNOWN" : job.MaterialExact);
+                _lblThickness.Text = "Thickness: " + (job.ThicknessMm > 0 ? job.ThicknessMm.ToString("0.###", CultureInfo.InvariantCulture) : "?") + " mm";
+                _lblSource.Text = "Source DWG: " + (job.ThicknessFileName ?? "");
+
+                double w = job.Sheet.WidthMm > 0 ? job.Sheet.WidthMm : _presets[0].WidthMm;
+                double h = job.Sheet.HeightMm > 0 ? job.Sheet.HeightMm : _presets[0].HeightMm;
+
+                // Clamp to numeric control range
+                w = Math.Min(w, (double)_numW.Maximum);
+                h = Math.Min(h, (double)_numH.Maximum);
+
+                _numW.Value = (decimal)w;
+                _numH.Value = (decimal)h;
 
                 int presetIdx = FindPresetIndex(w, h);
-                if (presetIdx < 0)
-                    row.Cells["Preset"].Value = "Custom";
+                string presetName = presetIdx >= 0 ? _presets[presetIdx].Name : "Custom";
+
+                if (_cbPreset.Items.Contains(presetName))
+                    _cbPreset.SelectedItem = presetName;
                 else
-                    row.Cells["Preset"].Value = _presets[presetIdx].Name;
+                    _cbPreset.SelectedItem = "Custom";
+            }
+            finally
+            {
+                _suppressDetailEvents = false;
             }
         }
 
-        private static bool TryParseCellDouble(object v, out double value)
+        private void SetDetailsEnabled(bool enabled)
         {
-            value = 0.0;
-            if (v == null)
-                return false;
+            _cbPreset.Enabled = enabled;
+            _numW.Enabled = enabled;
+            _numH.Enabled = enabled;
+            _btnApplyThickness.Enabled = enabled;
+            _btnApplyAllSheets.Enabled = enabled;
+        }
 
-            string s = v.ToString().Trim();
-            if (s.Length == 0)
-                return false;
+        private void OnPresetChanged()
+        {
+            if (_suppressDetailEvents)
+                return;
 
-            return double.TryParse(s, NumberStyles.Float, CultureInfo.InvariantCulture, out value);
+            if (_selectedJob == null)
+                return;
+
+            string presetName = (_cbPreset.SelectedItem as string) ?? "Custom";
+            var preset = _presets.FirstOrDefault(p => string.Equals(p.Name, presetName, StringComparison.OrdinalIgnoreCase));
+
+            if (!string.Equals(preset.Name, "Custom", StringComparison.OrdinalIgnoreCase) &&
+                preset.WidthMm > 0 && preset.HeightMm > 0)
+            {
+                _suppressDetailEvents = true;
+                try
+                {
+                    _numW.Value = (decimal)Math.Min(preset.WidthMm, (double)_numW.Maximum);
+                    _numH.Value = (decimal)Math.Min(preset.HeightMm, (double)_numH.Maximum);
+                }
+                finally
+                {
+                    _suppressDetailEvents = false;
+                }
+
+                SetSelectedJobSheet(preset.Name, preset.WidthMm, preset.HeightMm);
+                return;
+            }
+
+            // Custom preset: keep numeric values
+            SetSelectedJobSheet("Custom", (double)_numW.Value, (double)_numH.Value);
+        }
+
+        private void OnSheetDimChanged()
+        {
+            if (_suppressDetailEvents)
+                return;
+
+            if (_selectedJob == null)
+                return;
+
+            double w = (double)_numW.Value;
+            double h = (double)_numH.Value;
+
+            int presetIdx = FindPresetIndex(w, h);
+            string presetName = presetIdx >= 0 ? _presets[presetIdx].Name : "Custom";
+
+            _suppressDetailEvents = true;
+            try
+            {
+                if (_cbPreset.Items.Contains(presetName))
+                    _cbPreset.SelectedItem = presetName;
+                else
+                    _cbPreset.SelectedItem = "Custom";
+            }
+            finally
+            {
+                _suppressDetailEvents = false;
+            }
+
+            SetSelectedJobSheet(presetName, w, h);
+        }
+
+        private void SetSelectedJobSheet(string presetName, double w, double h)
+        {
+            if (_selectedJob == null)
+                return;
+
+            w = Math.Max(1.0, w);
+            h = Math.Max(1.0, h);
+
+            _selectedJob.Sheet = new SheetPreset(presetName ?? "Custom", w, h);
+
+            UpdateJobNode(_selectedJob);
+        }
+
+        private void ApplySelectedSheetToThickness()
+        {
+            if (_selectedJob == null)
+                return;
+
+            string file = _selectedJob.ThicknessFileName ?? "";
+
+            foreach (var job in _jobs.Where(j => j != null && string.Equals(j.ThicknessFileName ?? "", file, StringComparison.OrdinalIgnoreCase)))
+            {
+                job.Sheet = _selectedJob.Sheet;
+                UpdateJobNode(job);
+            }
+        }
+
+        private void ApplySelectedSheetToAll()
+        {
+            if (_selectedJob == null)
+                return;
+
+            foreach (var job in _jobs.Where(j => j != null))
+            {
+                job.Sheet = _selectedJob.Sheet;
+                UpdateJobNode(job);
+            }
+        }
+
+        private void UpdateJobNode(LaserNestJob job)
+        {
+            if (job == null) return;
+
+            if (_nodeByJob.TryGetValue(job, out var node) && node != null)
+                node.Text = BuildJobText(job);
+        }
+
+        private void UpdateRootNode(TreeNode root)
+        {
+            if (root == null) return;
+            if (root.Nodes == null) return;
+
+            int total = root.Nodes.Count;
+            int enabled = 0;
+            double thickness = 0.0;
+            string file = root.Text;
+
+            foreach (TreeNode child in root.Nodes)
+            {
+                if (child.Checked) enabled++;
+
+                if (thickness <= 0 && child.Tag is LaserNestJob j)
+                    thickness = j.ThicknessMm;
+
+                if (child.Tag is LaserNestJob j2 && !string.IsNullOrWhiteSpace(j2.ThicknessFileName))
+                    file = j2.ThicknessFileName;
+            }
+
+            // Root checkbox = "all selected"
+            root.Checked = total > 0 && enabled == total;
+            root.Text = BuildRootText(file, thickness, enabled, total);
+        }
+
+        private void SetAllEnabled(bool enabled)
+        {
+            _suppressTreeEvents = true;
+
+            try
+            {
+                _tree.BeginUpdate();
+
+                foreach (TreeNode root in _tree.Nodes)
+                {
+                    foreach (TreeNode child in root.Nodes)
+                    {
+                        child.Checked = enabled;
+
+                        if (child.Tag is LaserNestJob job)
+                            job.Enabled = enabled;
+                    }
+
+                    UpdateRootNode(root);
+                }
+            }
+            finally
+            {
+                _tree.EndUpdate();
+                _suppressTreeEvents = false;
+            }
         }
 
         private void OnOk()
         {
-            var selected = new List<LaserNestJob>();
+            var selected = _jobs.Where(j => j != null && j.Enabled).ToList();
+
+            if (selected.Count == 0)
+            {
+                MessageBox.Show("Nothing selected. Check at least one item.", "Laser nesting",
+                    MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
+            // Validate sheet sizes (even for disabled jobs, to preserve memory safely)
+            foreach (var job in _jobs)
+            {
+                if (job == null) continue;
+
+                if (job.Sheet.WidthMm <= 0 || job.Sheet.HeightMm <= 0)
+                {
+                    MessageBox.Show("One or more sheet sizes are invalid. Fix them before pressing OK.",
+                        "Invalid sheet size",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Warning);
+                    return;
+                }
+            }
+
+            // Save global default as the first enabled item (simple, predictable)
+            LaserCutUiMemory.SaveGlobalDefaultSheet(selected[0].Sheet);
+
+            // Save per-job sheet dims (even if disabled, so user doesn't lose editing)
+            foreach (var job in _jobs)
+            {
+                if (job == null) continue;
+                LaserCutUiMemory.SaveSheetFor(job.MaterialExact, job.ThicknessMm, job.Sheet);
+            }
 
             // Build settings (3 checkboxes enforced = true)
             NestingMode mode =
@@ -415,46 +741,8 @@ namespace SW2026RibbonAddin.Commands
                 ContourChordMm = (double)_chord.Value,
                 ContourSnapMm = (double)_snap.Value,
 
-                DefaultSheet = _presets[0] // not very important now
+                DefaultSheet = selected[0].Sheet
             };
-
-            foreach (DataGridViewRow row in _grid.Rows)
-            {
-                if (!(row.Tag is LaserNestJob job))
-                    continue;
-
-                bool enabled = row.Cells["Enabled"].Value is bool b && b;
-                job.Enabled = enabled;
-
-                if (!TryParseCellDouble(row.Cells["W"].Value, out double w) || w <= 0 ||
-                    !TryParseCellDouble(row.Cells["H"].Value, out double h) || h <= 0)
-                {
-                    MessageBox.Show("One or more sheet sizes are invalid. Fix them before pressing OK.",
-                        "Invalid sheet size",
-                        MessageBoxButtons.OK,
-                        MessageBoxIcon.Warning);
-                    return;
-                }
-
-                string presetName = (row.Cells["Preset"].Value as string) ?? "Custom";
-                job.Sheet = new SheetPreset(presetName, w, h);
-
-                // Remember per job even if disabled (so user doesn't lose their editing)
-                LaserCutUiMemory.SaveSheetFor(job.MaterialExact, job.ThicknessMm, job.Sheet);
-
-                if (enabled)
-                    selected.Add(job);
-            }
-
-            if (selected.Count == 0)
-            {
-                MessageBox.Show("Nothing selected. Check at least one item.", "Laser nesting",
-                    MessageBoxButtons.OK, MessageBoxIcon.Information);
-                return;
-            }
-
-            // Save global default as the first enabled item (simple, predictable)
-            LaserCutUiMemory.SaveGlobalDefaultSheet(selected[0].Sheet);
 
             Settings = settings;
             SelectedJobs = selected;
@@ -464,9 +752,8 @@ namespace SW2026RibbonAddin.Commands
         }
     }
 
-
-        internal sealed class LaserCutProgressForm : Form
-        {
+    internal sealed class LaserCutProgressForm : Form
+    {
             private readonly Label _lblHeader;
             private readonly Label _lblTask;
             private readonly Label _lblCounts;

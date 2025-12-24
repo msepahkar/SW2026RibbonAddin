@@ -29,8 +29,15 @@ namespace SW2026RibbonAddin.Commands
 
             try
             {
-                // 1) Combine
-                var combine = DwgBatchCombiner.Combine(mainFolder, showUi: false);
+                // 1) Combine (with progress)
+                DwgBatchCombiner.CombineRunResult combine;
+
+                using (var prog = new DwgCombineProgressForm())
+                {
+                    prog.Show();
+                    combine = DwgBatchCombiner.Combine(mainFolder, showUi: false, progress: prog);
+                    try { prog.Close(); } catch { }
+                }
                 if (combine != null && !string.IsNullOrWhiteSpace(combine.ErrorMessage))
                 {
                     MessageBox.Show(
@@ -79,6 +86,11 @@ namespace SW2026RibbonAddin.Commands
 
                 // 4) Run nesting batch
                 DwgLaserNester.NestJobs(mainFolder, selectedJobs, settings, showUi: true);
+            }
+            catch (OperationCanceledException)
+            {
+                // User cancelled DWG combining.
+                return;
             }
             catch (Exception ex)
             {
