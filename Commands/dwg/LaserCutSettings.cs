@@ -71,4 +71,38 @@ namespace SW2026RibbonAddin.Commands
 
         public string ThicknessFileName => Path.GetFileName(ThicknessFilePath) ?? "";
     }
+
+    /// <summary>
+    /// Progress sink used by the nesting engine.
+    ///
+    /// IMPORTANT: Nesting currently runs on the UI thread in this add-in.
+    /// Progress implementations should keep the UI responsive (e.g., by
+    /// pumping the message loop after updates).
+    /// </summary>
+    internal interface ILaserCutProgress
+    {
+        void BeginBatch(int totalTasks);
+
+        void BeginTask(
+            int taskIndex,
+            int totalTasks,
+            LaserNestJob job,
+            int totalParts,
+            NestingMode mode,
+            double sheetWmm,
+            double sheetHmm);
+
+        void ReportPlaced(int placed, int total, int sheetsUsed);
+
+        void EndTask(
+            int doneTasks,
+            int totalTasks,
+            LaserNestJob job,
+            bool success,
+            string message);
+
+        void SetStatus(string message);
+
+        void ThrowIfCancelled();
+    }
 }

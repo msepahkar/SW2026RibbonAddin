@@ -649,6 +649,65 @@ namespace SW2026RibbonAddin.Commands
             if (selected.Count == 0)
                 return;
 
+            NestBatchResult run;
+
+            using (var progress = new LaserCutProgressForm())
+            {
+                progress.Show();
+                run = NestJobsWithProgress(folder, selected, settings, progress, showUi: false);
+                try { progress.Close(); } catch { }
+            }
+
+            if (showUi)
+            {
+                MessageBox.Show(
+                    run.Cancelled
+                        ? "Nesting was cancelled.\r\n\r\nSummary:\r\n" + run.SummaryPath
+                        : run.FailedTasks > 0
+                            ? $"Batch nesting finished with {run.FailedTasks} failed task(s).\r\n\r\nSummary:\r\n" + run.SummaryPath
+                            : "Batch nesting finished.\r\n\r\nSummary:\r\n" + run.SummaryPath,
+                    "Laser nesting",
+                    MessageBoxButtons.OK,
+                    run.Cancelled || run.FailedTasks > 0 ? MessageBoxIcon.Warning : MessageBoxIcon.Information);
+            }
+        }
+
+        internal sealed class NestBatchResult
+        {
+            public string SummaryPath;
+            public int TotalTasks;
+            public int DoneTasks;
+            public int FailedTasks;
+            public bool Cancelled;
+        }
+
+        internal static NestBatchResult NestJobsWithProgress(
+            string folder,
+            List<LaserNestJob> jobs,
+            LaserCutRunSettings settings,
+            ILaserCutProgress progress,
+            bool showUi = false)
+        {
+            if (settings == null)
+                throw new ArgumentNullException(nameof(settings));
+            if (jobs == null)
+                throw new ArgumentNullException(nameof(jobs));
+
+            progress ??= new NullLaserCutProgress();
+
+            var selected = jobs.Where(j => j != null && j.Enabled).ToList();
+            var result = new NestBatchResult
+            {
+                SummaryPath = Path.Combine(folder ?? "", "batch_nest_summary.txt"),
+                TotalTasks = selected.Count,
+                DoneTasks = 0,
+                FailedTasks = 0,
+                Cancelled = false
+            };
+
+            progress.BeginBatch(selected.Count);
+
+            // Build summary header
             var summary = new StringBuilder();
             summary.AppendLine("Batch nesting summary");
             summary.AppendLine("Folder: " + folder);
@@ -657,74 +716,77 @@ namespace SW2026RibbonAddin.Commands
             summary.AppendLine("Note: SeparateByMaterialExact / OneDWGPerMaterial / FilterPreview are FORCED true.");
             summary.AppendLine(new string('-', 70));
 
-            string summaryPath = Path.Combine(folder, "batch_nest_summary.txt");
-
-            bool cancelled = false;
-
-            using (var progress = new LaserCutProgressForm())
+            for (int i = 0; i < selected.Count; i++)
             {
-                progress.Show();
-                progress.BeginBatch(selected.Count);
-
-                int done = 0;
+                var job = selected[i];
+                int taskIndex = i + 1;
 
                 try
                 {
-                    foreach (var job in selected)
-                    {
-                        progress.ThrowIfCancelled();
+                    progress.ThrowIfCancelled();
 
-                        done++;
+                    var run = RunSingleJob(job, settings, progress, taskIndex, selected.Count);
+                    result.DoneTasks++;
 
-                        var result = RunSingleJob(job, settings, progress, done, selected.Count);
+                    summary.AppendLine(Path.GetFileName(run.ThicknessFile));
+                    summary.AppendLine($"  Material: {run.MaterialExact}");
+                    summary.AppendLine($"  Mode: {run.Mode}");
+                    summary.AppendLine($"  SheetsUsed: {run.SheetsUsed}, Parts: {run.TotalParts}");
+                    summary.AppendLine($"  Output: {Path.GetFileName(run.OutputDwg)}");
+                    summary.AppendLine(new string('-', 70));
 
-                        summary.AppendLine(Path.GetFileName(result.ThicknessFile));
-                        summary.AppendLine($"  Material: {result.MaterialExact}");
-                        summary.AppendLine($"  Mode: {result.Mode}");
-                        summary.AppendLine($"  SheetsUsed: {result.SheetsUsed}, Parts: {result.TotalParts}");
-                        summary.AppendLine($"  Output: {Path.GetFileName(result.OutputDwg)}");
-                        summary.AppendLine(new string('-', 70));
-
-                        progress.EndTask(done);
-                    }
+                    progress.EndTask(result.DoneTasks + result.FailedTasks, selected.Count, job, success: true,
+                        message: $"SheetsUsed: {run.SheetsUsed}, Parts: {run.TotalParts}");
                 }
                 catch (OperationCanceledException)
                 {
-                    cancelled = true;
+                    result.Cancelled = true;
                     summary.AppendLine("CANCELLED BY USER");
                     summary.AppendLine(new string('-', 70));
+
+                    // Mark current task as cancelled/failed for UI purposes.
+                    progress.EndTask(result.DoneTasks + result.FailedTasks, selected.Count, job, success: false, message: "Cancelled");
+                    break;
                 }
                 catch (Exception ex)
                 {
-                    summary.AppendLine("ERROR:");
-                    summary.AppendLine(ex.ToString());
+                    result.FailedTasks++;
+
+                    summary.AppendLine(Path.GetFileName(job.ThicknessFilePath ?? "(missing file)"));
+                    summary.AppendLine($"  Material: {NormalizeMaterialLabel(job.MaterialExact)}");
+                    summary.AppendLine("  ERROR:");
+                    summary.AppendLine("  " + ex.Message);
                     summary.AppendLine(new string('-', 70));
-                    throw;
-                }
-                finally
-                {
-                    try { progress.Close(); } catch { }
+
+                    progress.EndTask(result.DoneTasks + result.FailedTasks, selected.Count, job, success: false, message: ex.Message);
+
+                    // Continue with remaining jobs.
                 }
             }
 
-            File.WriteAllText(summaryPath, summary.ToString(), Encoding.UTF8);
-
-            if (showUi)
+            try
             {
-                MessageBox.Show(
-                    cancelled
-                        ? "Nesting was cancelled.\r\n\r\nSummary:\r\n" + summaryPath
-                        : "Batch nesting finished.\r\n\r\nSummary:\r\n" + summaryPath,
-                    "Laser nesting",
-                    MessageBoxButtons.OK,
-                    cancelled ? MessageBoxIcon.Warning : MessageBoxIcon.Information);
+                File.WriteAllText(result.SummaryPath, summary.ToString(), Encoding.UTF8);
             }
+            catch { }
+
+            return result;
+        }
+
+        private sealed class NullLaserCutProgress : ILaserCutProgress
+        {
+            public void BeginBatch(int totalTasks) { }
+            public void BeginTask(int taskIndex, int totalTasks, LaserNestJob job, int totalParts, NestingMode mode, double sheetWmm, double sheetHmm) { }
+            public void ReportPlaced(int placed, int total, int sheetsUsed) { }
+            public void EndTask(int doneTasks, int totalTasks, LaserNestJob job, bool success, string message) { }
+            public void SetStatus(string message) { }
+            public void ThrowIfCancelled() { }
         }
 
         // ============================
         // Single job
         // ============================
-        private static NestRunResult RunSingleJob(LaserNestJob job, LaserCutRunSettings settings, LaserCutProgressForm progress, int taskIndex, int totalTasks)
+        private static NestRunResult RunSingleJob(LaserNestJob job, LaserCutRunSettings settings, ILaserCutProgress progress, int taskIndex, int totalTasks)
         {
             progress.ThrowIfCancelled();
 
@@ -803,9 +865,7 @@ namespace SW2026RibbonAddin.Commands
             progress.BeginTask(
                 taskIndex,
                 totalTasks,
-                thicknessFileName,
-                material,
-                thicknessMm,
+                job,
                 totalInstances,
                 settings.Mode,
                 job.Sheet.WidthMm,
@@ -895,9 +955,7 @@ namespace SW2026RibbonAddin.Commands
                 progress.BeginTask(
                     taskIndex,
                     totalTasks,
-                    thicknessFileName,
-                    material,
-                    thicknessMm,
+                    job,
                     totalInstances,
                     finalMode,
                     job.Sheet.WidthMm,

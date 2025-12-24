@@ -258,8 +258,8 @@ namespace SW2026RibbonAddin.Commands
             catch { }
 
             MessageBox.Show(
-                (cancelled ? "DWG export cancelled." : "") + 
-                $"Sheet-metal bodies (plates) found: {platesDone}" + 
+                (cancelled ? "DWG export cancelled." : "") +
+                $"Sheet-metal bodies (plates) found: {platesDone}" +
                 $"DWG files saved: {exported}" +
                 $"DWG failures: {dwgFailed}" +
                 $"Material detected: {material}" +

@@ -68,7 +68,7 @@ namespace SW2026RibbonAddin.Commands
             double baseOriginXmm,
             double baseOriginYmm,
             string materialLabel,
-            LaserCutProgressForm progress,
+            ILaserCutProgress progress,
             int totalInstances)
         {
             progress.ThrowIfCancelled();
@@ -232,7 +232,7 @@ namespace SW2026RibbonAddin.Commands
             double baseOriginXmm,
             double baseOriginYmm,
             string materialLabel,
-            LaserCutProgressForm progress,
+            ILaserCutProgress progress,
             int totalInstances,
             double chordMm,
             double snapMm,
@@ -346,7 +346,7 @@ namespace SW2026RibbonAddin.Commands
             long usableH,
             int maxCandidates,
             Func<PartDefinition, int, RotatedPoly> getRot,
-            LaserCutProgressForm progress,
+            ILaserCutProgress progress,
             out ContourPlacement placement)
         {
             placement = default;
@@ -490,7 +490,7 @@ namespace SW2026RibbonAddin.Commands
             double baseOriginXmm,
             double baseOriginYmm,
             string materialLabel,
-            LaserCutProgressForm progress,
+            ILaserCutProgress progress,
             int totalInstances,
             double chordMm,
             double snapMm,
@@ -686,7 +686,7 @@ namespace SW2026RibbonAddin.Commands
             int maxCandidates,
             int maxPartners,
             Func<PartDefinition, int, RotatedPoly> getRot,
-            LaserCutProgressForm progress,
+            ILaserCutProgress progress,
             long deadlineTicks,
             out ContourPlacement placement)
         {
@@ -748,7 +748,7 @@ namespace SW2026RibbonAddin.Commands
             long usableH,
             int maxCandidates,
             int maxPartners,
-            LaserCutProgressForm progress,
+            ILaserCutProgress progress,
             long deadlineTicks)
         {
             var result = new List<CandidateIns>(Math.Min(maxCandidates, 2048));

@@ -66,31 +66,12 @@ namespace SW2026RibbonAddin.Commands
                     return;
                 }
 
-                // 3) Show the new options dialog (needs folder + jobs)
-                LaserCutRunSettings settings;
-                List<LaserNestJob> selectedJobs;
-
+                // 3) Show the options dialog. When OK is pressed, nesting runs *inside the same
+                // dialog* and updates the tree with WAITING/RUNNING/DONE/FAILED.
                 using (var dlg = new LaserCutOptionsForm(mainFolder, jobs))
                 {
-                    if (dlg.ShowDialog() != DialogResult.OK)
-                        return;
-
-                    settings = dlg.Settings;
-                    selectedJobs = dlg.SelectedJobs;
+                    dlg.ShowDialog();
                 }
-
-                if (selectedJobs == null || selectedJobs.Count == 0)
-                {
-                    MessageBox.Show(
-                        "Nothing selected.",
-                        "Batch Combine + Nest",
-                        MessageBoxButtons.OK,
-                        MessageBoxIcon.Information);
-                    return;
-                }
-
-                // 4) Run nesting batch
-                DwgLaserNester.NestJobs(mainFolder, selectedJobs, settings, showUi: true);
             }
             catch (OperationCanceledException)
             {

@@ -11,7 +11,7 @@ using Microsoft.Win32;
 namespace SW2026RibbonAddin.Commands
 {
     
-    internal sealed class LaserCutOptionsForm : Form
+    internal sealed class LaserCutOptionsForm : Form, ILaserCutProgress
     {
         private readonly string _folder;
         private readonly List<LaserNestJob> _jobs; // sorted
@@ -46,6 +46,41 @@ namespace SW2026RibbonAddin.Commands
 
         private readonly Dictionary<LaserNestJob, TreeNode> _nodeByJob = new Dictionary<LaserNestJob, TreeNode>();
 
+        // ----------------------------
+        // Run progress (same dialog)
+        // ----------------------------
+        private enum JobRunState { None = 0, Waiting = 1, Running = 2, Done = 3, Failed = 4 }
+
+        private sealed class JobRunInfo
+        {
+            public JobRunState State;
+            public int Placed;
+            public int Total;
+            public int SheetsUsed;
+            public string Message;
+        }
+
+        private readonly Dictionary<LaserNestJob, JobRunInfo> _runInfoByJob = new Dictionary<LaserNestJob, JobRunInfo>();
+
+        private bool _runInProgress;
+        private bool _runFinished;
+        private volatile bool _cancelRequested;
+
+        private int _batchTotal;
+        private int _batchDone;
+        private int _batchFailed;
+
+        private LaserNestJob _currentJob;
+
+        // Progress UI
+        private readonly GroupBox _grpRun;
+        private readonly Label _lblRunHeader;
+        private readonly ProgressBar _barBatch;
+        private readonly Label _lblRunCounts;
+        private readonly Label _lblRunTask;
+        private readonly ProgressBar _barTask;
+        private readonly Label _lblRunStatus;
+
         private bool _suppressTreeEvents;
         private bool _suppressDetailEvents;
 
@@ -66,10 +101,11 @@ namespace SW2026RibbonAddin.Commands
         public LaserCutOptionsForm(string folder, List<LaserNestJob> jobs)
         {
             _folder = folder ?? "";
+            // Sort by material first (tree roots), then by thickness.
             _jobs = (jobs ?? new List<LaserNestJob>())
-                .OrderBy(j => j.ThicknessMm <= 0 ? double.MaxValue : j.ThicknessMm)
+                .OrderBy(j => (j?.MaterialExact ?? "UNKNOWN").Trim(), StringComparer.Ordinal)
+                .ThenBy(j => j.ThicknessMm <= 0 ? double.MaxValue : j.ThicknessMm)
                 .ThenBy(j => j.ThicknessFileName ?? "", StringComparer.OrdinalIgnoreCase)
-                .ThenBy(j => j.MaterialExact ?? "", StringComparer.Ordinal)
                 .ToList();
 
             Text = "Laser nesting options";
@@ -112,6 +148,7 @@ namespace SW2026RibbonAddin.Commands
                 CheckBoxes = true,
                 HideSelection = false
             };
+            _tree.BeforeCheck += Tree_BeforeCheck;
             _tree.AfterCheck += Tree_AfterCheck;
             _tree.AfterSelect += Tree_AfterSelect;
             _split.Panel1.Controls.Add(_tree);
@@ -184,6 +221,35 @@ namespace SW2026RibbonAddin.Commands
 
             _btnApplyThickness.Click += (_, __) => ApplySelectedSheetToThickness();
             _btnApplyAllSheets.Click += (_, __) => ApplySelectedSheetToAll();
+
+            // ----------------------------
+            // Run progress UI (hidden until user presses OK)
+            // ----------------------------
+            _grpRun = new GroupBox
+            {
+                Left = 12,
+                Top = 200,
+                Width = 450,
+                Height = 160,
+                Text = "Run progress",
+                Visible = false
+            };
+
+            _lblRunHeader = new Label { Left = 12, Top = 22, Width = 420, Height = 18, Text = "" };
+            _barBatch = new ProgressBar { Left = 12, Top = 44, Width = 420, Height = 16, Minimum = 0, Maximum = 1, Value = 0 };
+            _lblRunCounts = new Label { Left = 12, Top = 62, Width = 420, Height = 18, Text = "" };
+            _lblRunTask = new Label { Left = 12, Top = 82, Width = 420, Height = 32, Text = "" };
+            _barTask = new ProgressBar { Left = 12, Top = 116, Width = 420, Height = 16, Minimum = 0, Maximum = 1, Value = 0 };
+            _lblRunStatus = new Label { Left = 12, Top = 134, Width = 420, Height = 18, Text = "" };
+
+            _grpRun.Controls.Add(_lblRunHeader);
+            _grpRun.Controls.Add(_barBatch);
+            _grpRun.Controls.Add(_lblRunCounts);
+            _grpRun.Controls.Add(_lblRunTask);
+            _grpRun.Controls.Add(_barTask);
+            _grpRun.Controls.Add(_lblRunStatus);
+
+            details.Controls.Add(_grpRun);
 
             _btnAll = new Button { Left = 12, Top = 406, Width = 120, Height = 28, Text = "Select All" };
             _btnNone = new Button { Left = 140, Top = 406, Width = 120, Height = 28, Text = "Select None" };
@@ -278,6 +344,18 @@ namespace SW2026RibbonAddin.Commands
             CancelButton = _cancel;
 
             _ok.Click += (_, __) => OnOk();
+            _cancel.Click += (_, __) => OnCancelClicked();
+
+            // If user clicks [X] while nesting is running, request cancel and prevent closing
+            // (keeps the progress sink alive until nesting stops).
+            FormClosing += (s, e) =>
+            {
+                if (_runInProgress && !_runFinished)
+                {
+                    e.Cancel = true;
+                    RequestCancel();
+                }
+            };
 
             BuildTree();
 
@@ -324,33 +402,35 @@ namespace SW2026RibbonAddin.Commands
             _tree.Nodes.Clear();
             _nodeByJob.Clear();
 
+            // Root nodes = Material, child nodes = Thickness job.
             var groups = _jobs
-                .GroupBy(j => (j.ThicknessFileName ?? ""))
+                .Where(j => j != null)
+                .GroupBy(j => NormalizeMaterial(j.MaterialExact))
                 .Select(g => new
                 {
-                    FileName = g.Key,
-                    Thickness = g.FirstOrDefault()?.ThicknessMm ?? 0.0,
-                    Jobs = g.OrderBy(j => j.MaterialExact ?? "", StringComparer.Ordinal).ToList()
+                    Material = g.Key,
+                    Jobs = g
+                        .Where(j => j != null)
+                        .OrderBy(j => j.ThicknessMm <= 0 ? double.MaxValue : j.ThicknessMm)
+                        .ThenBy(j => j.ThicknessFileName ?? "", StringComparer.OrdinalIgnoreCase)
+                        .ToList()
                 })
-                .OrderBy(g => g.Thickness <= 0 ? double.MaxValue : g.Thickness)
-                .ThenBy(g => g.FileName ?? "", StringComparer.OrdinalIgnoreCase)
+                .OrderBy(g => g.Material ?? "", StringComparer.Ordinal)
                 .ToList();
 
             foreach (var g in groups)
             {
                 int total = g.Jobs.Count;
-                int enabled = g.Jobs.Count(j => j != null && j.Enabled);
+                int enabled = g.Jobs.Count(j => j.Enabled);
 
-                var root = new TreeNode(BuildRootText(g.FileName, g.Thickness, enabled, total))
+                var root = new TreeNode(BuildMaterialRootText(g.Material, enabled, total))
                 {
-                    Tag = null,
+                    Tag = g.Material,
                     Checked = total > 0 && enabled == total
                 };
 
                 foreach (var job in g.Jobs)
                 {
-                    if (job == null) continue;
-
                     var node = new TreeNode(BuildJobText(job))
                     {
                         Tag = job,
@@ -368,11 +448,26 @@ namespace SW2026RibbonAddin.Commands
             _tree.EndUpdate();
         }
 
-        private static string BuildRootText(string thicknessFileName, double thicknessMm, int enabled, int total)
+        private static string NormalizeMaterial(string materialExact)
         {
-            string thk = thicknessMm > 0 ? thicknessMm.ToString("0.###", CultureInfo.InvariantCulture) : "?";
-            string file = string.IsNullOrWhiteSpace(thicknessFileName) ? "(no file)" : thicknessFileName.Trim();
-            return $"{file}  ({thk} mm)   [{enabled}/{total}]";
+            materialExact = (materialExact ?? "").Trim();
+            return string.IsNullOrWhiteSpace(materialExact) ? "UNKNOWN" : materialExact;
+        }
+
+        private string BuildMaterialRootText(string materialExact, int enabled, int total)
+        {
+            string mat = NormalizeMaterial(materialExact);
+            string text = $"{mat}   [{enabled}/{total}]";
+
+            // During/after a run, append live counts for the *selected* jobs.
+            if (_runInProgress || _runFinished)
+            {
+                var c = GetRunCountsForMaterial(mat);
+                if (c.Selected > 0)
+                    text += $"   (wait {c.Waiting}, run {c.Running}, done {c.Done}, fail {c.Failed})";
+            }
+
+            return text;
         }
 
         private string BuildJobText(LaserNestJob job)
@@ -380,7 +475,8 @@ namespace SW2026RibbonAddin.Commands
             if (job == null)
                 return "(null)";
 
-            string mat = string.IsNullOrWhiteSpace(job.MaterialExact) ? "UNKNOWN" : job.MaterialExact.Trim();
+            string file = string.IsNullOrWhiteSpace(job.ThicknessFileName) ? "(no file)" : job.ThicknessFileName.Trim();
+            string thk = job.ThicknessMm > 0 ? job.ThicknessMm.ToString("0.###", CultureInfo.InvariantCulture) : "?";
 
             double w = job.Sheet.WidthMm;
             double h = job.Sheet.HeightMm;
@@ -393,10 +489,120 @@ namespace SW2026RibbonAddin.Commands
             }
 
             string dims = $"{w:0.###}×{h:0.###} mm";
-            if (!string.Equals(presetName, "Custom", StringComparison.OrdinalIgnoreCase))
-                return $"{mat}   —   {dims}   ({presetName})";
 
-            return $"{mat}   —   {dims}";
+            string baseText;
+            if (!string.Equals(presetName, "Custom", StringComparison.OrdinalIgnoreCase))
+                baseText = $"{file}  ({thk} mm)   —   {dims}   ({presetName})";
+            else
+                baseText = $"{file}  ({thk} mm)   —   {dims}";
+
+            // Append per-job run state (WAITING/RUNNING/DONE/FAILED)
+            if ((_runInProgress || _runFinished) && _runInfoByJob.TryGetValue(job, out var info) && info != null && info.State != JobRunState.None)
+            {
+                string stateText = "";
+                switch (info.State)
+                {
+                    case JobRunState.Waiting:
+                        stateText = "WAITING";
+                        break;
+                    case JobRunState.Running:
+                        if (info.Total > 0)
+                            stateText = $"RUNNING {Math.Max(0, info.Placed)}/{Math.Max(0, info.Total)}  Sheets {Math.Max(1, info.SheetsUsed)}";
+                        else
+                            stateText = "RUNNING";
+                        break;
+                    case JobRunState.Done:
+                        stateText = $"DONE  Sheets {Math.Max(1, info.SheetsUsed)}";
+                        break;
+                    case JobRunState.Failed:
+                        stateText = "FAILED";
+                        if (!string.IsNullOrWhiteSpace(info.Message))
+                            stateText += ": " + Shorten(info.Message, 80);
+                        break;
+                }
+
+                if (!string.IsNullOrWhiteSpace(stateText))
+                    baseText += "   [" + stateText + "]";
+            }
+
+            return baseText;
+        }
+
+        private static string Shorten(string s, int maxLen)
+        {
+            s = (s ?? "").Trim();
+            if (s.Length <= maxLen)
+                return s;
+
+            if (maxLen <= 3)
+                return s.Substring(0, maxLen);
+
+            return s.Substring(0, maxLen - 3) + "...";
+        }
+
+        private readonly struct MaterialRunCounts
+        {
+            public readonly int Selected;
+            public readonly int Waiting;
+            public readonly int Running;
+            public readonly int Done;
+            public readonly int Failed;
+
+            public MaterialRunCounts(int selected, int waiting, int running, int done, int failed)
+            {
+                Selected = selected;
+                Waiting = waiting;
+                Running = running;
+                Done = done;
+                Failed = failed;
+            }
+        }
+
+        private MaterialRunCounts GetRunCountsForMaterial(string materialNormalized)
+        {
+            int selected = 0, waiting = 0, running = 0, done = 0, failed = 0;
+
+            foreach (var job in _jobs)
+            {
+                if (job == null) continue;
+
+                string mat = NormalizeMaterial(job.MaterialExact);
+                if (!string.Equals(mat, materialNormalized, StringComparison.Ordinal))
+                    continue;
+
+                if (!job.Enabled)
+                    continue;
+
+                selected++;
+
+                if (_runInfoByJob.TryGetValue(job, out var info) && info != null)
+                {
+                    switch (info.State)
+                    {
+                        case JobRunState.Waiting:
+                            waiting++;
+                            break;
+                        case JobRunState.Running:
+                            running++;
+                            break;
+                        case JobRunState.Done:
+                            done++;
+                            break;
+                        case JobRunState.Failed:
+                            failed++;
+                            break;
+                        default:
+                            waiting++;
+                            break;
+                    }
+                }
+                else
+                {
+                    waiting++;
+                }
+            }
+
+            return new MaterialRunCounts(selected, waiting, running, done, failed);
         }
 
         private int FindPresetIndex(double w, double h)
@@ -412,6 +618,14 @@ namespace SW2026RibbonAddin.Commands
                     return i;
             }
             return -1;
+        }
+
+        private void Tree_BeforeCheck(object sender, TreeViewCancelEventArgs e)
+        {
+            // While a nesting run is active (or finished), the tree becomes a live status view.
+            // Prevent selection toggles to avoid confusing state changes.
+            if (_runInProgress || _runFinished)
+                e.Cancel = true;
         }
 
         private void Tree_AfterCheck(object sender, TreeViewEventArgs e)
@@ -483,7 +697,9 @@ namespace SW2026RibbonAddin.Commands
                 return;
             }
 
-            SetDetailsEnabled(true);
+            // During/after a run, keep controls read-only (tree becomes a status view).
+            bool allowEdit = !_runInProgress && !_runFinished;
+            SetDetailsEnabled(allowEdit);
 
             _suppressDetailEvents = true;
             try
@@ -642,23 +858,21 @@ namespace SW2026RibbonAddin.Commands
 
             int total = root.Nodes.Count;
             int enabled = 0;
-            double thickness = 0.0;
-            string file = root.Text;
+
+            string material = root.Tag as string;
 
             foreach (TreeNode child in root.Nodes)
             {
-                if (child.Checked) enabled++;
+                if (child.Checked)
+                    enabled++;
 
-                if (thickness <= 0 && child.Tag is LaserNestJob j)
-                    thickness = j.ThicknessMm;
-
-                if (child.Tag is LaserNestJob j2 && !string.IsNullOrWhiteSpace(j2.ThicknessFileName))
-                    file = j2.ThicknessFileName;
+                if (material == null && child.Tag is LaserNestJob j)
+                    material = j.MaterialExact;
             }
 
             // Root checkbox = "all selected"
             root.Checked = total > 0 && enabled == total;
-            root.Text = BuildRootText(file, thickness, enabled, total);
+            root.Text = BuildMaterialRootText(material, enabled, total);
         }
 
         private void SetAllEnabled(bool enabled)
@@ -691,6 +905,18 @@ namespace SW2026RibbonAddin.Commands
 
         private void OnOk()
         {
+            // If a run already finished, OK acts as "Close".
+            if (_runFinished)
+            {
+                DialogResult = DialogResult.OK;
+                Close();
+                return;
+            }
+
+            // Ignore additional OK clicks while the run is active.
+            if (_runInProgress)
+                return;
+
             var selected = _jobs.Where(j => j != null && j.Enabled).ToList();
 
             if (selected.Count == 0)
@@ -700,11 +926,9 @@ namespace SW2026RibbonAddin.Commands
                 return;
             }
 
-            // Validate sheet sizes (even for disabled jobs, to preserve memory safely)
-            foreach (var job in _jobs)
+            // Validate sheet sizes for selected jobs.
+            foreach (var job in selected)
             {
-                if (job == null) continue;
-
                 if (job.Sheet.WidthMm <= 0 || job.Sheet.HeightMm <= 0)
                 {
                     MessageBox.Show("One or more sheet sizes are invalid. Fix them before pressing OK.",
@@ -715,10 +939,8 @@ namespace SW2026RibbonAddin.Commands
                 }
             }
 
-            // Save global default as the first enabled item (simple, predictable)
+            // Persist UI memory
             LaserCutUiMemory.SaveGlobalDefaultSheet(selected[0].Sheet);
-
-            // Save per-job sheet dims (even if disabled, so user doesn't lose editing)
             foreach (var job in _jobs)
             {
                 if (job == null) continue;
@@ -747,12 +969,364 @@ namespace SW2026RibbonAddin.Commands
             Settings = settings;
             SelectedJobs = selected;
 
-            DialogResult = DialogResult.OK;
+            // Lock UI and start the run in the same dialog.
+            BeginRunUi();
+
+            DwgLaserNester.NestBatchResult result = null;
+            try
+            {
+                result = DwgLaserNester.NestJobsWithProgress(_folder, _jobs, settings, this, showUi: false);
+            }
+            catch (Exception ex)
+            {
+                // Unexpected failure: keep dialog open so user can see what happened.
+                UI(() =>
+                {
+                    _lblRunHeader.Text = "ERROR";
+                    _lblRunStatus.Text = ex.Message;
+                });
+
+                _runInProgress = false;
+                _runFinished = true;
+                _ok.Enabled = true;
+                _ok.Text = "Close";
+                _cancel.Enabled = true;
+                _cancel.Text = "Close";
+                return;
+            }
+
+            FinishRunUi(result);
+        }
+
+        private void BeginRunUi()
+        {
+            _runInProgress = true;
+            _runFinished = false;
+            _cancelRequested = false;
+
+            // Disable selection / editing while running (tree becomes a status view).
+            _btnAll.Enabled = false;
+            _btnNone.Enabled = false;
+
+            SetDetailsEnabled(false);
+
+            _rbFast.Enabled = false;
+            _rbContour1.Enabled = false;
+            _rbContour2.Enabled = false;
+            _chord.Enabled = false;
+            _snap.Enabled = false;
+
+            _ok.Enabled = false;
+            _cancel.Enabled = true;
+            _cancel.Text = "Cancel";
+
+            _grpRun.Visible = true;
+        }
+
+        private void FinishRunUi(DwgLaserNester.NestBatchResult result)
+        {
+            _runInProgress = false;
+            _runFinished = true;
+
+            UI(() =>
+            {
+                if (result == null)
+                {
+                    _lblRunHeader.Text = "Finished";
+                    _lblRunStatus.Text = "";
+                }
+                else if (result.Cancelled)
+                {
+                    _lblRunHeader.Text = "Cancelled";
+                    _lblRunStatus.Text = "Cancelled by user. Summary: " + (result.SummaryPath ?? "");
+                }
+                else if (result.FailedTasks > 0)
+                {
+                    _lblRunHeader.Text = "Finished (with failures)";
+                    _lblRunStatus.Text = $"{result.FailedTasks} task(s) failed. Summary: {result.SummaryPath}";
+                }
+                else
+                {
+                    _lblRunHeader.Text = "Finished";
+                    _lblRunStatus.Text = "Summary: " + (result.SummaryPath ?? "");
+                }
+
+                _ok.Enabled = true;
+                _ok.Text = "Close";
+                _cancel.Enabled = true;
+                _cancel.Text = "Close";
+
+                // Final refresh of root texts (shows waiting/done/failed counts)
+                _tree.BeginUpdate();
+                foreach (TreeNode root in _tree.Nodes)
+                    UpdateRootNode(root);
+                _tree.EndUpdate();
+            });
+        }
+
+        private void OnCancelClicked()
+        {
+            if (_runInProgress && !_runFinished)
+            {
+                RequestCancel();
+                return;
+            }
+
+            DialogResult = DialogResult.Cancel;
             Close();
+        }
+
+        private void RequestCancel()
+        {
+            if (_cancelRequested)
+                return;
+
+            _cancelRequested = true;
+            UI(() =>
+            {
+                _cancel.Enabled = false;
+                _lblRunStatus.Text = "Cancelling...";
+            });
+        }
+
+        // ----------------------------
+        // ILaserCutProgress implementation (updates progress + tree)
+        // ----------------------------
+        public void BeginBatch(int totalTasks)
+        {
+            UI(() =>
+            {
+                _batchTotal = Math.Max(0, totalTasks);
+                _batchDone = 0;
+                _batchFailed = 0;
+                _currentJob = null;
+
+                _grpRun.Visible = true;
+                _lblRunHeader.Text = "Starting...";
+                _lblRunTask.Text = "";
+                _lblRunStatus.Text = "";
+
+                _barBatch.Minimum = 0;
+                _barBatch.Maximum = Math.Max(1, _batchTotal);
+                _barBatch.Value = 0;
+
+                _barTask.Minimum = 0;
+                _barTask.Maximum = 1;
+                _barTask.Value = 0;
+
+                _lblRunCounts.Text = $"Jobs: done 0, failed 0, remaining {_batchTotal} (total {_batchTotal})";
+
+                _runInfoByJob.Clear();
+                foreach (var job in _jobs)
+                {
+                    if (job == null) continue;
+                    if (!job.Enabled) continue;
+                    _runInfoByJob[job] = new JobRunInfo { State = JobRunState.Waiting, Placed = 0, Total = 0, SheetsUsed = 1, Message = null };
+                }
+
+                _tree.BeginUpdate();
+                foreach (var kv in _nodeByJob)
+                {
+                    if (kv.Key != null)
+                        kv.Value.Text = BuildJobText(kv.Key);
+                }
+                foreach (TreeNode root in _tree.Nodes)
+                    UpdateRootNode(root);
+                _tree.EndUpdate();
+            });
+
+            ThrowIfCancelled();
+        }
+
+        public void BeginTask(int taskIndex, int totalTasks, LaserNestJob job, int totalParts, NestingMode mode, double sheetWmm, double sheetHmm)
+        {
+            UI(() =>
+            {
+                _batchTotal = Math.Max(0, totalTasks);
+                _currentJob = job;
+
+                if (job != null)
+                {
+                    if (!_runInfoByJob.TryGetValue(job, out var info) || info == null)
+                    {
+                        info = new JobRunInfo();
+                        _runInfoByJob[job] = info;
+                    }
+
+                    info.State = JobRunState.Running;
+                    info.Placed = 0;
+                    info.Total = Math.Max(0, totalParts);
+                    info.SheetsUsed = 1;
+                    info.Message = null;
+                }
+
+                int completed = Math.Max(0, _batchDone + _batchFailed);
+
+                _lblRunHeader.Text = $"Nesting... Task {Math.Max(1, taskIndex)}/{Math.Max(1, _batchTotal)}";
+
+                _barBatch.Maximum = Math.Max(1, _batchTotal);
+                _barBatch.Value = Math.Min(_barBatch.Maximum, completed);
+
+                _barTask.Minimum = 0;
+                _barTask.Maximum = Math.Max(1, Math.Max(0, totalParts));
+                _barTask.Value = 0;
+
+                string mat = NormalizeMaterial(job?.MaterialExact);
+                string file = job?.ThicknessFileName ?? "";
+                string thk = job != null && job.ThicknessMm > 0 ? job.ThicknessMm.ToString("0.###", CultureInfo.InvariantCulture) : "?";
+                _lblRunTask.Text = $"{mat}\r\n{file} ({thk} mm) | {mode} | Sheet {sheetWmm:0.###}×{sheetHmm:0.###}";
+
+                _lblRunStatus.Text = "";
+
+                if (job != null)
+                {
+                    UpdateJobNode(job);
+                    if (_nodeByJob.TryGetValue(job, out var node) && node != null)
+                    {
+                        try
+                        {
+                            _tree.SelectedNode = node;
+                            node.EnsureVisible();
+                        }
+                        catch { }
+
+                        if (node.Parent != null)
+                            UpdateRootNode(node.Parent);
+                    }
+                }
+
+                int remaining = Math.Max(0, _batchTotal - completed);
+                _lblRunCounts.Text = $"Jobs: done {_batchDone}, failed {_batchFailed}, remaining {remaining} (total {_batchTotal})";
+            });
+
+            ThrowIfCancelled();
+        }
+
+        public void ReportPlaced(int placed, int total, int sheetsUsed)
+        {
+            UI(() =>
+            {
+                _barTask.Maximum = Math.Max(1, Math.Max(0, total));
+                _barTask.Value = Math.Min(_barTask.Maximum, Math.Max(0, placed));
+
+                _lblRunStatus.Text = $"Placed {Math.Max(0, placed)}/{Math.Max(0, total)}   Sheets: {Math.Max(1, sheetsUsed)}";
+
+                if (_currentJob != null)
+                {
+                    if (!_runInfoByJob.TryGetValue(_currentJob, out var info) || info == null)
+                    {
+                        info = new JobRunInfo();
+                        _runInfoByJob[_currentJob] = info;
+                    }
+
+                    info.Placed = Math.Max(0, placed);
+                    info.Total = Math.Max(0, total);
+                    info.SheetsUsed = Math.Max(1, sheetsUsed);
+
+                    UpdateJobNode(_currentJob);
+                    if (_nodeByJob.TryGetValue(_currentJob, out var node) && node != null && node.Parent != null)
+                        UpdateRootNode(node.Parent);
+                }
+            });
+
+            ThrowIfCancelled();
+        }
+
+        public void EndTask(int doneTasks, int totalTasks, LaserNestJob job, bool success, string message)
+        {
+            UI(() =>
+            {
+                // Track done/failed counts locally (keeps the dialog self-contained).
+                if (success)
+                    _batchDone++;
+                else
+                    _batchFailed++;
+
+                if (job != null)
+                {
+                    if (!_runInfoByJob.TryGetValue(job, out var info) || info == null)
+                    {
+                        info = new JobRunInfo();
+                        _runInfoByJob[job] = info;
+                    }
+
+                    info.State = success ? JobRunState.Done : JobRunState.Failed;
+                    info.Message = message;
+
+                    UpdateJobNode(job);
+                    if (_nodeByJob.TryGetValue(job, out var node) && node != null && node.Parent != null)
+                        UpdateRootNode(node.Parent);
+                }
+
+                _currentJob = null;
+
+                _batchTotal = Math.Max(0, totalTasks);
+                _barBatch.Maximum = Math.Max(1, _batchTotal);
+                int completed = Math.Min(_barBatch.Maximum, Math.Max(0, _batchDone + _batchFailed));
+                _barBatch.Value = completed;
+
+                int remaining = Math.Max(0, _batchTotal - completed);
+                _lblRunCounts.Text = $"Jobs: done {_batchDone}, failed {_batchFailed}, remaining {remaining} (total {_batchTotal})";
+
+                if (success)
+                    _lblRunStatus.Text = string.IsNullOrWhiteSpace(message) ? "Done." : ("Done. " + message);
+                else
+                    _lblRunStatus.Text = string.IsNullOrWhiteSpace(message) ? "Failed." : ("Failed. " + message);
+            });
+
+            ThrowIfCancelled();
+        }
+
+        public void SetStatus(string message)
+        {
+            UI(() =>
+            {
+                _lblRunStatus.Text = message ?? "";
+            });
+
+            ThrowIfCancelled();
+        }
+
+        public void ThrowIfCancelled()
+        {
+            if (_cancelRequested)
+                throw new OperationCanceledException("User cancelled nesting.");
+        }
+
+        private void UI(Action action)
+        {
+            if (IsDisposed)
+                return;
+
+            try
+            {
+                if (InvokeRequired)
+                {
+                    Invoke(new Action(() =>
+                    {
+                        try { action(); } catch { }
+                    }));
+                }
+                else
+                {
+                    action();
+                }
+            }
+            catch
+            {
+                // ignore UI failures (e.g., during shutdown)
+            }
+
+            PumpUI();
+        }
+
+        private void PumpUI()
+        {
+            try { Application.DoEvents(); } catch { }
         }
     }
 
-    internal sealed class LaserCutProgressForm : Form
+    internal sealed class LaserCutProgressForm : Form, ILaserCutProgress
     {
             private readonly Label _lblHeader;
             private readonly Label _lblTask;
@@ -838,9 +1412,7 @@ namespace SW2026RibbonAddin.Commands
             public void BeginTask(
                 int taskIndex,
                 int totalTasks,
-                string thicknessFileName,
-                string materialExact,
-                double thicknessMm,
+                LaserNestJob job,
                 int totalParts,
                 NestingMode mode,
                 double sheetWmm,
@@ -851,9 +1423,9 @@ namespace SW2026RibbonAddin.Commands
                     _batchIndex = Math.Max(1, taskIndex);
                     _batchTotal = Math.Max(1, totalTasks);
 
-                    _file = thicknessFileName ?? "";
-                    _material = materialExact ?? "UNKNOWN";
-                    _thickness = thicknessMm;
+                    _file = job?.ThicknessFileName ?? "";
+                    _material = job?.MaterialExact ?? "UNKNOWN";
+                    _thickness = job?.ThicknessMm ?? 0.0;
                     _mode = mode;
                     _sheetW = sheetWmm;
                     _sheetH = sheetHmm;
@@ -896,11 +1468,16 @@ namespace SW2026RibbonAddin.Commands
                 ThrowIfCancelled();
             }
 
-            public void EndTask(int doneTasks)
+            public void EndTask(int doneTasks, int totalTasks, LaserNestJob job, bool success, string message)
             {
                 UI(() =>
                 {
-                    _lblStatus.Text = $"Finished task {doneTasks}/{_batchTotal}";
+                    _batchTotal = Math.Max(1, totalTasks);
+
+                    if (success)
+                        _lblStatus.Text = $"Finished task {doneTasks}/{_batchTotal}" + (string.IsNullOrWhiteSpace(message) ? "" : $" — {message}");
+                    else
+                        _lblStatus.Text = $"Task {doneTasks}/{_batchTotal} FAILED" + (string.IsNullOrWhiteSpace(message) ? "" : $" — {message}");
                 });
 
                 ThrowIfCancelled();
