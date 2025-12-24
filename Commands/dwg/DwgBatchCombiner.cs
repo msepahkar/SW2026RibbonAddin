@@ -45,7 +45,7 @@ namespace SW2026RibbonAddin.Commands
             public bool Success => UniqueParts > 0 && ThicknessDwgs != null && ThicknessDwgs.Count > 0;
         }
 
-        public static CombineRunResult Combine(string mainFolder, bool showUi = false)
+        public static CombineRunResult Combine(string mainFolder, bool showUi = false, DwgCombineProgressForm progress = null)
         {
             if (string.IsNullOrEmpty(mainFolder) || !Directory.Exists(mainFolder))
             {
@@ -89,12 +89,19 @@ namespace SW2026RibbonAddin.Commands
                 return new CombineRunResult { ErrorMessage = msg };
             }
 
+            progress?.BeginPhase("Scanning job folders", subFolders.Length, "Reading parts.csv...");
+            int folderIndex = 0;
+
             // Key includes FILE + THICKNESS + MATERIAL (exact string)
             var combined = new Dictionary<string, CombinedPart>(StringComparer.OrdinalIgnoreCase);
 
             // --- read all parts.csv and merge rows ---
             foreach (string sub in subFolders)
             {
+                folderIndex++;
+                progress?.Report(folderIndex, subFolders.Length, Path.GetFileName(sub));
+                progress?.ThrowIfCancelled();
+
                 string csvPath = Path.Combine(sub, "parts.csv");
                 if (!File.Exists(csvPath))
                     continue;
@@ -181,8 +188,9 @@ namespace SW2026RibbonAddin.Commands
             File.WriteAllLines(allCsvPath, outLines, Encoding.UTF8);
 
             // --- create per-thickness DWG files ---
+            progress?.BeginPhase("Creating thickness DWGs", list.Count, "Building thickness_*.dwg files...");
             var thicknessDwgs = new List<string>();
-            CreatePerThicknessDwgs(mainFolder, list, thicknessDwgs);
+            CreatePerThicknessDwgs(mainFolder, list, thicknessDwgs, progress);
 
             if (showUi)
             {
@@ -244,7 +252,15 @@ namespace SW2026RibbonAddin.Commands
             int idxFile = FindHeaderIndex(header, "FileName", "Filename");
             int idxThk = FindHeaderIndex(header, "PlateThickness_mm", "Thickness", "PlateThickness");
             int idxQty = FindHeaderIndex(header, "Quantity", "Qty");
-            int idxMat = FindHeaderIndex(header, "Material");
+            // Material header varies by exporter/version.
+            // Accept common variants so we don't silently fall back to UNKNOWN.
+            int idxMat = FindHeaderIndex(header,
+                "Material",
+                "SWMaterial",
+                "SW-Material",
+                "SolidWorksMaterial",
+                "MaterialExact",
+                "MaterialName");
 
             // Backwards compatible: if old format (3 cols), assume:
             // 0=File, 1=Thickness, 2=Qty
@@ -453,11 +469,14 @@ namespace SW2026RibbonAddin.Commands
         /// - bottoms aligned on Y = 0
         /// - two text lines beneath each plate
         /// </summary>
-        private static void CreatePerThicknessDwgs(string mainFolder, List<CombinedPart> parts, List<string> outPaths)
+        private static void CreatePerThicknessDwgs(string mainFolder, List<CombinedPart> parts, List<string> outPaths, DwgCombineProgressForm progress)
         {
             var groups = parts
                 .GroupBy(p => p.ThicknessMm)
                 .OrderBy(g => g.Key);
+
+            int processedParts = 0;
+            int totalParts = parts != null ? parts.Count : 0;
 
             foreach (var g in groups)
             {
@@ -466,6 +485,9 @@ namespace SW2026RibbonAddin.Commands
                 string fileSafeThickness = thicknessText.Replace('.', '_').Replace(',', '_');
 
                 string outPath = Path.Combine(mainFolder, $"thickness_{fileSafeThickness}.dwg");
+
+                progress?.SetStatus($"Creating {Path.GetFileName(outPath)}");
+                progress?.ThrowIfCancelled();
 
                 var doc = new CadDocument();
                 BlockRecord modelSpace = doc.BlockRecords["*Model_Space"];
@@ -477,6 +499,10 @@ namespace SW2026RibbonAddin.Commands
 
                 foreach (var part in g)
                 {
+                    processedParts++;
+                    progress?.Report(processedParts, Math.Max(1, totalParts), $"{part.FileName}  |  {part.MaterialExact}  |  {thicknessText} mm");
+                    progress?.ThrowIfCancelled();
+
                     if (!File.Exists(part.FullPath))
                         continue;
 
@@ -803,4 +829,157 @@ namespace SW2026RibbonAddin.Commands
             return safe;
         }
     }
+
+    /// <summary>
+    /// Simple progress UI for Combine DWG / Batch Combine+Nest.
+    /// Runs on the same thread as the combine operation, so it pumps DoEvents to stay responsive.
+    /// </summary>
+    internal sealed class DwgCombineProgressForm : Form
+    {
+        private readonly Label _lblHeader;
+        private readonly Label _lblTask;
+        private readonly Label _lblDetail;
+        private readonly Label _lblStatus;
+        private readonly ProgressBar _bar;
+        private readonly Button _btnCancel;
+
+        private volatile bool _cancelRequested;
+        private string _phase = "";
+
+        public bool IsCancellationRequested => _cancelRequested;
+
+        public DwgCombineProgressForm()
+        {
+            Text = "Combining DWGs...";
+            FormBorderStyle = FormBorderStyle.FixedDialog;
+            MaximizeBox = false;
+            MinimizeBox = false;
+            StartPosition = FormStartPosition.CenterScreen;
+            ShowInTaskbar = false;
+
+            Width = 560;
+            Height = 210;
+
+            _lblHeader = new Label { Left = 12, Top = 10, Width = 520, Height = 18, Text = "Combining DWGs..." };
+            _lblTask = new Label { Left = 12, Top = 32, Width = 520, Height = 18, Text = "" };
+            _lblDetail = new Label { Left = 12, Top = 52, Width = 520, Height = 36, Text = "" };
+
+            _bar = new ProgressBar { Left = 12, Top = 92, Width = 520, Height = 18, Minimum = 0, Maximum = 100, Value = 0 };
+
+            _lblStatus = new Label { Left = 12, Top = 114, Width = 520, Height = 18, Text = "" };
+
+            _btnCancel = new Button { Left = 442, Top = 140, Width = 90, Height = 26, Text = "Cancel" };
+            _btnCancel.Click += (s, e) => RequestCancel();
+
+            Controls.Add(_lblHeader);
+            Controls.Add(_lblTask);
+            Controls.Add(_lblDetail);
+            Controls.Add(_bar);
+            Controls.Add(_lblStatus);
+            Controls.Add(_btnCancel);
+
+            // If user clicks [X], treat as cancel request (don’t abruptly kill the process)
+            FormClosing += (s, e) =>
+            {
+                if (!_cancelRequested)
+                {
+                    _cancelRequested = true;
+                    _btnCancel.Enabled = false;
+                    _lblStatus.Text = "Cancelling...";
+                    PumpUI();
+                }
+            };
+        }
+
+        public void BeginPhase(string phase, int total, string status = null)
+        {
+            UI(() =>
+            {
+                _phase = phase ?? "";
+
+                _lblTask.Text = _phase;
+                _lblDetail.Text = "";
+
+                _bar.Minimum = 0;
+                _bar.Maximum = Math.Max(1, total);
+                _bar.Value = 0;
+
+                _lblStatus.Text = status ?? "";
+                _btnCancel.Enabled = true;
+            });
+
+            ThrowIfCancelled();
+        }
+
+        public void Report(int current, int total, string detail, string status = null)
+        {
+            UI(() =>
+            {
+                int max = Math.Max(1, total);
+                if (_bar.Maximum != max)
+                    _bar.Maximum = max;
+
+                int v = Math.Min(_bar.Maximum, Math.Max(_bar.Minimum, current));
+                _bar.Value = v;
+
+                _lblTask.Text = string.IsNullOrWhiteSpace(_phase)
+                    ? $"{v}/{max}"
+                    : $"{_phase}  {v}/{max}";
+
+                _lblDetail.Text = detail ?? "";
+
+                if (status != null)
+                    _lblStatus.Text = status;
+            });
+
+            ThrowIfCancelled();
+        }
+
+        public void SetStatus(string status)
+        {
+            UI(() =>
+            {
+                _lblStatus.Text = status ?? "";
+            });
+
+            ThrowIfCancelled();
+        }
+
+        public void ThrowIfCancelled()
+        {
+            if (_cancelRequested)
+                throw new OperationCanceledException("User cancelled DWG combining.");
+        }
+
+        private void RequestCancel()
+        {
+            _cancelRequested = true;
+            UI(() =>
+            {
+                _btnCancel.Enabled = false;
+                _lblStatus.Text = "Cancelling...";
+            });
+        }
+
+        private void UI(Action action)
+        {
+            if (IsDisposed) return;
+
+            if (InvokeRequired)
+            {
+                try { BeginInvoke(action); } catch { }
+                return;
+            }
+
+            action();
+            PumpUI();
+        }
+
+        private void PumpUI()
+        {
+            // IMPORTANT: keeps the form responsive when combine runs on the same thread
+            try { Application.DoEvents(); } catch { }
+        }
+    }
+
 }

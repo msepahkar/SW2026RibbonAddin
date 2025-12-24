@@ -169,7 +169,13 @@ namespace SW2026RibbonAddin.Commands
 
                 int colFile = FindCol(headerFields, "FileName", "Filename", "File");
                 int colThk = FindCol(headerFields, "PlateThickness_mm", "Thickness", "PlateThickness");
-                int colMat = FindCol(headerFields, "Material", "SWMaterial", "SolidWorksMaterial");
+                int colMat = FindCol(headerFields,
+                    "Material",
+                    "SWMaterial",
+                    "SW-Material",
+                    "SolidWorksMaterial",
+                    "MaterialExact",
+                    "MaterialName");
 
                 if (colFile < 0 || colThk < 0 || colMat < 0)
                     return idx;
@@ -218,15 +224,33 @@ namespace SW2026RibbonAddin.Commands
 
         private static int FindCol(List<string> headerFields, params string[] names)
         {
+            if (headerFields == null || headerFields.Count == 0 || names == null || names.Length == 0)
+                return -1;
+
+            string Norm(string s)
+            {
+                s = (s ?? "").Trim().Trim('"').Trim();
+                if (s.Length == 0) return "";
+                s = s.Replace(" ", "").Replace("-", "").Replace("_", "");
+                return s.ToUpperInvariant();
+            }
+
+            // Normalize header fields once.
             for (int i = 0; i < headerFields.Count; i++)
             {
-                var h = (headerFields[i] ?? "").Trim().Trim('"').Trim();
-                foreach (var n in names)
+                var h = Norm(headerFields[i]);
+                if (h.Length == 0) continue;
+
+                foreach (var nRaw in names)
                 {
-                    if (string.Equals(h, n, StringComparison.OrdinalIgnoreCase))
+                    var n = Norm(nRaw);
+                    if (n.Length == 0) continue;
+
+                    if (h == n)
                         return i;
                 }
             }
+
             return -1;
         }
 
@@ -482,13 +506,24 @@ namespace SW2026RibbonAddin.Commands
                 double thickness = TryGetPlateThicknessFromFileName(file) ?? 0.0;
                 string thkKey = ThicknessKey(thickness);
 
-                HashSet<string> matsFromCsv = null;
-                if (idx != null && thickness > 0 && idx.MaterialsByThicknessKey.TryGetValue(thkKey, out var set) && set.Count > 0)
-                    matsFromCsv = set;
-
-                if (matsFromCsv != null)
+                // Preferred: use all_parts.csv (fast)
+                HashSet<string> mats = null;
+                if (idx != null && thickness > 0 && idx.MaterialsByThicknessKey.TryGetValue(thkKey, out var set) && set != null && set.Count > 0)
                 {
-                    foreach (var mat in matsFromCsv.OrderBy(s => s, StringComparer.Ordinal))
+                    mats = new HashSet<string>(set, StringComparer.Ordinal);
+
+                    // If we have known materials, drop UNKNOWN to avoid clutter.
+                    if (mats.Count > 1)
+                        mats.RemoveWhere(m => string.Equals(m, "UNKNOWN", StringComparison.OrdinalIgnoreCase));
+                }
+
+                // Fallback: scan the DWG itself for embedded material tokens (robust even if CSV missing)
+                if (mats == null || mats.Count == 0)
+                    mats = TryScanMaterialsFromThicknessDwg(file, idx, thkKey);
+
+                if (mats != null && mats.Count > 0)
+                {
+                    foreach (var mat in mats.OrderBy(s => s, StringComparer.Ordinal))
                     {
                         jobs.Add(new LaserNestJob
                         {
@@ -498,17 +533,18 @@ namespace SW2026RibbonAddin.Commands
                             MaterialExact = mat
                         });
                     }
-                    continue;
                 }
-
-                // Fallback: unknown
-                jobs.Add(new LaserNestJob
+                else
                 {
-                    Enabled = true,
-                    ThicknessFilePath = file,
-                    ThicknessMm = thickness,
-                    MaterialExact = "UNKNOWN"
-                });
+                    // Last resort: unknown
+                    jobs.Add(new LaserNestJob
+                    {
+                        Enabled = true,
+                        ThicknessFilePath = file,
+                        ThicknessMm = thickness,
+                        MaterialExact = "UNKNOWN"
+                    });
+                }
             }
 
             return jobs
@@ -516,6 +552,73 @@ namespace SW2026RibbonAddin.Commands
                 .ThenBy(j => j.ThicknessMm <= 0 ? double.MaxValue : j.ThicknessMm)
                 .ThenBy(j => j.ThicknessFileName ?? "", StringComparer.OrdinalIgnoreCase)
                 .ToList();
+        }
+
+        private static HashSet<string> TryScanMaterialsFromThicknessDwg(string dwgPath, AllPartsIndex idx, string thicknessKey)
+        {
+            if (string.IsNullOrWhiteSpace(dwgPath) || !File.Exists(dwgPath))
+                return null;
+
+            try
+            {
+                CadDocument doc;
+                using (var reader = new DwgReader(dwgPath))
+                {
+                    doc = reader.Read();
+                }
+
+                if (doc == null)
+                    return null;
+
+                var materials = new HashSet<string>(StringComparer.Ordinal);
+
+                foreach (var block in doc.BlockRecords)
+                {
+                    if (block == null)
+                        continue;
+
+                    string name = block.Name ?? "";
+                    if (!name.StartsWith("P_", StringComparison.OrdinalIgnoreCase))
+                        continue;
+
+                    // Only consider our "plate" blocks (they carry Qty + material token)
+                    if (name.LastIndexOf("_Q", StringComparison.OrdinalIgnoreCase) < 0)
+                        continue;
+
+                    string material = "UNKNOWN";
+
+                    bool gotMatFromName = TryExtractMaterialFromBlockName(name, out var matFromName);
+                    if (gotMatFromName)
+                        material = NormalizeMaterialLabel(matFromName);
+
+                    bool isUnknown = string.Equals(material, "UNKNOWN", StringComparison.OrdinalIgnoreCase);
+
+                    // If the block-name material is missing/unknown, try CSV mapping by (partKey + thickness)
+                    if ((!gotMatFromName || isUnknown) && idx != null && !string.IsNullOrWhiteSpace(thicknessKey))
+                    {
+                        if (TryExtractPartTokenFromBlockName(name, out var token))
+                        {
+                            string partLoose = MakeLooseKey(token);
+                            string key = partLoose + "|" + thicknessKey;
+
+                            if (idx.MaterialByPartKeyAndThickness.TryGetValue(key, out var matFromCsv))
+                                material = NormalizeMaterialLabel(matFromCsv);
+                        }
+                    }
+
+                    material = NormalizeMaterialLabel(material);
+                    materials.Add(material);
+                }
+
+                if (materials.Count > 1)
+                    materials.RemoveWhere(m => string.Equals(m, "UNKNOWN", StringComparison.OrdinalIgnoreCase));
+
+                return materials.Count > 0 ? materials : null;
+            }
+            catch
+            {
+                return null;
+            }
         }
 
         private static List<string> GetThicknessFiles(string folder)

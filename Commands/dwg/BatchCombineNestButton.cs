@@ -29,8 +29,15 @@ namespace SW2026RibbonAddin.Commands
 
             try
             {
-                // 1) Combine
-                var combine = DwgBatchCombiner.Combine(mainFolder, showUi: false);
+                // 1) Combine (with progress)
+                DwgBatchCombiner.CombineRunResult combine;
+
+                using (var prog = new DwgCombineProgressForm())
+                {
+                    prog.Show();
+                    combine = DwgBatchCombiner.Combine(mainFolder, showUi: false, progress: prog);
+                    try { prog.Close(); } catch { }
+                }
                 if (combine != null && !string.IsNullOrWhiteSpace(combine.ErrorMessage))
                 {
                     MessageBox.Show(
@@ -40,6 +47,11 @@ namespace SW2026RibbonAddin.Commands
                         MessageBoxIcon.Warning);
                     return;
                 }
+
+                // all_parts.csv is regenerated during Combine. Clear the index cache so the subsequent
+                // ScanJobsForFolder call always picks up the freshly written CSV (important on file
+                // systems with coarse timestamp resolution).
+                DwgLaserNester.ClearAllPartsIndexCacheForFolder(mainFolder);
 
                 // 2) Scan nesting jobs (Material x Thickness)
                 var jobs = DwgLaserNester.ScanJobsForFolder(mainFolder);
@@ -79,6 +91,11 @@ namespace SW2026RibbonAddin.Commands
 
                 // 4) Run nesting batch
                 DwgLaserNester.NestJobs(mainFolder, selectedJobs, settings, showUi: true);
+            }
+            catch (OperationCanceledException)
+            {
+                // User cancelled DWG combining.
+                return;
             }
             catch (Exception ex)
             {
