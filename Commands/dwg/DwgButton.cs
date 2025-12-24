@@ -93,15 +93,28 @@ namespace SW2026RibbonAddin.Commands
 
             string originalKey = GetActiveDocKey(swApp);
 
+            DwgExportProgressForm prog = null;
+
             try
             {
+                prog = new DwgExportProgressForm();
+                prog.Show();
+                prog.SetStatus("Preparing DWG export...");
+
                 if (isPart)
-                    RunForSinglePart(swApp, model, jobFolder);
+                    RunForSinglePart(swApp, model, jobFolder, prog);
                 else
-                    RunForAssembly(swApp, (IAssemblyDoc)model, jobFolder);
+                    RunForAssembly(swApp, (IAssemblyDoc)model, jobFolder, prog);
+            }
+            catch (OperationCanceledException)
+            {
+                // User cancelled; do not show an error.
             }
             finally
             {
+                try { prog?.Close(); } catch { }
+                try { prog?.Dispose(); } catch { }
+
                 RestoreActiveDoc(swApp, originalKey);
             }
         }
@@ -122,8 +135,11 @@ namespace SW2026RibbonAddin.Commands
         // Single Part
         // ------------------------------------------------------------------
 
-        private void RunForSinglePart(ISldWorks swApp, IModelDoc2 model, string jobFolder)
+        private void RunForSinglePart(ISldWorks swApp, IModelDoc2 model, string jobFolder, DwgExportProgressForm prog)
         {
+            if (model == null)
+                return;
+
             if (!TryGetSheetMetalThickness(model, out double thicknessMeters))
             {
                 MessageBox.Show("The active part is not a sheet-metal part.", "DWG Export");
@@ -139,6 +155,15 @@ namespace SW2026RibbonAddin.Commands
 
             string cfgName = GetBestConfigName(model, null);
             string material = GetMaterialName(model, cfgName);
+            double thicknessMm = thicknessMeters * 1000.0;
+
+            try
+            {
+                prog?.BeginExport(Path.GetFileName(jobFolder), totalParts: 1, outputFolder: jobFolder);
+                prog?.BeginPart(1, 1, modelPath, cfgName, material, thicknessMm);
+                prog?.UpdateCounts(partsDone: 0, totalParts: 1, failedParts: 0, dwgOk: 0, dwgFailed: 0, platesDone: 0);
+            }
+            catch { }
 
             var csvLines = new List<string>
             {
@@ -146,19 +171,60 @@ namespace SW2026RibbonAddin.Commands
             };
 
             var dwgFileNames = new List<string>();
-            int failures = ExportFlatPatternsForPart(
-                model,
-                modelPath,
-                jobFolder,
-                uniquePartToken: null,
-                globalUsedNames: null,
-                dwgFileNames: dwgFileNames);
+            var failureDetails = new List<string>();
 
-            int exported = dwgFileNames.Count;
-            int totalBodies = exported + failures;
-            int failed = failures;
+            int exported = 0;
+            int dwgFailed = 0;
+            int platesDone = 0;
 
-            double thicknessMm = thicknessMeters * 1000.0;
+            bool cancelled = false;
+
+            try
+            {
+                int failures = ExportFlatPatternsForPart(
+                    partModel: model,
+                    modelPath: modelPath,
+                    folder: jobFolder,
+                    uniquePartToken: null,
+                    globalUsedNames: null,
+                    dwgFileNames: dwgFileNames,
+                    onBodyStart: (idx, total, flatName, outPath) =>
+                    {
+                        prog?.ReportBody(idx, total, flatName, outPath);
+                    },
+                    onBodyEnd: (idx, total, flatName, outPath, ok) =>
+                    {
+                        platesDone++;
+
+                        if (ok)
+                            exported++;
+                        else
+                        {
+                            dwgFailed++;
+                            failureDetails.Add(
+                                "DWG FAIL: " + modelPath +
+                                (string.IsNullOrWhiteSpace(cfgName) ? "" : (" [" + cfgName + "]")) +
+                                " | " + (string.IsNullOrWhiteSpace(flatName) ? "FlatPattern" : flatName) +
+                                " -> " + outPath);
+                        }
+
+                        prog?.UpdateCounts(partsDone: 0, totalParts: 1, failedParts: 0, dwgOk: exported, dwgFailed: dwgFailed, platesDone: platesDone);
+                    },
+                    isCancelled: () => prog != null && prog.IsCancellationRequested
+                );
+
+                // Keep counters consistent even if callbacks were not called
+                if (exported != dwgFileNames.Count)
+                    exported = dwgFileNames.Count;
+                if (dwgFailed != failures)
+                    dwgFailed = failures;
+                if (platesDone != exported + dwgFailed)
+                    platesDone = exported + dwgFailed;
+            }
+            catch (OperationCanceledException)
+            {
+                cancelled = true;
+            }
 
             foreach (string dwgName in dwgFileNames)
             {
@@ -172,12 +238,33 @@ namespace SW2026RibbonAddin.Commands
             string csvPath = Path.Combine(jobFolder, "parts.csv");
             TryWriteCsv(csvPath, csvLines);
 
+            TryWriteExportReport(
+                jobFolder,
+                sourceDoc: modelPath,
+                cancelled: cancelled,
+                totalParts: 1,
+                processedParts: 1,
+                failedParts: 0,
+                totalPlates: platesDone,
+                dwgOk: exported,
+                dwgFailed: dwgFailed,
+                failureDetails: failureDetails);
+
+            try
+            {
+                prog?.UpdateCounts(partsDone: 1, totalParts: 1, failedParts: 0, dwgOk: exported, dwgFailed: dwgFailed, platesDone: platesDone);
+                prog?.SetStatus(cancelled ? "Cancelled." : "Done.");
+            }
+            catch { }
+
             MessageBox.Show(
-                $"Sheet-metal bodies found: {totalBodies}\r\n" +
-                $"DWG files saved: {exported}\r\n" +
-                $"Failed: {failed}\r\n" +
-                $"Material detected: {material}\r\n" +
-                $"Folder:\r\n{jobFolder}",
+                (cancelled ? "DWG export cancelled." : "") + 
+                $"Sheet-metal bodies (plates) found: {platesDone}" + 
+                $"DWG files saved: {exported}" +
+                $"DWG failures: {dwgFailed}" +
+                $"Material detected: {material}" +
+                $"Folder:{jobFolder}" +
+                (failureDetails.Count > 0 ? "See export_report.txt for details." : ""),
                 "DWG Export");
         }
 
@@ -185,7 +272,7 @@ namespace SW2026RibbonAddin.Commands
         // Assembly
         // ------------------------------------------------------------------
 
-        private void RunForAssembly(ISldWorks swApp, IAssemblyDoc asm, string jobFolder)
+        private void RunForAssembly(ISldWorks swApp, IAssemblyDoc asm, string jobFolder, DwgExportProgressForm prog)
         {
             if (asm == null)
             {
@@ -193,7 +280,21 @@ namespace SW2026RibbonAddin.Commands
                 return;
             }
 
+            string asmPath = "";
+            try
+            {
+                var asmModel = asm as IModelDoc2;
+                if (asmModel != null)
+                    asmPath = asmModel.GetPathName();
+            }
+            catch { }
+
+            if (string.IsNullOrWhiteSpace(asmPath))
+                asmPath = "(unsaved assembly)";
+
             try { asm.ResolveAllLightWeightComponents(true); } catch { }
+
+            try { prog?.SetStatus("Scanning assembly for sheet-metal parts..."); } catch { }
 
             var usage = CollectSheetMetalUsage(asm);
             if (usage.Count == 0)
@@ -202,22 +303,60 @@ namespace SW2026RibbonAddin.Commands
                 return;
             }
 
+            // Create a stable order for progress UI (by file name)
+            var parts = new List<SheetMetalUsageInfo>(usage.Values);
+            parts.Sort((a, b) =>
+            {
+                int c = string.Compare(a?.PartPath, b?.PartPath, StringComparison.OrdinalIgnoreCase);
+                if (c != 0) return c;
+                return string.Compare(a?.ConfigName, b?.ConfigName, StringComparison.OrdinalIgnoreCase);
+            });
+
             var csvLines = new List<string>
             {
                 "FileName,PlateThickness_mm,Quantity,Material"
             };
 
-            int exported = 0;
-            int failed = 0;
-            int totalBodies = 0;
+            int totalParts = parts.Count;
+            int processedParts = 0;
+            int failedParts = 0;
+
+            int dwgOk = 0;
+            int dwgFailed = 0;
+            int totalPlates = 0;
+
+            bool cancelled = false;
+
+            var failureDetails = new List<string>();
 
             // Prevent silent overwrites when different parts share the same base filename.
             var globalUsedNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-            foreach (var kvp in usage)
+            try
             {
-                var info = kvp.Value;
-                string partPath = info.PartPath;
+                prog?.BeginExport(Path.GetFileName(jobFolder), totalParts, jobFolder);
+                prog?.UpdateCounts(partsDone: 0, totalParts: totalParts, failedParts: 0, dwgOk: 0, dwgFailed: 0, platesDone: 0);
+            }
+            catch { }
+
+            for (int i = 0; i < parts.Count; i++)
+            {
+                var info = parts[i];
+                if (info == null)
+                    continue;
+
+                string partPath = info.PartPath ?? "";
+                string cfgName = info.ConfigName ?? "";
+
+                try
+                {
+                    prog?.BeginPart(i + 1, totalParts, partPath, cfgName, info.Material, info.ThicknessMeters * 1000.0);
+                    prog?.SetStatus("Opening part...");
+                }
+                catch { }
+
+                var dwgFileNames = new List<string>();
+                string resolvedMaterial = info.Material;
 
                 try
                 {
@@ -233,66 +372,128 @@ namespace SW2026RibbonAddin.Commands
                     var partModel = swApp.IActiveDoc2 as IModelDoc2;
                     if (partModel == null || partModel.GetType() != (int)swDocumentTypes_e.swDocPART)
                     {
-                        failed++;
-                        continue;
+                        failedParts++;
+                        failureDetails.Add("PART FAIL: " + partPath + (string.IsNullOrWhiteSpace(cfgName) ? "" : (" [" + cfgName + "]")) +
+                                           " - could not activate/open as a PART.");
                     }
-
-                    if (!string.IsNullOrWhiteSpace(info.ConfigName))
+                    else
                     {
-                        try { partModel.ShowConfiguration2(info.ConfigName); } catch { }
+                        if (!string.IsNullOrWhiteSpace(cfgName))
+                        {
+                            try { partModel.ShowConfiguration2(cfgName); } catch { }
+                        }
+
+                        if (string.IsNullOrWhiteSpace(resolvedMaterial) || resolvedMaterial.Equals("UNKNOWN", StringComparison.OrdinalIgnoreCase))
+                            resolvedMaterial = GetMaterialName(partModel, cfgName);
+
+                        string uniqueToken = ComputeShortHash(partPath + "||" + (cfgName ?? ""), hexChars: 8);
+
+                        double thicknessMm = info.ThicknessMeters * 1000.0;
+
+                        try
+                        {
+                            ExportFlatPatternsForPart(
+                                partModel: partModel,
+                                modelPath: partPath,
+                                folder: jobFolder,
+                                uniquePartToken: uniqueToken,
+                                globalUsedNames: globalUsedNames,
+                                dwgFileNames: dwgFileNames,
+                                onBodyStart: (idx, total, flatName, outPath) =>
+                                {
+                                    prog?.ReportBody(idx, total, flatName, outPath);
+                                },
+                                onBodyEnd: (idx, total, flatName, outPath, ok) =>
+                                {
+                                    totalPlates++;
+
+                                    if (ok)
+                                        dwgOk++;
+                                    else
+                                    {
+                                        dwgFailed++;
+                                        failureDetails.Add(
+                                            "DWG FAIL: " + partPath +
+                                            (string.IsNullOrWhiteSpace(cfgName) ? "" : (" [" + cfgName + "]")) +
+                                            " | " + (string.IsNullOrWhiteSpace(flatName) ? "FlatPattern" : flatName) +
+                                            " -> " + outPath);
+                                    }
+
+                                    prog?.UpdateCounts(partsDone: processedParts, totalParts: totalParts, failedParts: failedParts, dwgOk: dwgOk, dwgFailed: dwgFailed, platesDone: totalPlates);
+                                },
+                                isCancelled: () => prog != null && prog.IsCancellationRequested
+                            );
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            cancelled = true;
+                        }
+
+                        // Add CSV lines for whatever was exported so far (even if cancelled)
+                        foreach (string dwgName in dwgFileNames)
+                        {
+                            csvLines.Add(
+                                $"{CsvCell(dwgName)}," +
+                                $"{thicknessMm.ToString("0.###", CultureInfo.InvariantCulture)}," +
+                                $"{info.Quantity * _assemblyQuantity}," +
+                                $"{CsvCell(resolvedMaterial)}");
+                        }
                     }
-
-                    string material = info.Material;
-                    if (string.IsNullOrWhiteSpace(material) || material.Equals("UNKNOWN", StringComparison.OrdinalIgnoreCase))
-                        material = GetMaterialName(partModel, info.ConfigName);
-
-                    var dwgFileNames = new List<string>();
-                    string uniqueToken = ComputeShortHash(partPath + "||" + (info.ConfigName ?? ""), hexChars: 8);
-
-                    int failuresForPart = ExportFlatPatternsForPart(
-                        partModel,
-                        partPath,
-                        jobFolder,
-                        uniquePartToken: uniqueToken,
-                        globalUsedNames: globalUsedNames,
-                        dwgFileNames: dwgFileNames);
-
-                    int exportedForPart = dwgFileNames.Count;
-                    int totalForPart = exportedForPart + failuresForPart;
-
-                    totalBodies += totalForPart;
-                    exported += exportedForPart;
-                    failed += failuresForPart;
-
-                    double thicknessMm = info.ThicknessMeters * 1000.0;
-
-                    foreach (string dwgName in dwgFileNames)
-                    {
-                        csvLines.Add(
-                            $"{CsvCell(dwgName)}," +
-                            $"{thicknessMm.ToString("0.###", CultureInfo.InvariantCulture)}," +
-                            $"{info.Quantity * _assemblyQuantity}," +
-                            $"{CsvCell(material)}");
-                    }
-
-                    try { swApp.CloseDoc(partPath); } catch { }
+                }
+                catch (OperationCanceledException)
+                {
+                    cancelled = true;
                 }
                 catch (Exception ex)
                 {
                     Debug.WriteLine("DWG export failed for " + partPath + ": " + ex);
-                    failed++;
+                    failedParts++;
+                    failureDetails.Add("PART FAIL: " + partPath + (string.IsNullOrWhiteSpace(cfgName) ? "" : (" [" + cfgName + "]")) +
+                                       " - " + ex.Message);
                 }
+                finally
+                {
+                    try { swApp.CloseDoc(partPath); } catch { }
+                }
+
+                processedParts++;
+                try
+                {
+                    prog?.UpdateCounts(partsDone: processedParts, totalParts: totalParts, failedParts: failedParts, dwgOk: dwgOk, dwgFailed: dwgFailed, platesDone: totalPlates);
+                }
+                catch { }
+
+                if (cancelled)
+                    break;
             }
 
             string csvPath = Path.Combine(jobFolder, "parts.csv");
             TryWriteCsv(csvPath, csvLines);
 
+            TryWriteExportReport(
+                jobFolder,
+                sourceDoc: asmPath,
+                cancelled: cancelled,
+                totalParts: totalParts,
+                processedParts: processedParts,
+                failedParts: failedParts,
+                totalPlates: totalPlates,
+                dwgOk: dwgOk,
+                dwgFailed: dwgFailed,
+                failureDetails: failureDetails);
+
+            try { prog?.SetStatus(cancelled ? "Cancelled." : "Done."); } catch { }
+
             MessageBox.Show(
-                $"Unique sheet-metal parts found: {usage.Count}\r\n" +
-                $"Total sheet-metal bodies (plates): {totalBodies}\r\n" +
-                $"DWG files saved: {exported}\r\n" +
-                $"Failed: {failed}\r\n" +
-                $"Folder:\r\n{jobFolder}",
+                (cancelled ? "DWG export cancelled." : "") +
+                $"Unique sheet-metal parts found: {totalParts}" +
+                $"Parts processed: {processedParts}/{totalParts}" +
+                $"Parts failed: {failedParts}" +
+                $"Total plates (DWG attempts): {totalPlates}" +
+                $"DWG files saved: {dwgOk}" +
+                $"DWG failures: {dwgFailed}" +
+                $"Folder:{jobFolder}" +
+                (failureDetails.Count > 0 ? "See export_report.txt for details." : ""),
                 "DWG Export");
         }
 
@@ -306,7 +507,10 @@ namespace SW2026RibbonAddin.Commands
             string folder,
             string uniquePartToken,
             HashSet<string> globalUsedNames,
-            List<string> dwgFileNames)
+            List<string> dwgFileNames,
+            Action<int, int, string, string> onBodyStart,
+            Action<int, int, string, string, bool> onBodyEnd,
+            Func<bool> isCancelled)
         {
             if (partModel == null)
                 return 1;
@@ -318,10 +522,26 @@ namespace SW2026RibbonAddin.Commands
             if (string.IsNullOrEmpty(modelPath))
                 return 1;
 
-            var flatPatterns = GetFlatPatternFeatures(partModel);
+            var flatPatterns = GetFlatPatternFeatures(partModel) ?? new List<Feature>();
 
+            // Filter null features (defensive)
+            if (flatPatterns.Count > 0)
+            {
+                var filtered = new List<Feature>(flatPatterns.Count);
+                foreach (var f in flatPatterns)
+                {
+                    if (f != null)
+                        filtered.Add(f);
+                }
+                flatPatterns = filtered;
+            }
+
+            // Case A: no selectable FlatPattern features (fallback export)
             if (flatPatterns.Count == 0)
             {
+                if (isCancelled != null && isCancelled())
+                    throw new OperationCanceledException("User cancelled DWG export.");
+
                 string baseName = Path.GetFileNameWithoutExtension(modelPath);
                 if (string.IsNullOrEmpty(baseName))
                     baseName = "SheetMetal";
@@ -330,13 +550,16 @@ namespace SW2026RibbonAddin.Commands
                 string dwgName = ReserveUniqueFileName(stem + ".dwg", globalUsedNames);
                 string outPath = Path.Combine(folder, dwgName);
 
-                if (ExportFlatPatternWithoutSelection(partDoc, modelPath, outPath))
-                {
-                    dwgFileNames.Add(dwgName);
-                    return 0;
-                }
+                onBodyStart?.Invoke(1, 1, "FlatPattern", outPath);
 
-                return 1;
+                bool ok = ExportFlatPatternWithoutSelection(partDoc, modelPath, outPath);
+
+                if (ok)
+                    dwgFileNames.Add(dwgName);
+
+                onBodyEnd?.Invoke(1, 1, "FlatPattern", outPath, ok);
+
+                return ok ? 0 : 1;
             }
 
             string partBaseName = Path.GetFileNameWithoutExtension(modelPath);
@@ -345,20 +568,24 @@ namespace SW2026RibbonAddin.Commands
 
             int failures = 0;
             int idx = 1;
+
             var usedNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
             string stemPrefix = MakeExportStem(partBaseName, uniquePartToken);
+            int total = flatPatterns.Count;
 
             foreach (Feature flatFeat in flatPatterns)
             {
-                if (flatFeat == null)
-                    continue;
+                if (isCancelled != null && isCancelled())
+                    throw new OperationCanceledException("User cancelled DWG export.");
 
                 string suffix = null;
-                try { suffix = flatFeat.Name; } catch { }
+                try { suffix = flatFeat?.Name; } catch { }
 
                 if (string.IsNullOrWhiteSpace(suffix))
                     suffix = idx.ToString(CultureInfo.InvariantCulture);
+
+                string flatNameForUi = suffix;
 
                 suffix = MakeSafeFilePart(suffix);
 
@@ -367,11 +594,15 @@ namespace SW2026RibbonAddin.Commands
 
                 string outPath = Path.Combine(folder, finalName);
 
+                onBodyStart?.Invoke(idx, total, flatNameForUi, outPath);
+
                 bool ok = ExportFlatPatternSelected(partDoc, modelPath, flatFeat, outPath);
                 if (ok)
                     dwgFileNames.Add(finalName);
                 else
                     failures++;
+
+                onBodyEnd?.Invoke(idx, total, flatNameForUi, outPath, ok);
 
                 idx++;
             }
@@ -965,6 +1196,58 @@ namespace SW2026RibbonAddin.Commands
             }
         }
 
+
+
+        private static void TryWriteExportReport(
+            string jobFolder,
+            string sourceDoc,
+            bool cancelled,
+            int totalParts,
+            int processedParts,
+            int failedParts,
+            int totalPlates,
+            int dwgOk,
+            int dwgFailed,
+            List<string> failureDetails)
+        {
+            try
+            {
+                var lines = new List<string>();
+
+                lines.Add("DWG Export Report");
+                lines.Add("Date: " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"));
+                lines.Add("Source: " + (sourceDoc ?? ""));
+                lines.Add("Output folder: " + (jobFolder ?? ""));
+                lines.Add("Cancelled: " + cancelled);
+                lines.Add("");
+
+                lines.Add("Total parts: " + totalParts);
+                lines.Add("Parts processed: " + processedParts);
+                lines.Add("Parts failed: " + failedParts);
+                lines.Add("Total plates (DWG attempts): " + totalPlates);
+                lines.Add("DWG saved: " + dwgOk);
+                lines.Add("DWG failed: " + dwgFailed);
+
+                if (failureDetails != null && failureDetails.Count > 0)
+                {
+                    lines.Add("");
+                    lines.Add("Failures:");
+                    foreach (string f in failureDetails)
+                    {
+                        if (string.IsNullOrWhiteSpace(f)) continue;
+                        lines.Add(f);
+                    }
+                }
+
+                string reportPath = Path.Combine(jobFolder ?? "", "export_report.txt");
+                File.WriteAllLines(reportPath, lines, Encoding.UTF8);
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine("Export report write failed: " + ex);
+            }
+        }
+
         private static string GetActiveDocKey(ISldWorks swApp)
         {
             try
@@ -1017,4 +1300,197 @@ namespace SW2026RibbonAddin.Commands
             return "\"" + s + "\"";
         }
     }
+
+    internal sealed class DwgExportProgressForm : Form
+    {
+        private readonly Label _lblHeader;
+        private readonly Label _lblPart;
+        private readonly Label _lblDetails;
+        private readonly Label _lblCounts;
+        private readonly Label _lblStatus;
+        private readonly ProgressBar _bar;
+        private readonly Button _btnCancel;
+
+        private volatile bool _cancelRequested;
+
+        public bool IsCancellationRequested => _cancelRequested;
+
+        public DwgExportProgressForm()
+        {
+            Text = "DWG Export...";
+            FormBorderStyle = FormBorderStyle.FixedDialog;
+            MaximizeBox = false;
+            MinimizeBox = false;
+            StartPosition = FormStartPosition.CenterScreen;
+            ShowInTaskbar = false;
+
+            Width = 640;
+            Height = 250;
+
+            _lblHeader = new Label { Left = 12, Top = 10, Width = 600, Height = 18, Text = "DWG Export..." };
+            _lblPart = new Label { Left = 12, Top = 32, Width = 600, Height = 18, Text = "" };
+            _lblDetails = new Label { Left = 12, Top = 52, Width = 600, Height = 36, Text = "" };
+            _lblCounts = new Label { Left = 12, Top = 90, Width = 600, Height = 32, Text = "" };
+
+            _bar = new ProgressBar { Left = 12, Top = 126, Width = 600, Height = 18, Minimum = 0, Maximum = 100, Value = 0 };
+
+            _lblStatus = new Label { Left = 12, Top = 148, Width = 600, Height = 18, Text = "" };
+
+            _btnCancel = new Button { Left = 522, Top = 176, Width = 90, Height = 26, Text = "Cancel" };
+            _btnCancel.Click += (s, e) => RequestCancel();
+
+            Controls.Add(_lblHeader);
+            Controls.Add(_lblPart);
+            Controls.Add(_lblDetails);
+            Controls.Add(_lblCounts);
+            Controls.Add(_bar);
+            Controls.Add(_lblStatus);
+            Controls.Add(_btnCancel);
+
+            // If user clicks [X], treat as cancel request (don’t kill the process abruptly)
+            FormClosing += (s, e) =>
+            {
+                if (!_cancelRequested)
+                {
+                    _cancelRequested = true;
+                    _btnCancel.Enabled = false;
+                    _lblStatus.Text = "Cancelling...";
+                    PumpUI();
+                }
+            };
+        }
+
+        public void BeginExport(string jobName, int totalParts, string outputFolder)
+        {
+            UI(() =>
+            {
+                string j = (jobName ?? "").Trim();
+                if (j.Length == 0) j = "DWG Export";
+
+                _lblHeader.Text = $"DWG Export...  {j}";
+                _lblPart.Text = string.IsNullOrWhiteSpace(outputFolder) ? "" : ("Output: " + outputFolder);
+                _lblDetails.Text = "";
+                _lblCounts.Text = "";
+
+                _bar.Minimum = 0;
+                _bar.Maximum = Math.Max(1, totalParts);
+                _bar.Value = 0;
+
+                _lblStatus.Text = "";
+                _btnCancel.Enabled = true;
+            });
+
+            ThrowIfCancelled();
+        }
+
+        public void BeginPart(int partIndex, int totalParts, string partPath, string configName, string material, double thicknessMm)
+        {
+            UI(() =>
+            {
+                string name = "";
+                try { name = Path.GetFileName(partPath ?? ""); } catch { name = partPath ?? ""; }
+
+                string cfg = string.IsNullOrWhiteSpace(configName) ? "" : $"  [{configName}]";
+
+                _lblPart.Text = $"Part {partIndex}/{Math.Max(1, totalParts)}: {name}{cfg}";
+
+                string mat = string.IsNullOrWhiteSpace(material) ? "UNKNOWN" : material.Trim();
+                string th = thicknessMm > 0
+                    ? thicknessMm.ToString("0.###", CultureInfo.InvariantCulture) + " mm"
+                    : "? mm";
+
+                _lblDetails.Text = $"{mat} | {th}";
+            });
+
+            ThrowIfCancelled();
+        }
+
+        public void ReportBody(int bodyIndex, int bodyTotal, string flatName, string outPath)
+        {
+            UI(() =>
+            {
+                string flat = string.IsNullOrWhiteSpace(flatName) ? "FlatPattern" : flatName.Trim();
+                string file = "";
+                try { file = Path.GetFileName(outPath ?? ""); } catch { file = outPath ?? ""; }
+
+                _lblStatus.Text = $"Exporting {bodyIndex}/{Math.Max(1, bodyTotal)}: {flat}";
+                if (!string.IsNullOrWhiteSpace(file))
+                    _lblStatus.Text += $"  →  {file}";
+            });
+
+            ThrowIfCancelled();
+        }
+
+        public void UpdateCounts(int partsDone, int totalParts, int failedParts, int dwgOk, int dwgFailed, int platesDone)
+        {
+            UI(() =>
+            {
+                int tp = Math.Max(1, totalParts);
+                int pd = Math.Max(0, Math.Min(partsDone, tp));
+
+                if (_bar.Maximum != tp)
+                    _bar.Maximum = tp;
+
+                _bar.Value = Math.Min(_bar.Maximum, Math.Max(_bar.Minimum, pd));
+
+                int fp = Math.Max(0, failedParts);
+                int ok = Math.Max(0, dwgOk);
+                int bad = Math.Max(0, dwgFailed);
+                int plates = Math.Max(0, platesDone);
+
+                _lblCounts.Text =
+                    $"Parts: {pd}/{tp}    Failed parts: {fp}" +
+                    $"Plates (DWGs): {plates}    Saved: {ok}    Failed: {bad}";
+            });
+
+            ThrowIfCancelled();
+        }
+
+        public void SetStatus(string message)
+        {
+            UI(() =>
+            {
+                _lblStatus.Text = message ?? "";
+            });
+
+            ThrowIfCancelled();
+        }
+
+        public void ThrowIfCancelled()
+        {
+            if (_cancelRequested)
+                throw new OperationCanceledException("User cancelled DWG export.");
+        }
+
+        private void RequestCancel()
+        {
+            _cancelRequested = true;
+            UI(() =>
+            {
+                _btnCancel.Enabled = false;
+                _lblStatus.Text = "Cancelling...";
+            });
+        }
+
+        private void UI(Action action)
+        {
+            if (IsDisposed) return;
+
+            if (InvokeRequired)
+            {
+                try { BeginInvoke(action); } catch { }
+                return;
+            }
+
+            action();
+            PumpUI();
+        }
+
+        private void PumpUI()
+        {
+            // IMPORTANT: keeps the form responsive when export runs on the same thread
+            try { Application.DoEvents(); } catch { }
+        }
+    }
+
 }
