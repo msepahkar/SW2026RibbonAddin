@@ -101,6 +101,58 @@ namespace SW2026RibbonAddin.Commands
 			return r;
 		}
 
+		// Rotate a polygon by an arbitrary angle (radians) around the origin.
+		// NOTE: points are in SCALE units (0.001mm). We round back to long.
+		private static Path64 RotatePolyRad(Path64 p, double rad)
+		{
+			if (p == null)
+				return null;
+
+			// Fast-path for 0, 90, 180, 270-ish angles to keep results stable.
+			// We only use this when very close to those angles.
+			double deg = rad * 180.0 / Math.PI;
+			double degNorm = ((deg % 360.0) + 360.0) % 360.0;
+			if (Math.Abs(degNorm - 0.0) < 1e-9) return RotatePoly(p, 0);
+			if (Math.Abs(degNorm - 90.0) < 1e-9) return RotatePoly(p, 90);
+			if (Math.Abs(degNorm - 180.0) < 1e-9) return RotatePoly(p, 180);
+			if (Math.Abs(degNorm - 270.0) < 1e-9) return RotatePoly(p, 270);
+
+			double c = Math.Cos(rad);
+			double s = Math.Sin(rad);
+
+			var r = new Path64(p.Count);
+			foreach (var pt in p)
+			{
+				double x = pt.X;
+				double y = pt.Y;
+				long xr = (long)Math.Round(x * c - y * s);
+				long yr = (long)Math.Round(x * s + y * c);
+				r.Add(new Point64(xr, yr));
+			}
+
+			return r;
+		}
+
+		private static Path64 SnapPath(Path64 p, double snapMm)
+		{
+			if (p == null || p.Count == 0)
+				return p;
+
+			long grid = Math.Max(1, (long)Math.Round(snapMm * SCALE));
+			if (grid <= 1)
+				return p;
+
+			var r = new Path64(p.Count);
+			foreach (var pt in p)
+			{
+				long sx = (long)Math.Round((double)pt.X / grid) * grid;
+				long sy = (long)Math.Round((double)pt.Y / grid) * grid;
+				r.Add(new Point64(sx, sy));
+			}
+
+			return CleanPath(r);
+		}
+
 		private static Path64 OffsetLargest(Path64 poly, double deltaScaled)
 		{
 			if (poly == null || poly.Count < 3)

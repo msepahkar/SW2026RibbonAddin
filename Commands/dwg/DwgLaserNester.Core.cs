@@ -1139,9 +1139,20 @@ namespace SW2026RibbonAddin.Commands
         private sealed class _MirrorShapeInfo
         {
             public PartDefinition Part;
+            // Rotation applied to the original block (radians) so that the
+            // resulting pair-rectangle becomes axis-aligned.
+            public double RotRad;
+
+            // Rotated polygon, normalized so its bbox min is at (0,0).
+            // Full precision version is used for geometric verification.
             public Path64 PolyNormFull;
+
+            // Decimated + snapped version used for hashing/matching.
             public Path64 PolyNormDec;
-            public LongRect Bounds0;
+
+            // Bounding box of the rotated polygon BEFORE normalization.
+            // Used to compute the insertion translation for the rotated block.
+            public LongRect RotBounds0;
             public long Width;
             public long Height;
             public ulong Key;
@@ -1170,109 +1181,223 @@ namespace SW2026RibbonAddin.Commands
                 return;
 
             const int HASH_MAX_POINTS = 220;
+            const double HASH_SNAP_MM = 0.01; // helps stable hashing after rotation
+            const int MAX_ANGLES_PER_PART = 14;
 
-            // Precompute normalized polys + hash keys.
-            var infos = new Dictionary<PartDefinition, _MirrorShapeInfo>();
+            // Precompute rotated-normalized polys + hash keys for a small set of
+            // candidate angles per part. This enables mirror-pair detection even
+            // when the parts are exported in arbitrary orientations.
+            var infosByPart = new Dictionary<PartDefinition, List<_MirrorShapeInfo>>();
             var byKey = new Dictionary<ulong, List<_MirrorShapeInfo>>();
 
             foreach (var p in parts)
             {
-                Path64 poly = p.OuterContour0;
-                if (poly == null || poly.Count < 3)
-                    poly = MakeRectPolyScaled(p.MinX, p.MinY, p.MaxX, p.MaxY);
+                Path64 poly0 = p.OuterContour0;
+                if (poly0 == null || poly0.Count < 3)
+                    poly0 = MakeRectPolyScaled(p.MinX, p.MinY, p.MaxX, p.MaxY);
 
-                poly = CleanPath(poly);
-                if (poly == null || poly.Count < 3)
+                poly0 = CleanPath(poly0);
+                if (poly0 == null || poly0.Count < 3)
                     continue;
 
-                var b = GetBounds(poly);
-                long w = b.MaxX - b.MinX;
-                long h = b.MaxY - b.MinY;
-                if (w <= 0 || h <= 0)
-                    continue;
+                var angles = GetCandidateAnglesForMirrorPairing(poly0, MAX_ANGLES_PER_PART);
+                if (angles == null || angles.Count == 0)
+                    angles = new List<double> { 0.0 };
 
-                var normFull = TranslatePath(poly, -b.MinX, -b.MinY);
-                var normDec = CleanPath(DecimatePath(normFull, HASH_MAX_POINTS));
+                var list = new List<_MirrorShapeInfo>();
 
-                ulong key = HashPathCanonical(normDec);
-
-                if (key == 0UL)
-                    continue;
-
-                var mx = MirrorX(normDec, w);
-                var my = MirrorY(normDec, h);
-                ulong kx = HashPathCanonical(mx);
-                ulong ky = HashPathCanonical(my);
-
-                var info = new _MirrorShapeInfo
+                foreach (double a in angles)
                 {
-                    Part = p,
-                    PolyNormFull = normFull,
-                    PolyNormDec = normDec,
-                    Bounds0 = b,
-                    Width = w,
-                    Height = h,
-                    Key = key,
-                    MirrorXKey = kx,
-                    MirrorYKey = ky
-                };
+                    // Rotate by -a so that an edge at angle 'a' becomes horizontal.
+                    double rotRad = -a;
 
-                infos[p] = info;
+                    var polyRot = RotatePolyRad(poly0, rotRad);
+                    polyRot = CleanPath(polyRot);
+                    if (polyRot == null || polyRot.Count < 3)
+                        continue;
 
-                if (!byKey.TryGetValue(key, out var list))
-                {
-                    list = new List<_MirrorShapeInfo>();
-                    byKey[key] = list;
+                    var bRot = GetBounds(polyRot);
+                    long w = bRot.MaxX - bRot.MinX;
+                    long h = bRot.MaxY - bRot.MinY;
+                    if (w <= 0 || h <= 0)
+                        continue;
+
+                    var normFull = TranslatePath(polyRot, -bRot.MinX, -bRot.MinY);
+                    normFull = CleanPath(normFull);
+
+                    var normDec = CleanPath(DecimatePath(normFull, HASH_MAX_POINTS));
+                    normDec = SnapPath(normDec, HASH_SNAP_MM);
+
+                    if (normDec == null || normDec.Count < 3)
+                        continue;
+
+                    // Ensure snapped decimated shape is also anchored at 0,0.
+                    var bDec = GetBounds(normDec);
+                    if (bDec.MinX != 0 || bDec.MinY != 0)
+                        normDec = CleanPath(TranslatePath(normDec, -bDec.MinX, -bDec.MinY));
+
+                    if (normDec == null || normDec.Count < 3)
+                        continue;
+
+                    ulong key = HashPathCanonical(normDec);
+                    if (key == 0UL)
+                        continue;
+
+                    var bHash = GetBounds(normDec);
+                    long wHash = bHash.MaxX - bHash.MinX;
+                    long hHash = bHash.MaxY - bHash.MinY;
+                    if (wHash <= 0 || hHash <= 0)
+                        continue;
+
+                    var mx = MirrorX(normDec, wHash);
+                    var my = MirrorY(normDec, hHash);
+                    ulong kx = HashPathCanonical(mx);
+                    ulong ky = HashPathCanonical(my);
+
+                    var info = new _MirrorShapeInfo
+                    {
+                        Part = p,
+                        RotRad = rotRad,
+                        PolyNormFull = normFull,
+                        PolyNormDec = normDec,
+                        RotBounds0 = bRot,
+                        Width = w,
+                        Height = h,
+                        Key = key,
+                        MirrorXKey = kx,
+                        MirrorYKey = ky,
+                    };
+
+                    list.Add(info);
+
+                    if (!byKey.TryGetValue(key, out var klist))
+                    {
+                        klist = new List<_MirrorShapeInfo>();
+                        byKey[key] = klist;
+                    }
+                    klist.Add(info);
                 }
-                list.Add(info);
+
+                if (list.Count > 0)
+                    infosByPart[p] = list;
             }
 
-            if (infos.Count < 2)
+            if (infosByPart.Count < 2)
                 return;
 
-            // Process bigger rectangles first (more benefit).
-            var ordered = infos.Values
-                .OrderByDescending(i => i.Width * i.Height)
+            // Process bigger parts first (more benefit).
+            var orderedParts = infosByPart.Keys
+                .OrderByDescending(d => Math.Max(0.0, d.Width) * Math.Max(0.0, d.Height))
                 .ToList();
 
             int createdPairs = 0;
 
-            foreach (var a in ordered)
+            foreach (var A in orderedParts)
             {
-                var A = a.Part;
                 if (A == null || A.Quantity <= 0)
                     continue;
 
-                // Try mirror-X, then mirror-Y (either/both can contribute depending on quantities).
-                TryConsumeMirrorPairs(doc, defs, materialLabel, a, a.MirrorXKey, byKey, mode, pairGapMm, MirrorPairAxis.X, ref createdPairs);
-                TryConsumeMirrorPairs(doc, defs, materialLabel, a, a.MirrorYKey, byKey, mode, pairGapMm, MirrorPairAxis.Y, ref createdPairs);
+                if (!infosByPart.TryGetValue(A, out var aInfos) || aInfos == null || aInfos.Count == 0)
+                    continue;
+
+                // Try to consume as many mirror pairs for this part as possible.
+                // Usually there is only one matching mirror-part, but this loop
+                // allows multiple matches if the data contains duplicates.
+                bool pairedSomething;
+                do
+                {
+                    pairedSomething = false;
+
+                    if (A.Quantity <= 0)
+                        break;
+
+                    _MirrorShapeInfo bestA = null;
+                    _MirrorShapeInfo bestB = null;
+                    MirrorPairAxis bestAxis = MirrorPairAxis.X;
+
+                    // Find the first valid candidate (verified by geometry).
+                    foreach (var a in aInfos)
+                    {
+                        if (A.Quantity <= 0)
+                            break;
+
+                        if (a == null || a.Key == 0UL)
+                            continue;
+
+                        if (TryFindVerifiedMirrorCandidate(a, byKey, out var b, out var axis))
+                        {
+                            bestA = a;
+                            bestB = b;
+                            bestAxis = axis;
+                            break;
+                        }
+                    }
+
+                    if (bestA == null || bestB == null || bestB.Part == null)
+                        break;
+
+                    int pairCount = Math.Min(A.Quantity, bestB.Part.Quantity);
+                    if (pairCount <= 0)
+                        break;
+
+                    if (CreateMirrorPairBlock(doc, defs, materialLabel, bestA, bestB, bestAxis, mode, pairGapMm, pairCount, ref createdPairs))
+                    {
+                        // Consume quantities
+                        A.Quantity -= pairCount;
+                        bestB.Part.Quantity -= pairCount;
+                        pairedSomething = true;
+                    }
+
+                } while (pairedSomething);
             }
 
             // Remove zero-qty originals (keeps list smaller for placement)
             defs.RemoveAll(d => d == null || d.Quantity <= 0);
         }
 
-        private static bool TryConsumeMirrorPairs(
-            CadDocument doc,
-            List<PartDefinition> defs,
-            string materialLabel,
+        private static bool TryFindVerifiedMirrorCandidate(
             _MirrorShapeInfo a,
-            ulong mirrorKey,
             Dictionary<ulong, List<_MirrorShapeInfo>> byKey,
-            MirrorPairingMode mode,
-            double pairGapMm,
-            MirrorPairAxis axis,
-            ref int createdPairs)
+            out _MirrorShapeInfo bBest,
+            out MirrorPairAxis axisBest)
         {
+            bBest = null;
+            axisBest = MirrorPairAxis.X;
+
             if (a == null || a.Part == null || a.Part.Quantity <= 0)
+                return false;
+
+            // Try mirror-X, then mirror-Y.
+            if (TryFindVerifiedMirrorCandidateAxis(a, byKey, MirrorPairAxis.X, out bBest))
+            {
+                axisBest = MirrorPairAxis.X;
+                return true;
+            }
+
+            if (TryFindVerifiedMirrorCandidateAxis(a, byKey, MirrorPairAxis.Y, out bBest))
+            {
+                axisBest = MirrorPairAxis.Y;
+                return true;
+            }
+
+            return false;
+        }
+
+        private static bool TryFindVerifiedMirrorCandidateAxis(
+            _MirrorShapeInfo a,
+            Dictionary<ulong, List<_MirrorShapeInfo>> byKey,
+            MirrorPairAxis axis,
+            out _MirrorShapeInfo bBest)
+        {
+            bBest = null;
+
+            ulong mirrorKey = axis == MirrorPairAxis.X ? a.MirrorXKey : a.MirrorYKey;
+            if (mirrorKey == 0UL)
                 return false;
 
             if (!byKey.TryGetValue(mirrorKey, out var candidates) || candidates == null || candidates.Count == 0)
                 return false;
 
-            bool anyPaired = false;
-
-            // Prefer candidates with available quantity and same bbox dims.
             foreach (var b in candidates)
             {
                 var B = b?.Part;
@@ -1296,126 +1421,221 @@ namespace SW2026RibbonAddin.Commands
                 if (!VerifyRectangleUnionNoOverlap(a.PolyNormFull, b.PolyNormFull, a.Width, a.Height))
                     continue;
 
-                int pairCount = Math.Min(a.Part.Quantity, B.Quantity);
-                if (pairCount <= 0)
-                    continue;
-
-                // Create a new pair block definition once per A-B match.
-                string pairBlockName = BuildPairBlockName(a.Part.BlockName, B.BlockName, createdPairs + 1);
-
-                BlockRecord pairBlock = null;
-                string nameTry = pairBlockName;
-
-                for (int attempt = 0; attempt < 200; attempt++)
-                {
-                    try
-                    {
-                        pairBlock = new BlockRecord(nameTry);
-                        doc.BlockRecords.Add(pairBlock);
-                        break;
-                    }
-                    catch
-                    {
-                        nameTry = pairBlockName + "_" + (attempt + 1).ToString(CultureInfo.InvariantCulture);
-                        pairBlock = null;
-                    }
-                }
-
-                if (pairBlock == null)
-                    continue;
-
-                // Place both parts into the same rectangle bbox (normalized to min=0,0).
-                // CommonLine: the two parts touch (common-line) and together form an exact rectangle.
-                // WithGap: keep an internal gap (use auto gap) by shifting one half, and grow the outer rectangle by that gap.
-                long gapScaled = 0;
-                if (mode == MirrorPairingMode.WithGap && pairGapMm > 0)
-                    gapScaled = (long)Math.Round(pairGapMm * SCALE);
-
-                long rectW = a.Width;
-                long rectH = a.Height;
-
-                double extraBx = 0.0;
-                double extraBy = 0.0;
-
-                if (gapScaled > 0)
-                {
-                    if (axis == MirrorPairAxis.X)
-                    {
-                        rectW = a.Width + gapScaled;
-                        extraBx = (double)gapScaled / SCALE;
-                    }
-                    else if (axis == MirrorPairAxis.Y)
-                    {
-                        rectH = a.Height + gapScaled;
-                        extraBy = (double)gapScaled / SCALE;
-                    }
-                }
-
-                double ax = -(double)a.Bounds0.MinX / SCALE;
-                double ay = -(double)a.Bounds0.MinY / SCALE;
-                double bx = -(double)b.Bounds0.MinX / SCALE + extraBx;
-                double by = -(double)b.Bounds0.MinY / SCALE + extraBy;
-
-                pairBlock.Entities.Add(new Insert(a.Part.Block)
-                {
-                    InsertPoint = new XYZ(ax, ay, 0.0),
-                    Rotation = 0.0,
-                    XScale = 1.0,
-                    YScale = 1.0,
-                    ZScale = 1.0
-                });
-
-                pairBlock.Entities.Add(new Insert(B.Block)
-                {
-                    InsertPoint = new XYZ(bx, by, 0.0),
-                    Rotation = 0.0,
-                    XScale = 1.0,
-                    YScale = 1.0,
-                    ZScale = 1.0
-                });
-
-                // New synthetic part def representing a rectangle that yields TWO parts.
-                double wMm = (double)rectW / SCALE;
-                double hMm = (double)rectH / SCALE;
-
-                var rect = new Path64
-                {
-                    new Point64(0, 0),
-                    new Point64(rectW, 0),
-                    new Point64(rectW, rectH),
-                    new Point64(0, rectH)
-                };
-
-                defs.Add(new PartDefinition
-                {
-                    Block = pairBlock,
-                    BlockName = pairBlock.Name,
-                    Quantity = pairCount,
-                    PartCountWeight = 2,
-                    MaterialExact = materialLabel ?? "UNKNOWN",
-
-                    MinX = 0.0,
-                    MinY = 0.0,
-                    MaxX = wMm,
-                    MaxY = hMm,
-                    Width = wMm,
-                    Height = hMm,
-
-                    OuterContour0 = rect,
-                    OuterArea2Abs = Area2Abs(rect)
-                });
-
-                // Consume quantities
-                a.Part.Quantity -= pairCount;
-                B.Quantity -= pairCount;
-
-                createdPairs++;
-                anyPaired = true;
-
-                // Keep pairing A with other candidates if it still has qty.
+                bBest = b;
+                return true;
             }
 
-            return anyPaired;
+            return false;
+        }
+
+        private static bool CreateMirrorPairBlock(
+            CadDocument doc,
+            List<PartDefinition> defs,
+            string materialLabel,
+            _MirrorShapeInfo a,
+            _MirrorShapeInfo b,
+            MirrorPairAxis axis,
+            MirrorPairingMode mode,
+            double pairGapMm,
+            int pairCount,
+            ref int createdPairs)
+        {
+            if (doc == null || defs == null || a == null || b == null || a.Part == null || b.Part == null)
+                return false;
+
+            var A = a.Part;
+            var B = b.Part;
+
+            // Create a new pair block definition once per A-B match.
+            string pairBlockName = BuildPairBlockName(A.BlockName, B.BlockName, createdPairs + 1);
+
+            BlockRecord pairBlock = null;
+            string nameTry = pairBlockName;
+
+            for (int attempt = 0; attempt < 200; attempt++)
+            {
+                try
+                {
+                    pairBlock = new BlockRecord(nameTry);
+                    doc.BlockRecords.Add(pairBlock);
+                    break;
+                }
+                catch
+                {
+                    nameTry = pairBlockName + "_" + (attempt + 1).ToString(CultureInfo.InvariantCulture);
+                    pairBlock = null;
+                }
+            }
+
+            if (pairBlock == null)
+                return false;
+
+            // CommonLine: the two parts touch (common-line) and together form an exact rectangle.
+            // WithGap: keep an internal gap (use auto gap) by shifting one half, and grow the outer rectangle by that gap.
+            long gapScaled = 0;
+            if (mode == MirrorPairingMode.WithGap && pairGapMm > 0)
+                gapScaled = (long)Math.Round(pairGapMm * SCALE);
+
+            long rectW = a.Width;
+            long rectH = a.Height;
+
+            double extraBx = 0.0;
+            double extraBy = 0.0;
+
+            if (gapScaled > 0)
+            {
+                if (axis == MirrorPairAxis.X)
+                {
+                    rectW = a.Width + gapScaled;
+                    extraBx = (double)gapScaled / SCALE;
+                }
+                else if (axis == MirrorPairAxis.Y)
+                {
+                    rectH = a.Height + gapScaled;
+                    extraBy = (double)gapScaled / SCALE;
+                }
+            }
+
+            // Insert translations: move each rotated block so its rotated bbox min sits at (0,0).
+            double ax = -(double)a.RotBounds0.MinX / SCALE;
+            double ay = -(double)a.RotBounds0.MinY / SCALE;
+            double bx = -(double)b.RotBounds0.MinX / SCALE + extraBx;
+            double by = -(double)b.RotBounds0.MinY / SCALE + extraBy;
+
+            pairBlock.Entities.Add(new Insert(A.Block)
+            {
+                InsertPoint = new XYZ(ax, ay, 0.0),
+                Rotation = a.RotRad,
+                XScale = 1.0,
+                YScale = 1.0,
+                ZScale = 1.0
+            });
+
+            pairBlock.Entities.Add(new Insert(B.Block)
+            {
+                InsertPoint = new XYZ(bx, by, 0.0),
+                Rotation = b.RotRad,
+                XScale = 1.0,
+                YScale = 1.0,
+                ZScale = 1.0
+            });
+
+            // New synthetic part def representing a rectangle that yields TWO parts.
+            double wMm = (double)rectW / SCALE;
+            double hMm = (double)rectH / SCALE;
+
+            var rect = new Path64
+            {
+                new Point64(0, 0),
+                new Point64(rectW, 0),
+                new Point64(rectW, rectH),
+                new Point64(0, rectH)
+            };
+
+            defs.Add(new PartDefinition
+            {
+                Block = pairBlock,
+                BlockName = pairBlock.Name,
+                Quantity = pairCount,
+                PartCountWeight = 2,
+                MaterialExact = materialLabel ?? "UNKNOWN",
+
+                MinX = 0.0,
+                MinY = 0.0,
+                MaxX = wMm,
+                MaxY = hMm,
+                Width = wMm,
+                Height = hMm,
+
+                OuterContour0 = rect,
+                OuterArea2Abs = Area2Abs(rect)
+            });
+
+            createdPairs++;
+            return true;
+        }
+
+        private static List<double> GetCandidateAnglesForMirrorPairing(Path64 poly, int maxAngles)
+        {
+            if (poly == null || poly.Count < 3)
+                return new List<double> { 0.0 };
+
+            // Reduce point count a bit to avoid noisy micro-edges (especially from arcs).
+            var p = CleanPath(DecimatePath(poly, 520));
+            if (p == null || p.Count < 3)
+                return new List<double> { 0.0 };
+
+            // Collect edge angles weighted by edge length.
+            var cands = new List<(double ang, double w)>();
+            int n = p.Count;
+
+            // Ignore very small edges (< ~2mm) to avoid noise.
+            double minLen = 2.0 * SCALE;
+            double minLen2 = minLen * minLen;
+
+            for (int i = 0; i < n; i++)
+            {
+                var a = p[i];
+                var b = p[(i + 1) % n];
+                long dxL = b.X - a.X;
+                long dyL = b.Y - a.Y;
+                double dx = dxL;
+                double dy = dyL;
+                double len2 = dx * dx + dy * dy;
+                if (len2 < minLen2)
+                    continue;
+
+                double ang = Math.Atan2(dy, dx);
+                double norm = NormalizeAngle0ToHalfPi(ang);
+                cands.Add((norm, len2));
+            }
+
+            // Always include 0.
+            var result = new List<double> { 0.0 };
+
+            if (cands.Count == 0)
+                return result;
+
+            // Sort longest edges first.
+            cands.Sort((x, y) => y.w.CompareTo(x.w));
+
+            double tol = 0.5 * Math.PI / 180.0; // 0.5 degree
+
+            foreach (var c in cands)
+            {
+                if (result.Count >= Math.Max(2, maxAngles))
+                    break;
+
+                bool close = false;
+                foreach (double existing in result)
+                {
+                    double diff = Math.Abs(c.ang - existing);
+                    diff = Math.Min(diff, (Math.PI / 2.0) - diff);
+                    if (diff < tol)
+                    {
+                        close = true;
+                        break;
+                    }
+                }
+
+                if (!close)
+                    result.Add(c.ang);
+            }
+
+            return result;
+        }
+
+        private static double NormalizeAngle0ToHalfPi(double angleRad)
+        {
+            // Map to [0, PI)
+            double a = angleRad % Math.PI;
+            if (a < 0) a += Math.PI;
+
+            // Fold to [0, PI/2)
+            if (a >= Math.PI / 2.0)
+                a -= Math.PI / 2.0;
+
+            return a;
         }
 
         private static bool DimsClose(long a, long b)
