@@ -1,0 +1,1449 @@
+diff --git a/Commands/dwg/DwgLaserNester.Algorithms.cs b/Commands/dwg/DwgLaserNester.Algorithms.cs
+index d0d9d4b..3f72315 100644
+--- a/Commands/dwg/DwgLaserNester.Algorithms.cs
++++ b/Commands/dwg/DwgLaserNester.Algorithms.cs
+@@ -73,10 +73,10 @@ namespace SW2026RibbonAddin.Commands
+         {
+             progress.ThrowIfCancelled();
+ 
+-            // Width-first packing:
+-            // Pack rectangles in horizontal shelves (rows) from left->right, bottom->top.
+-            // This tends to keep the remaining unused part of the sheet as a full-width strip
+-            // so it can be reused later for other jobs.
++            // Y-axis-first packing (requested):
++            // Pack rectangles in vertical shelves (columns) from bottom->top, left->right.
++            // This tends to keep the remaining unused part of the sheet as a full-height strip,
++            // so when a sheet is half-filled the empty area is a large contiguous region.
+ 
+             double placementMargin = marginMm + gapMm;
+ 
+@@ -91,7 +91,7 @@ namespace SW2026RibbonAddin.Commands
+             double maxY = sheetHmm - placementMargin;
+ 
+             var remaining = ExpandInstances(defs);
+-            // Start with larger parts first, then fill gaps within each row.
++            // Start with larger parts first, then fill gaps within each column.
+             remaining.Sort((a, b) => (b.Width * b.Height).CompareTo(a.Width * a.Height));
+ 
+             var sheets = new List<SheetRectState>();
+@@ -111,8 +111,8 @@ namespace SW2026RibbonAddin.Commands
+                 return s;
+             }
+ 
+-            bool TryChooseForNewShelf(PartDefinition part, double availW, double availH,
+-                                      out double usedW, out double usedH, out double rotRad)
++            bool TryChooseForNewColumn(PartDefinition part, double availW, double availH,
++                                       out double usedW, out double usedH, out double rotRad)
+             {
+                 // usedW/usedH include the gap.
+                 usedW = 0;
+@@ -133,15 +133,15 @@ namespace SW2026RibbonAddin.Commands
+ 
+                 if (fit0 && fit90)
+                 {
+-                    // Prefer the orientation with smaller shelf height.
+-                    if (h90 < h0 - 1e-9)
++                    // Prefer the orientation with smaller column width.
++                    if (w90 < w0 - 1e-9)
+                     {
+                         usedW = w90;
+                         usedH = h90;
+                         rotRad = Math.PI / 2.0;
+                         return true;
+                     }
+-                    if (h0 < h90 - 1e-9)
++                    if (w0 < w90 - 1e-9)
+                     {
+                         usedW = w0;
+                         usedH = h0;
+@@ -149,8 +149,8 @@ namespace SW2026RibbonAddin.Commands
+                         return true;
+                     }
+ 
+-                    // Same height: prefer larger width (helps fill width).
+-                    if (w90 > w0)
++                    // Same width: prefer larger height (helps fill the column).
++                    if (h90 > h0)
+                     {
+                         usedW = w90;
+                         usedH = h90;
+@@ -180,8 +180,8 @@ namespace SW2026RibbonAddin.Commands
+                 return true;
+             }
+ 
+-            bool TryChooseForExistingShelf(PartDefinition part, double availW, double shelfH,
+-                                           out double usedW, out double usedH, out double rotRad)
++            bool TryChooseForExistingColumn(PartDefinition part, double colW, double availH,
++                                            out double usedW, out double usedH, out double rotRad)
+             {
+                 usedW = 0;
+                 usedH = 0;
+@@ -193,9 +193,9 @@ namespace SW2026RibbonAddin.Commands
+                 // 0 deg
+                 double w0 = part.Width + gapMm;
+                 double h0 = part.Height + gapMm;
+-                if (w0 <= availW && h0 <= shelfH)
++                if (w0 <= colW && h0 <= availH)
+                 {
+-                    double leftover = availW - w0;
++                    double leftover = availH - h0;
+                     bestLeftover = leftover;
+                     usedW = w0;
+                     usedH = h0;
+@@ -206,10 +206,10 @@ namespace SW2026RibbonAddin.Commands
+                 // 90 deg
+                 double w90 = part.Height + gapMm;
+                 double h90 = part.Width + gapMm;
+-                if (w90 <= availW && h90 <= shelfH)
++                if (w90 <= colW && h90 <= availH)
+                 {
+-                    double leftover = availW - w90;
+-                    if (!found || leftover < bestLeftover - 1e-9 || (Math.Abs(leftover - bestLeftover) < 1e-9 && w90 > usedW))
++                    double leftover = availH - h90;
++                    if (!found || leftover < bestLeftover - 1e-9 || (Math.Abs(leftover - bestLeftover) < 1e-9 && h90 > usedH))
+                     {
+                         bestLeftover = leftover;
+                         usedW = w90;
+@@ -269,25 +269,25 @@ namespace SW2026RibbonAddin.Commands
+             {
+                 progress.ThrowIfCancelled();
+ 
+-                double shelfY = minY;
++                double colX = minX;
+                 bool placedAnything = false;
+ 
+                 while (remaining.Count > 0)
+                 {
+                     progress.ThrowIfCancelled();
+ 
+-                    double availH = maxY - shelfY;
+-                    if (availH <= 1e-6)
++                    double availW = maxX - colX;
++                    if (availW <= 1e-6)
+                         break;
+ 
+-                    // Start a new shelf: take the first (largest-first) remaining part that fits.
++                    // Start a new column: take the first (largest-first) remaining part that fits.
+                     int startIndex = -1;
+                     double startUsedW = 0, startUsedH = 0, startRot = 0;
+ 
+                     for (int i = 0; i < remaining.Count; i++)
+                     {
+                         var p = remaining[i];
+-                        if (TryChooseForNewShelf(p, usableW, availH, out var uW, out var uH, out var r))
++                        if (TryChooseForNewColumn(p, availW, usableH, out var uW, out var uH, out var r))
+                         {
+                             startIndex = i;
+                             startUsedW = uW;
+@@ -303,41 +303,41 @@ namespace SW2026RibbonAddin.Commands
+                     var startPart = remaining[startIndex];
+                     remaining.RemoveAt(startIndex);
+ 
+-                    double shelfX = minX;
+-                    double shelfH = startUsedH;
++                    double colY = minY;
++                    double colW = startUsedW;
+ 
+-                    PlaceAt(cur, startPart, shelfX, shelfY, startRot);
++                    PlaceAt(cur, startPart, colX, colY, startRot);
+                     placedAnything = true;
+ 
+-                    shelfX += startUsedW;
++                    colY += startUsedH;
+ 
+                     placedParts += Math.Max(1, startPart.PartCountWeight);
+                     progress.ReportPlaced(placedParts, totalInstances, sheets.Count);
+ 
+-                    // Fill the shelf: pick the best fit part for remaining width.
++                    // Fill the column: pick the best fit part for remaining height.
+                     while (remaining.Count > 0)
+                     {
+                         progress.ThrowIfCancelled();
+ 
+-                        double availW = maxX - shelfX;
+-                        if (availW <= 1e-6)
++                        double availH = maxY - colY;
++                        if (availH <= 1e-6)
+                             break;
+ 
+                         int bestIdx = -1;
+-                        double bestUsedW = 0, bestRot = 0;
++                        double bestUsedH = 0, bestRot = 0;
+                         double bestLeftover = double.PositiveInfinity;
+ 
+                         for (int i = 0; i < remaining.Count; i++)
+                         {
+                             var p = remaining[i];
+-                            if (!TryChooseForExistingShelf(p, availW, shelfH, out var uW, out var uH, out var r))
++                            if (!TryChooseForExistingColumn(p, colW, availH, out var uW, out var uH, out var r))
+                                 continue;
+ 
+-                            double leftover = availW - uW;
+-                            if (bestIdx < 0 || leftover < bestLeftover - 1e-9 || (Math.Abs(leftover - bestLeftover) < 1e-9 && uW > bestUsedW))
++                            double leftover = availH - uH;
++                            if (bestIdx < 0 || leftover < bestLeftover - 1e-9 || (Math.Abs(leftover - bestLeftover) < 1e-9 && uH > bestUsedH))
+                             {
+                                 bestIdx = i;
+-                                bestUsedW = uW;
++                                bestUsedH = uH;
+                                 bestRot = r;
+                                 bestLeftover = leftover;
+                             }
+@@ -353,14 +353,14 @@ namespace SW2026RibbonAddin.Commands
+                         var pBest = remaining[bestIdx];
+                         remaining.RemoveAt(bestIdx);
+ 
+-                        PlaceAt(cur, pBest, shelfX, shelfY, bestRot);
+-                        shelfX += bestUsedW;
++                        PlaceAt(cur, pBest, colX, colY, bestRot);
++                        colY += bestUsedH;
+ 
+                         placedParts += Math.Max(1, pBest.PartCountWeight);
+                         progress.ReportPlaced(placedParts, totalInstances, sheets.Count);
+                     }
+ 
+-                    shelfY += shelfH;
++                    colX += colW;
+                 }
+ 
+                 if (remaining.Count == 0)
+@@ -372,7 +372,7 @@ namespace SW2026RibbonAddin.Commands
+                     bool canFitAny = false;
+                     foreach (var p in remaining)
+                     {
+-                        if (TryChooseForNewShelf(p, usableW, usableH, out _, out _, out _))
++                        if (TryChooseForNewColumn(p, usableW, usableH, out _, out _, out _))
+                         {
+                             canFitAny = true;
+                             break;
+@@ -612,7 +612,7 @@ namespace SW2026RibbonAddin.Commands
+         {
+             placement = default;
+ 
+-            foreach (int rotDeg in RotationsDeg)
++            foreach (int rotDeg in GetRotationCandidatesDeg(part))
+             {
+                 progress.ThrowIfCancelled();
+ 
+@@ -700,14 +700,31 @@ namespace SW2026RibbonAddin.Commands
+             var xs = xSet.OrderBy(v => v).Take(140).ToList();
+             var ys = ySet.OrderBy(v => v).Take(140).ToList();
+ 
+-            foreach (var y in ys)
++            // Candidate ordering depends on the default sheet fill axis.
++            // Y-axis fill => prioritize smaller X first (columns), then stack upward.
++            if (DEFAULT_SHEET_FILL_AXIS == SheetFillAxis.Y)
+             {
+                 foreach (var x in xs)
+                 {
+-                    Add(x - rp.OffsetBounds.MinX, y - rp.OffsetBounds.MinY);
++                    foreach (var y in ys)
++                    {
++                        Add(x - rp.OffsetBounds.MinX, y - rp.OffsetBounds.MinY);
++                        if (result.Count >= maxCandidates) break;
++                    }
++                    if (result.Count >= maxCandidates) break;
++                }
++            }
++            else
++            {
++                foreach (var y in ys)
++                {
++                    foreach (var x in xs)
++                    {
++                        Add(x - rp.OffsetBounds.MinX, y - rp.OffsetBounds.MinY);
++                        if (result.Count >= maxCandidates) break;
++                    }
+                     if (result.Count >= maxCandidates) break;
+                 }
+-                if (result.Count >= maxCandidates) break;
+             }
+ 
+             if (result.Count < maxCandidates && sheet.Placed.Count > 0)
+@@ -959,7 +976,7 @@ namespace SW2026RibbonAddin.Commands
+         {
+             placement = default;
+ 
+-            foreach (int rotDeg in RotationsDeg)
++            foreach (int rotDeg in GetRotationCandidatesDeg(part))
+             {
+                 progress.ThrowIfCancelled();
+                 ThrowIfDeadlineExceeded(deadlineTicks);
+@@ -1062,14 +1079,30 @@ namespace SW2026RibbonAddin.Commands
+ 
+                 int skylineBudget = Math.Min(250, maxCandidates / 2);
+ 
+-                foreach (var y in ys)
++                // Candidate ordering depends on the default sheet fill axis.
++                if (DEFAULT_SHEET_FILL_AXIS == SheetFillAxis.Y)
+                 {
+                     foreach (var x in xs)
+                     {
+-                        Add(x - rp.OffsetBounds.MinX, y - rp.OffsetBounds.MinY);
++                        foreach (var y in ys)
++                        {
++                            Add(x - rp.OffsetBounds.MinX, y - rp.OffsetBounds.MinY);
++                            if (result.Count >= skylineBudget) break;
++                        }
++                        if (result.Count >= skylineBudget) break;
++                    }
++                }
++                else
++                {
++                    foreach (var y in ys)
++                    {
++                        foreach (var x in xs)
++                        {
++                            Add(x - rp.OffsetBounds.MinX, y - rp.OffsetBounds.MinY);
++                            if (result.Count >= skylineBudget) break;
++                        }
+                         if (result.Count >= skylineBudget) break;
+                     }
+-                    if (result.Count >= skylineBudget) break;
+                 }
+             }
+ 
+@@ -1157,6 +1190,239 @@ namespace SW2026RibbonAddin.Commands
+             return areaB.CompareTo(areaA);
+         }
+ 
++        private static int[] GetRotationCandidatesDeg(PartDefinition part)
++        {
++            if (part == null)
++                return DefaultRotationsDeg;
++
++            var cached = part.RotationCandidatesDeg;
++            if (cached != null && cached.Length > 0)
++                return cached;
++
++            part.RotationCandidatesDeg = BuildRotationCandidatesDeg(part);
++            return part.RotationCandidatesDeg ?? DefaultRotationsDeg;
++        }
++
++        private static int NormalizeDeg(int deg)
++        {
++            deg %= 360;
++            if (deg < 0) deg += 360;
++            return deg;
++        }
++
++        /// <summary>
++        /// Builds an ordered list of rotation candidates (degrees) for a part.
++        /// The list always starts with the fast/stable defaults {0,90,180,270}.
++        /// Extra angles are appended only for non-orthogonal parts, and only used
++        /// when the default orientations fail to place the part.
++        /// </summary>
++        private static int[] BuildRotationCandidatesDeg(PartDefinition part)
++        {
++            Path64 poly = part?.OuterContour0;
++            if (poly == null || poly.Count < 3)
++                return DefaultRotationsDeg;
++
++            // Heuristics tuned to avoid enabling arbitrary angles for simple rectangles
++            // with tiny chamfers/fillets, while still allowing rotated/diagonal parts.
++            const double ORTHO_TOL_DEG = 2.0;
++            const double MIN_EDGE_MM = 2.0;            // ignore tiny segments (arc tessellation noise)
++            const double NONORTHO_FRAC_ENABLE = 0.15;  // perimeter fraction required to enable extra angles
++            const int EDGE_ANGLE_BIN_DEG = 3;
++            const int MAX_DOMINANT_ANGLES = 3;
++            const int MAX_ROTATIONS_TOTAL = 32;
++
++            double minEdgeScaled = MIN_EDGE_MM * SCALE;
++
++            double totalLen = 0.0;
++            double orthoLen = 0.0;
++            double nonOrthoLen = 0.0;
++
++            var bins = new Dictionary<int, double>(); // angle bin (0..179) -> length weight
++
++            int n = poly.Count;
++            for (int i = 0; i < n; i++)
++            {
++                var a = poly[i];
++                var b = poly[(i + 1) % n];
++
++                double dx = (double)(b.X - a.X);
++                double dy = (double)(b.Y - a.Y);
++                double len = Math.Sqrt(dx * dx + dy * dy);
++                if (len < minEdgeScaled)
++                    continue;
++
++                totalLen += len;
++
++                double ang = Math.Atan2(dy, dx) * 180.0 / Math.PI;
++
++                // Undirected edge angle in [0,180).
++                while (ang < 0.0) ang += 180.0;
++                while (ang >= 180.0) ang -= 180.0;
++
++                double mod = ang % 90.0;
++                double dev = Math.Min(mod, 90.0 - mod);
++
++                if (dev <= ORTHO_TOL_DEG)
++                {
++                    orthoLen += len;
++                    continue;
++                }
++
++                nonOrthoLen += len;
++
++                int bin = (int)Math.Round(ang / EDGE_ANGLE_BIN_DEG) * EDGE_ANGLE_BIN_DEG;
++                bin = ((bin % 180) + 180) % 180;
++                if (bins.TryGetValue(bin, out var w))
++                    bins[bin] = w + len;
++                else
++                    bins[bin] = len;
++            }
++
++            if (totalLen <= 0.0)
++                return DefaultRotationsDeg;
++
++            double nonOrthoFrac = nonOrthoLen / totalLen;
++            if (nonOrthoFrac < NONORTHO_FRAC_ENABLE)
++                return DefaultRotationsDeg;
++
++            // defaults first, then extras
++            var used = new HashSet<int>(DefaultRotationsDeg);
++            var extras = new List<int>(16);
++
++            void AddRot(int deg)
++            {
++                deg = NormalizeDeg(deg);
++                if (used.Add(deg))
++                    extras.Add(deg);
++            }
++
++            // 1) Principal axis (PCA): helps for elongated parts with rounded edges.
++            if (TryGetPrincipalAxisDeg(poly, out double axisDeg, out double anisotropy) && anisotropy >= 0.15)
++            {
++                double mod = axisDeg % 90.0;
++                double dev = Math.Min(mod, 90.0 - mod);
++                if (dev > ORTHO_TOL_DEG)
++                {
++                    int r0 = (int)Math.Round(-axisDeg);
++                    int r90 = (int)Math.Round(90.0 - axisDeg);
++                    AddRot(r0);
++                    AddRot(r0 + 180);
++                    AddRot(r90);
++                    AddRot(r90 + 180);
++                }
++            }
++
++            // 2) Dominant non-orth edge directions.
++            if (bins.Count > 0)
++            {
++                var top = bins.OrderByDescending(kv => kv.Value).Take(MAX_DOMINANT_ANGLES).ToList();
++                foreach (var kv in top)
++                {
++                    int ang = kv.Key;
++                    int r0 = -ang;
++                    int r90 = 90 - ang;
++                    AddRot(r0);
++                    AddRot(r0 + 180);
++                    AddRot(r90);
++                    AddRot(r90 + 180);
++                }
++            }
++
++            // 3) Coarse grid fallback (only reached if defaults + (1)/(2) fail).
++            // This is useful for truly "arbitrary" parts where the best fit angle is not obvious.
++            if (extras.Count < 6)
++            {
++                for (int d = 0; d < 360; d += 30)
++                {
++                    if (d % 90 == 0) continue;
++                    AddRot(d);
++                }
++            }
++
++            // 4) Finer grid only for strongly non-orth parts.
++            if (nonOrthoFrac >= 0.50 && extras.Count < 12)
++            {
++                for (int d = 0; d < 360; d += 15)
++                {
++                    if (d % 90 == 0) continue;
++                    AddRot(d);
++                    if (DefaultRotationsDeg.Length + extras.Count >= MAX_ROTATIONS_TOTAL)
++                        break;
++                }
++            }
++
++            if (extras.Count == 0)
++                return DefaultRotationsDeg;
++
++            int total = Math.Min(MAX_ROTATIONS_TOTAL, DefaultRotationsDeg.Length + extras.Count);
++            var res = new int[total];
++            Array.Copy(DefaultRotationsDeg, res, DefaultRotationsDeg.Length);
++
++            int outIdx = DefaultRotationsDeg.Length;
++            for (int i = 0; i < extras.Count && outIdx < total; i++)
++                res[outIdx++] = extras[i];
++
++            return res;
++        }
++
++        // Principal component (PCA) axis of a polygon point set.
++        // Returns axisDeg in [0,180) and anisotropy in [0,1].
++        private static bool TryGetPrincipalAxisDeg(Path64 poly, out double axisDeg, out double anisotropy)
++        {
++            axisDeg = 0.0;
++            anisotropy = 0.0;
++
++            if (poly == null || poly.Count < 3)
++                return false;
++
++            int n = poly.Count;
++
++            double meanX = 0.0, meanY = 0.0;
++            for (int i = 0; i < n; i++)
++            {
++                meanX += poly[i].X;
++                meanY += poly[i].Y;
++            }
++
++            meanX /= n;
++            meanY /= n;
++
++            double cxx = 0.0, cyy = 0.0, cxy = 0.0;
++            for (int i = 0; i < n; i++)
++            {
++                double x = poly[i].X - meanX;
++                double y = poly[i].Y - meanY;
++                cxx += x * x;
++                cyy += y * y;
++                cxy += x * y;
++            }
++
++            if (n > 1)
++            {
++                cxx /= (n - 1);
++                cyy /= (n - 1);
++                cxy /= (n - 1);
++            }
++
++            double trace = cxx + cyy;
++            if (trace <= 0.0)
++                return false;
++
++            double diff = cxx - cyy;
++            double root = Math.Sqrt(diff * diff + 4.0 * cxy * cxy);
++            double lambda1 = (trace + root) / 2.0;
++            double lambda2 = (trace - root) / 2.0;
++
++            anisotropy = (lambda1 - lambda2) / (lambda1 + lambda2 + 1e-12);
++
++            double angleRad = 0.5 * Math.Atan2(2.0 * cxy, diff);
++            double deg = angleRad * 180.0 / Math.PI;
++            while (deg < 0.0) deg += 180.0;
++            while (deg >= 180.0) deg -= 180.0;
++            axisDeg = deg;
++            return true;
++        }
++
+         private static RotatedPoly GetOrCreateRotated(PartDefinition part, int rotDeg, double gapMm, Dictionary<string, RotatedPoly> cache)
+         {
+             string key =
+@@ -1210,14 +1476,26 @@ namespace SW2026RibbonAddin.Commands
+ 
+         private static int CandidateCompare(CandidateIns a, CandidateIns b, RotatedPoly rp)
+         {
++            long aMinX = a.InsX + rp.OffsetBounds.MinX;
++            long bMinX = b.InsX + rp.OffsetBounds.MinX;
+             long aMinY = a.InsY + rp.OffsetBounds.MinY;
+             long bMinY = b.InsY + rp.OffsetBounds.MinY;
+-            int cmp = aMinY.CompareTo(bMinY);
+-            if (cmp != 0) return cmp;
+ 
+-            long aMinX = a.InsX + rp.OffsetBounds.MinX;
+-            long bMinX = b.InsX + rp.OffsetBounds.MinX;
+-            return aMinX.CompareTo(bMinX);
++            // Candidate priority depends on the requested default fill axis:
++            // - Y-axis fill => build "columns": smaller X first, then smaller Y
++            // - X-axis fill => build "rows"   : smaller Y first, then smaller X
++            if (DEFAULT_SHEET_FILL_AXIS == SheetFillAxis.Y)
++            {
++                int cmp = aMinX.CompareTo(bMinX);
++                if (cmp != 0) return cmp;
++                return aMinY.CompareTo(bMinY);
++            }
++            else
++            {
++                int cmp = aMinY.CompareTo(bMinY);
++                if (cmp != 0) return cmp;
++                return aMinX.CompareTo(bMinX);
++            }
+         }
+ 
+         private static bool CandidateFits(CandidateIns cand, RotatedPoly rp, long usableW, long usableH, out LongRect movedBBox)
+diff --git a/Commands/dwg/DwgLaserNester.Core.cs b/Commands/dwg/DwgLaserNester.Core.cs
+index e14c736..9d56d88 100644
+--- a/Commands/dwg/DwgLaserNester.Core.cs
++++ b/Commands/dwg/DwgLaserNester.Core.cs
+@@ -19,7 +19,15 @@ namespace SW2026RibbonAddin.Commands
+     {
+         // Geometry scale for Clipper (mm -> integer)
+         private const long SCALE = 1000; // 0.001 mm units
+-        private static readonly int[] RotationsDeg = { 0, 90, 180, 270 };
++
++        // Default rotation set (fast + stable). Extra angles may be appended per-part when needed.
++        private static readonly int[] DefaultRotationsDeg = { 0, 90, 180, 270 };
++
++        // Default sheet fill axis (requested): fill along Y.
++        // In practice this means we prioritize placements with smaller X first (columns),
++        // so the remaining space stays as a large contiguous strip.
++        private enum SheetFillAxis { X = 0, Y = 1 }
++        private const SheetFillAxis DEFAULT_SHEET_FILL_AXIS = SheetFillAxis.Y;
+ 
+         // ============================
+         // DWG output styling (layers/blocks)
+@@ -434,6 +442,10 @@ namespace SW2026RibbonAddin.Commands
+ 
+             public Path64 OuterContour0;
+             public long OuterArea2Abs;
++
++            // Rotation candidates for contour nesting (computed lazily).
++            // Default is {0,90,180,270}; extra angles are appended only when needed.
++            public int[] RotationCandidatesDeg;
+         }
+ 
+         /// <summary>
+diff --git a/remove_mirror_parts.patch a/remove_mirror_parts.patch
+deleted file mode 100644
+index 0e4c35d..0000000
+--- a/remove_mirror_parts.patch
++++ /dev/null
+@@ -1,834 +0,0 @@
+---- /mnt/data/orig/SW2026RibbonAddin-master/Commands/dwg/LaserCutSettings.cs	2025-12-24 17:20:42.000000000 +0000
+-+++ /mnt/data/SW2026RibbonAddin/SW2026RibbonAddin-master/Commands/dwg/LaserCutSettings.cs	2025-12-25 05:54:10.280483389 +0000
+-@@ -9,15 +9,6 @@
+-         ContourLevel1 = 1,
+-         ContourLevel2_NFP = 2,
+-     }
+--
+--
+--    internal enum MirrorPairingMode
+--    {
+--        Off = 0,
+--        CommonLine = 1,
+--        WithGap = 2,
+--    }
+--
+-     internal readonly struct SheetPreset
+-     {
+-         public string Name { get; }
+-@@ -44,22 +35,6 @@
+-         public bool SeparateByMaterialExact { get; set; } = true;
+-         public bool OutputOneDwgPerMaterial { get; set; } = true;
+-         public bool KeepOnlyCurrentMaterialInSourcePreview { get; set; } = true;
+--
+--
+--        // Optional optimization: if enabled, the nester will try to detect
+--        // mirrored part pairs that together fill a rectangle, and treat them
+--        // as a single “paired rectangle” (common-line) item during nesting.
+--        // This can dramatically improve Fast(Rectangles) mode for L/triangle shapes.
+--        public MirrorPairingMode MirrorPairing { get; set; } = MirrorPairingMode.Off;
+--
+--        // Backward compatible alias (older code used a boolean).
+--        // Setting this to true enables CommonLine mode.
+--        public bool PairMirroredPartsToRectangles
+--        {
+--            get => MirrorPairing != MirrorPairingMode.Off;
+--            set => MirrorPairing = value ? MirrorPairingMode.CommonLine : MirrorPairingMode.Off;
+--        }
+--
+-         // Mode
+-         public NestingMode Mode { get; set; } = NestingMode.ContourLevel1;
+- 
+-
+---- /mnt/data/orig/SW2026RibbonAddin-master/Commands/dwg/LaserCutForms.cs	2025-12-24 17:20:42.000000000 +0000
+-+++ /mnt/data/SW2026RibbonAddin/SW2026RibbonAddin-master/Commands/dwg/LaserCutForms.cs	2025-12-25 05:51:47.181540283 +0000
+-@@ -40,9 +40,6 @@
+- 
+-         private readonly NumericUpDown _chord;
+-         private readonly NumericUpDown _snap;
+--
+--
+--        private readonly ComboBox _cbMirrorPairMode;
+-         private readonly Button _ok;
+-         private readonly Button _cancel;
+- 
+-@@ -326,25 +323,6 @@
+-                 Value = 0.05M
+-             };
+-             grp.Controls.Add(_snap);
+--
+--
+--            grp.Controls.Add(new Label { Left = 540, Top = 96, Width = 90, Text = "Mirror pairs:" });
+--            _cbMirrorPairMode = new ComboBox
+--            {
+--                Left = 630,
+--                Top = 92,
+--                Width = 300,
+--                DropDownStyle = ComboBoxStyle.DropDownList
+--            };
+--            _cbMirrorPairMode.Items.AddRange(new object[]
+--            {
+--                "Off",
+--                "Touching rectangle (common-line)",
+--                "Rectangle with gap (use auto gap)"
+--            });
+--            _cbMirrorPairMode.SelectedIndex = 0;
+--            grp.Controls.Add(_cbMirrorPairMode);
+--
+-             var note = new Label
+-             {
+-                 Left = 12,
+-@@ -983,9 +961,7 @@
+-                 ContourChordMm = (double)_chord.Value,
+-                 ContourSnapMm = (double)_snap.Value,
+- 
+--                DefaultSheet = selected[0].Sheet,
+--
+--                MirrorPairing = _cbMirrorPairMode.SelectedIndex == 1 ? MirrorPairingMode.CommonLine : _cbMirrorPairMode.SelectedIndex == 2 ? MirrorPairingMode.WithGap : MirrorPairingMode.Off
+-+                DefaultSheet = selected[0].Sheet
+-             };
+- 
+-             Settings = settings;
+-@@ -1037,8 +1013,6 @@
+-             _rbContour2.Enabled = false;
+-             _chord.Enabled = false;
+-             _snap.Enabled = false;
+--            _cbMirrorPairMode.Enabled = false;
+--
+-             _ok.Enabled = false;
+-             _cancel.Enabled = true;
+-             _cancel.Text = "Cancel";
+-
+---- /mnt/data/orig/SW2026RibbonAddin-master/Commands/dwg/DwgLaserNester.Core.cs	2025-12-24 17:20:42.000000000 +0000
+-+++ /mnt/data/SW2026RibbonAddin/SW2026RibbonAddin-master/Commands/dwg/DwgLaserNester.Core.cs	2025-12-25 05:53:07.892543666 +0000
+-@@ -913,16 +913,6 @@
+- 
+-             double baseSheetOriginX = srcMinX;
+-             double baseSheetOriginY = srcMaxY + 200.0;
+--
+--
+--            // Optional optimization: mirror-pair parts that together fill a rectangle
+--            // (common-line). This is OFF by default (see UI checkbox).
+--            if (settings.MirrorPairing != MirrorPairingMode.Off)
+--            {
+--                ApplyMirrorPairingToRectangles(doc, defs, material, settings.MirrorPairing, gapMm);
+--                totalParts = defs.Sum(d => d.Quantity * Math.Max(1, d.PartCountWeight));
+--            }
+--
+-             // Prepare DWG output layers/blocks for this job.
+-             EnsureNestOutputLayersAndBlocks(doc, job.Sheet.WidthMm, job.Sheet.HeightMm);
+- 
+-@@ -1187,713 +1177,6 @@
+-         }
+- 
+- 
+--        // ============================
+--        // Mirror-pair optimization
+--        private enum MirrorPairAxis { X = 0, Y = 1 }
+--
+--        // ============================
+--        private sealed class _MirrorShapeInfo
+--        {
+--            public PartDefinition Part;
+--            // Rotation applied to the original block (radians) so that the
+--            // resulting pair-rectangle becomes axis-aligned.
+--            public double RotRad;
+--
+--            // Rotated polygon, normalized so its bbox min is at (0,0).
+--            // Full precision version is used for geometric verification.
+--            public Path64 PolyNormFull;
+--
+--            // Decimated + snapped version used for hashing/matching.
+--            public Path64 PolyNormDec;
+--
+--            // Bounding box of the rotated polygon BEFORE normalization.
+--            // Used to compute the insertion translation for the rotated block.
+--            public LongRect RotBounds0;
+--            public long Width;
+--            public long Height;
+--            public ulong Key;
+--            public ulong MirrorXKey;
+--            public ulong MirrorYKey;
+--        }
+--
+--        /// <summary>
+--        /// Attempts to detect mirrored part pairs that, when overlaid in the same bounding box,
+--        /// form a full rectangle (no overlap area, union fills the rectangle).
+--        ///
+--        /// If found, it creates a new "PAIR_*" block (containing two inserts) and adds a
+--        /// synthetic PartDefinition with PartCountWeight=2 and a rectangular contour.
+--        ///
+--        /// This is especially helpful for Fast(Rectangles) mode when individual parts have
+--        /// large bounding-box waste (L shapes, triangles, etc.).
+--        /// </summary>
+--        private static void ApplyMirrorPairingToRectangles(CadDocument doc, List<PartDefinition> defs, string materialLabel, MirrorPairingMode mode, double pairGapMm)
+--        {
+--            if (doc == null || defs == null || defs.Count < 2)
+--                return;
+--
+--            // Only consider parts with positive qty.
+--            var parts = defs.Where(d => d != null && d.Quantity > 0).ToList();
+--            if (parts.Count < 2)
+--                return;
+--
+--            const int HASH_MAX_POINTS = 220;
+--            const double HASH_SNAP_MM = 0.01; // helps stable hashing after rotation
+--            const int MAX_ANGLES_PER_PART = 14;
+--
+--            // Precompute rotated-normalized polys + hash keys for a small set of
+--            // candidate angles per part. This enables mirror-pair detection even
+--            // when the parts are exported in arbitrary orientations.
+--            var infosByPart = new Dictionary<PartDefinition, List<_MirrorShapeInfo>>();
+--            var byKey = new Dictionary<ulong, List<_MirrorShapeInfo>>();
+--
+--            foreach (var p in parts)
+--            {
+--                Path64 poly0 = p.OuterContour0;
+--                if (poly0 == null || poly0.Count < 3)
+--                    poly0 = MakeRectPolyScaled(p.MinX, p.MinY, p.MaxX, p.MaxY);
+--
+--                poly0 = CleanPath(poly0);
+--                if (poly0 == null || poly0.Count < 3)
+--                    continue;
+--
+--                var angles = GetCandidateAnglesForMirrorPairing(poly0, MAX_ANGLES_PER_PART);
+--                if (angles == null || angles.Count == 0)
+--                    angles = new List<double> { 0.0 };
+--
+--                var list = new List<_MirrorShapeInfo>();
+--
+--                foreach (double a in angles)
+--                {
+--                    // Rotate by -a so that an edge at angle 'a' becomes horizontal.
+--                    double rotRad = -a;
+--
+--                    var polyRot = RotatePolyRad(poly0, rotRad);
+--                    polyRot = CleanPath(polyRot);
+--                    if (polyRot == null || polyRot.Count < 3)
+--                        continue;
+--
+--                    var bRot = GetBounds(polyRot);
+--                    long w = bRot.MaxX - bRot.MinX;
+--                    long h = bRot.MaxY - bRot.MinY;
+--                    if (w <= 0 || h <= 0)
+--                        continue;
+--
+--                    var normFull = TranslatePath(polyRot, -bRot.MinX, -bRot.MinY);
+--                    normFull = CleanPath(normFull);
+--
+--                    var normDec = CleanPath(DecimatePath(normFull, HASH_MAX_POINTS));
+--                    normDec = SnapPath(normDec, HASH_SNAP_MM);
+--
+--                    if (normDec == null || normDec.Count < 3)
+--                        continue;
+--
+--                    // IMPORTANT:
+--                    // Do NOT re-anchor using the decimated bounds.
+--                    // We want hashing to remain stable relative to the *full* rotated bounds (0..w, 0..h),
+--                    // otherwise two mirrored parts can shift differently after decimation and stop matching.
+--
+--                    ulong key = HashPathCanonical(normDec);
+--                    if (key == 0UL)
+--                        continue;
+--
+--                    // Mirror around the FULL bounds (w/h), not the decimated bounds.
+--                    var mx = MirrorX(normDec, w);
+--                    var my = MirrorY(normDec, h);
+--                    ulong kx = HashPathCanonical(mx);
+--                    ulong ky = HashPathCanonical(my);
+--
+--                    var info = new _MirrorShapeInfo
+--                    {
+--                        Part = p,
+--                        RotRad = rotRad,
+--                        PolyNormFull = normFull,
+--                        PolyNormDec = normDec,
+--                        RotBounds0 = bRot,
+--                        Width = w,
+--                        Height = h,
+--                        Key = key,
+--                        MirrorXKey = kx,
+--                        MirrorYKey = ky,
+--                    };
+--
+--                    list.Add(info);
+--
+--                    if (!byKey.TryGetValue(key, out var klist))
+--                    {
+--                        klist = new List<_MirrorShapeInfo>();
+--                        byKey[key] = klist;
+--                    }
+--                    klist.Add(info);
+--                }
+--
+--                if (list.Count > 0)
+--                    infosByPart[p] = list;
+--            }
+--
+--            if (infosByPart.Count < 2)
+--                return;
+--
+--            // Process bigger parts first (more benefit).
+--            var orderedParts = infosByPart.Keys
+--                .OrderByDescending(d => Math.Max(0.0, d.Width) * Math.Max(0.0, d.Height))
+--                .ToList();
+--
+--            int createdPairs = 0;
+--
+--            foreach (var A in orderedParts)
+--            {
+--                if (A == null || A.Quantity <= 0)
+--                    continue;
+--
+--                if (!infosByPart.TryGetValue(A, out var aInfos) || aInfos == null || aInfos.Count == 0)
+--                    continue;
+--
+--                // Try to consume as many mirror pairs for this part as possible.
+--                // Usually there is only one matching mirror-part, but this loop
+--                // allows multiple matches if the data contains duplicates.
+--                bool pairedSomething;
+--                do
+--                {
+--                    pairedSomething = false;
+--
+--                    if (A.Quantity <= 0)
+--                        break;
+--
+--                    _MirrorShapeInfo bestA = null;
+--                    _MirrorShapeInfo bestB = null;
+--                    MirrorPairAxis bestAxis = MirrorPairAxis.X;
+--
+--                    // Find the first valid candidate (verified by geometry).
+--                    foreach (var a in aInfos)
+--                    {
+--                        if (A.Quantity <= 0)
+--                            break;
+--
+--                        if (a == null || a.Key == 0UL)
+--                            continue;
+--
+--                        if (TryFindVerifiedMirrorCandidate(a, byKey, out var b, out var axis))
+--                        {
+--                            bestA = a;
+--                            bestB = b;
+--                            bestAxis = axis;
+--                            break;
+--                        }
+--                    }
+--
+--                    if (bestA == null || bestB == null || bestB.Part == null)
+--                        break;
+--
+--                    int pairCount = Math.Min(A.Quantity, bestB.Part.Quantity);
+--                    if (pairCount <= 0)
+--                        break;
+--
+--                    if (CreateMirrorPairBlock(doc, defs, materialLabel, bestA, bestB, bestAxis, mode, pairGapMm, pairCount, ref createdPairs))
+--                    {
+--                        // Consume quantities
+--                        A.Quantity -= pairCount;
+--                        bestB.Part.Quantity -= pairCount;
+--                        pairedSomething = true;
+--                    }
+--
+--                } while (pairedSomething);
+--            }
+--
+--            // Remove zero-qty originals (keeps list smaller for placement)
+--            defs.RemoveAll(d => d == null || d.Quantity <= 0);
+--        }
+--
+--        private static bool TryFindVerifiedMirrorCandidate(
+--            _MirrorShapeInfo a,
+--            Dictionary<ulong, List<_MirrorShapeInfo>> byKey,
+--            out _MirrorShapeInfo bBest,
+--            out MirrorPairAxis axisBest)
+--        {
+--            bBest = null;
+--            axisBest = MirrorPairAxis.X;
+--
+--            if (a == null || a.Part == null || a.Part.Quantity <= 0)
+--                return false;
+--
+--            // Try mirror-X, then mirror-Y.
+--            if (TryFindVerifiedMirrorCandidateAxis(a, byKey, MirrorPairAxis.X, out bBest))
+--            {
+--                axisBest = MirrorPairAxis.X;
+--                return true;
+--            }
+--
+--            if (TryFindVerifiedMirrorCandidateAxis(a, byKey, MirrorPairAxis.Y, out bBest))
+--            {
+--                axisBest = MirrorPairAxis.Y;
+--                return true;
+--            }
+--
+--            return false;
+--        }
+--
+--        private static bool TryFindVerifiedMirrorCandidateAxis(
+--            _MirrorShapeInfo a,
+--            Dictionary<ulong, List<_MirrorShapeInfo>> byKey,
+--            MirrorPairAxis axis,
+--            out _MirrorShapeInfo bBest)
+--        {
+--            bBest = null;
+--
+--            ulong mirrorKey = axis == MirrorPairAxis.X ? a.MirrorXKey : a.MirrorYKey;
+--            if (mirrorKey == 0UL)
+--                return false;
+--
+--            if (!byKey.TryGetValue(mirrorKey, out var candidates) || candidates == null || candidates.Count == 0)
+--                return false;
+--
+--            foreach (var b in candidates)
+--            {
+--                var B = b?.Part;
+--                if (B == null)
+--                    continue;
+--
+--                if (ReferenceEquals(B, a.Part))
+--                    continue;
+--
+--                if (a.Part.Quantity <= 0)
+--                    break;
+--
+--                if (B.Quantity <= 0)
+--                    continue;
+--
+--                // Must match bounding box dims very closely.
+--                if (!DimsClose(a.Width, b.Width) || !DimsClose(a.Height, b.Height))
+--                    continue;
+--
+--                // Expensive verify: union fills the rectangle and intersection area is ~0.
+--                if (!VerifyRectangleUnionNoOverlap(a.PolyNormFull, b.PolyNormFull, a.Width, a.Height))
+--                    continue;
+--
+--                bBest = b;
+--                return true;
+--            }
+--
+--            return false;
+--        }
+--
+--        private static bool CreateMirrorPairBlock(
+--            CadDocument doc,
+--            List<PartDefinition> defs,
+--            string materialLabel,
+--            _MirrorShapeInfo a,
+--            _MirrorShapeInfo b,
+--            MirrorPairAxis axis,
+--            MirrorPairingMode mode,
+--            double pairGapMm,
+--            int pairCount,
+--            ref int createdPairs)
+--        {
+--            if (doc == null || defs == null || a == null || b == null || a.Part == null || b.Part == null)
+--                return false;
+--
+--            var A = a.Part;
+--            var B = b.Part;
+--
+--            // Create a new pair block definition once per A-B match.
+--            string pairBlockName = BuildPairBlockName(A.BlockName, B.BlockName, createdPairs + 1);
+--
+--            BlockRecord pairBlock = null;
+--            string nameTry = pairBlockName;
+--
+--            for (int attempt = 0; attempt < 200; attempt++)
+--            {
+--                try
+--                {
+--                    pairBlock = new BlockRecord(nameTry);
+--                    doc.BlockRecords.Add(pairBlock);
+--                    break;
+--                }
+--                catch
+--                {
+--                    nameTry = pairBlockName + "_" + (attempt + 1).ToString(CultureInfo.InvariantCulture);
+--                    pairBlock = null;
+--                }
+--            }
+--
+--            if (pairBlock == null)
+--                return false;
+--
+--            // CommonLine: the two parts touch (common-line) and together form an exact rectangle.
+--            // WithGap: keep an internal gap (use auto gap) by shifting one half, and grow the outer rectangle by that gap.
+--            long gapScaled = 0;
+--            if (mode == MirrorPairingMode.WithGap && pairGapMm > 0)
+--                gapScaled = (long)Math.Round(pairGapMm * SCALE);
+--
+--            long rectW = a.Width;
+--            long rectH = a.Height;
+--
+--            double extraBx = 0.0;
+--            double extraBy = 0.0;
+--
+--            if (gapScaled > 0)
+--            {
+--                if (axis == MirrorPairAxis.X)
+--                {
+--                    rectW = a.Width + gapScaled;
+--                    extraBx = (double)gapScaled / SCALE;
+--                }
+--                else if (axis == MirrorPairAxis.Y)
+--                {
+--                    rectH = a.Height + gapScaled;
+--                    extraBy = (double)gapScaled / SCALE;
+--                }
+--            }
+--
+--            // Insert translations: move each rotated block so its rotated bbox min sits at (0,0).
+--            double ax = -(double)a.RotBounds0.MinX / SCALE;
+--            double ay = -(double)a.RotBounds0.MinY / SCALE;
+--            double bx = -(double)b.RotBounds0.MinX / SCALE + extraBx;
+--            double by = -(double)b.RotBounds0.MinY / SCALE + extraBy;
+--
+--            pairBlock.Entities.Add(new Insert(A.Block)
+--            {
+--                InsertPoint = new XYZ(ax, ay, 0.0),
+--                Rotation = a.RotRad,
+--                XScale = 1.0,
+--                YScale = 1.0,
+--                ZScale = 1.0
+--            });
+--
+--            pairBlock.Entities.Add(new Insert(B.Block)
+--            {
+--                InsertPoint = new XYZ(bx, by, 0.0),
+--                Rotation = b.RotRad,
+--                XScale = 1.0,
+--                YScale = 1.0,
+--                ZScale = 1.0
+--            });
+--
+--            // New synthetic part def representing a rectangle that yields TWO parts.
+--            double wMm = (double)rectW / SCALE;
+--            double hMm = (double)rectH / SCALE;
+--
+--            var rect = new Path64
+--            {
+--                new Point64(0, 0),
+--                new Point64(rectW, 0),
+--                new Point64(rectW, rectH),
+--                new Point64(0, rectH)
+--            };
+--
+--            long realArea2Abs = GetRealArea2Abs(A) + GetRealArea2Abs(B);
+--            if (realArea2Abs <= 0)
+--                realArea2Abs = Area2Abs(rect);
+--
+--            defs.Add(new PartDefinition
+--            {
+--                Block = pairBlock,
+--                BlockName = pairBlock.Name,
+--                Quantity = pairCount,
+--                PartCountWeight = 2,
+--                MaterialExact = materialLabel ?? "UNKNOWN",
+--
+--                MinX = 0.0,
+--                MinY = 0.0,
+--                MaxX = wMm,
+--                MaxY = hMm,
+--                Width = wMm,
+--                Height = hMm,
+--
+--                OuterContour0 = rect,
+--                // IMPORTANT: fill% must be based on real part area (A+B), NOT the rectangle envelope
+--                // (especially in Gap mode where the envelope includes an internal air strip).
+--                OuterArea2Abs = realArea2Abs
+--            });
+--
+--            createdPairs++;
+--            return true;
+--        }
+--
+--        private static List<double> GetCandidateAnglesForMirrorPairing(Path64 poly, int maxAngles)
+--        {
+--            if (poly == null || poly.Count < 3)
+--                return new List<double> { 0.0 };
+--
+--            // Reduce point count a bit to avoid noisy micro-edges (especially from arcs).
+--            var p = CleanPath(DecimatePath(poly, 520));
+--            if (p == null || p.Count < 3)
+--                return new List<double> { 0.0 };
+--
+--            // Collect edge angles weighted by edge length.
+--            var cands = new List<(double ang, double w)>();
+--            int n = p.Count;
+--
+--            // Ignore very small edges (< ~2mm) to avoid noise.
+--            double minLen = 2.0 * SCALE;
+--            double minLen2 = minLen * minLen;
+--
+--            for (int i = 0; i < n; i++)
+--            {
+--                var a = p[i];
+--                var b = p[(i + 1) % n];
+--                long dxL = b.X - a.X;
+--                long dyL = b.Y - a.Y;
+--                double dx = dxL;
+--                double dy = dyL;
+--                double len2 = dx * dx + dy * dy;
+--                if (len2 < minLen2)
+--                    continue;
+--
+--                double ang = Math.Atan2(dy, dx);
+--                double norm = NormalizeAngle0ToHalfPi(ang);
+--                cands.Add((norm, len2));
+--            }
+--
+--            // Always include 0.
+--            var result = new List<double> { 0.0 };
+--
+--            if (cands.Count == 0)
+--                return result;
+--
+--            // Sort longest edges first.
+--            cands.Sort((x, y) => y.w.CompareTo(x.w));
+--
+--            double tol = 0.5 * Math.PI / 180.0; // 0.5 degree
+--
+--            foreach (var c in cands)
+--            {
+--                if (result.Count >= Math.Max(2, maxAngles))
+--                    break;
+--
+--                bool close = false;
+--                foreach (double existing in result)
+--                {
+--                    double diff = Math.Abs(c.ang - existing);
+--                    diff = Math.Min(diff, (Math.PI / 2.0) - diff);
+--                    if (diff < tol)
+--                    {
+--                        close = true;
+--                        break;
+--                    }
+--                }
+--
+--                if (!close)
+--                    result.Add(c.ang);
+--            }
+--
+--            return result;
+--        }
+--
+--        private static double NormalizeAngle0ToHalfPi(double angleRad)
+--        {
+--            // Map to [0, PI)
+--            double a = angleRad % Math.PI;
+--            if (a < 0) a += Math.PI;
+--
+--            // Fold to [0, PI/2)
+--            if (a >= Math.PI / 2.0)
+--                a -= Math.PI / 2.0;
+--
+--            return a;
+--        }
+--
+--        private static bool DimsClose(long a, long b)
+--        {
+--            // Allow a bit of slack for rotated geometry rounding.
+--            // 0.25mm in scaled units.
+--            long tol = Math.Max(1, (long)Math.Round(0.25 * SCALE));
+--            return Math.Abs(a - b) <= tol;
+--        }
+--
+--        private static bool VerifyRectangleUnionNoOverlap(Path64 aNorm, Path64 bNorm, long w, long h)
+--        {
+--            if (aNorm == null || bNorm == null || aNorm.Count < 3 || bNorm.Count < 3)
+--                return false;
+--
+--            if (w <= 0 || h <= 0)
+--                return false;
+--
+--            // Intersection area should be ~0
+--            var clip = new Clipper64();
+--            clip.AddSubject(aNorm);
+--            clip.AddClip(bNorm);
+--
+--            var inter = new Paths64();
+--            clip.Execute(Clipper2Lib.ClipType.Intersection, FillRule.NonZero, inter);
+--
+--            long interA2 = 0;
+--            if (inter != null)
+--            {
+--                foreach (var p in inter)
+--                    interA2 += Area2Abs(p);
+--            }
+--
+--            // Allow small numerical noise (rotations + rounding can create tiny overlaps).
+--            // 25mm^2 => 25 * 2 * 1e6 = 50,000,000 in Area2Abs units.
+--            const long interTolA2 = 50_000_000;
+--            if (interA2 > interTolA2)
+--                return false;
+--
+--            // Union area should be ~= rectangle area
+--            var clipU = new Clipper64();
+--            clipU.AddSubject(aNorm);
+--            clipU.AddSubject(bNorm);
+--
+--            var uni = new Paths64();
+--            clipU.Execute(Clipper2Lib.ClipType.Union, FillRule.NonZero, uni);
+--
+--            long uniA2 = 0;
+--            if (uni != null)
+--            {
+--                foreach (var p in uni)
+--                    uniA2 += Area2Abs(p);
+--            }
+--
+--            long rectA2 = 2L * w * h;
+--
+--            // Relative tolerance 0.5% + absolute tolerance (to absorb rounding/arc-chord noise)
+--            long absTol = 50_000_000; // 25mm^2
+--            long relTol = (long)Math.Round(rectA2 * 0.005);
+--
+--            long tol = Math.Max(absTol, relTol);
+--
+--            return Math.Abs(uniA2 - rectA2) <= tol;
+--        }
+--
+--        private static Path64 MirrorX(Path64 p, long width)
+--        {
+--            if (p == null) return p;
+--
+--            var r = new Path64(p.Count);
+--            foreach (var pt in p)
+--                r.Add(new Point64(width - pt.X, pt.Y));
+--
+--            return CleanPath(r);
+--        }
+--
+--        private static Path64 MirrorY(Path64 p, long height)
+--        {
+--            if (p == null) return p;
+--
+--            var r = new Path64(p.Count);
+--            foreach (var pt in p)
+--                r.Add(new Point64(pt.X, height - pt.Y));
+--
+--            return CleanPath(r);
+--        }
+--
+--        private static string BuildPairBlockName(string aName, string bName, int index)
+--        {
+--            string Clean(string s, int maxLen)
+--            {
+--                s = (s ?? "").Trim();
+--                if (s.Length == 0) return "X";
+--
+--                var sb = new StringBuilder(s.Length);
+--                foreach (char c in s)
+--                {
+--                    if (char.IsLetterOrDigit(c))
+--                        sb.Append(c);
+--                    else if (c == '_' || c == '-')
+--                        sb.Append('_');
+--                }
+--
+--                var t = sb.ToString();
+--                if (t.Length == 0) t = "X";
+--                if (t.Length > maxLen) t = t.Substring(0, maxLen);
+--                return t;
+--            }
+--
+--            string aa = Clean(aName, 24);
+--            string bb = Clean(bName, 24);
+--
+--            return $"PAIR_{index}_{aa}_{bb}";
+--        }
+--
+--        // Canonical hash for a closed polygon path, invariant to start index and direction.
+--        private static ulong HashPathCanonical(Path64 p)
+--        {
+--            if (p == null || p.Count < 3)
+--                return 0UL;
+--
+--            p = CleanPath(p);
+--            int n = p.Count;
+--            if (n < 3)
+--                return 0UL;
+--
+--            long minX = long.MaxValue;
+--            long minY = long.MaxValue;
+--
+--            for (int i = 0; i < n; i++)
+--            {
+--                var pt = p[i];
+--                if (pt.X < minX || (pt.X == minX && pt.Y < minY))
+--                {
+--                    minX = pt.X;
+--                    minY = pt.Y;
+--                }
+--            }
+--
+--            var starts = new List<int>();
+--            for (int i = 0; i < n; i++)
+--                if (p[i].X == minX && p[i].Y == minY)
+--                    starts.Add(i);
+--
+--            int bestStart = starts[0];
+--            int bestDir = +1; // +1 forward, -1 reverse
+--
+--            foreach (int s in starts)
+--            {
+--                if (CompareCyclic(p, s, +1, bestStart, bestDir) < 0)
+--                {
+--                    bestStart = s;
+--                    bestDir = +1;
+--                }
+--
+--                if (CompareCyclic(p, s, -1, bestStart, bestDir) < 0)
+--                {
+--                    bestStart = s;
+--                    bestDir = -1;
+--                }
+--            }
+--
+--            // FNV-1a 64-bit
+--            ulong h = 1469598103934665603UL;
+--            const ulong prime = 1099511628211UL;
+--
+--            for (int k = 0; k < n; k++)
+--            {
+--                int idx = bestDir > 0 ? (bestStart + k) % n : (bestStart - k + n) % n;
+--                var pt = p[idx];
+--
+--                unchecked
+--                {
+--                    h ^= (ulong)pt.X;
+--                    h *= prime;
+--                    h ^= (ulong)pt.Y;
+--                    h *= prime;
+--                }
+--            }
+--
+--            return h;
+--        }
+--
+--        private static int CompareCyclic(Path64 p, int startA, int dirA, int startB, int dirB)
+--        {
+--            int n = p.Count;
+--
+--            for (int k = 0; k < n; k++)
+--            {
+--                int ia = dirA > 0 ? (startA + k) % n : (startA - k + n) % n;
+--                int ib = dirB > 0 ? (startB + k) % n : (startB - k + n) % n;
+--
+--                var a = p[ia];
+--                var b = p[ib];
+--
+--                if (a.X != b.X)
+--                    return a.X < b.X ? -1 : 1;
+--                if (a.Y != b.Y)
+--                    return a.Y < b.Y ? -1 : 1;
+--            }
+--
+--            return 0;
+--        }
+--
+-         private static bool TryGetBlockBbox(BlockRecord block, out double minX, out double minY, out double maxX, out double maxY)
+-         {
+-             minX = double.MaxValue;

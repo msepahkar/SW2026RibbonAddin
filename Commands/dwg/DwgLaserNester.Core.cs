@@ -19,7 +19,15 @@ namespace SW2026RibbonAddin.Commands
     {
         // Geometry scale for Clipper (mm -> integer)
         private const long SCALE = 1000; // 0.001 mm units
-        private static readonly int[] RotationsDeg = { 0, 90, 180, 270 };
+
+        // Default rotation set (fast + stable). Extra angles may be appended per-part when needed.
+        private static readonly int[] DefaultRotationsDeg = { 0, 90, 180, 270 };
+
+        // Default sheet fill axis (requested): fill along Y.
+        // In practice this means we prioritize placements with smaller X first (columns),
+        // so the remaining space stays as a large contiguous strip.
+        private enum SheetFillAxis { X = 0, Y = 1 }
+        private const SheetFillAxis DEFAULT_SHEET_FILL_AXIS = SheetFillAxis.Y;
 
         // ============================
         // DWG output styling (layers/blocks)
@@ -434,6 +442,10 @@ namespace SW2026RibbonAddin.Commands
 
             public Path64 OuterContour0;
             public long OuterArea2Abs;
+
+            // Rotation candidates for contour nesting (computed lazily).
+            // Default is {0,90,180,270}; extra angles are appended only when needed.
+            public int[] RotationCandidatesDeg;
         }
 
         /// <summary>
