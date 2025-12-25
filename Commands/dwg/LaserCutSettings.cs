@@ -9,15 +9,6 @@ namespace SW2026RibbonAddin.Commands
         ContourLevel1 = 1,
         ContourLevel2_NFP = 2,
     }
-
-
-    internal enum MirrorPairingMode
-    {
-        Off = 0,
-        CommonLine = 1,
-        WithGap = 2,
-    }
-
     internal readonly struct SheetPreset
     {
         public string Name { get; }
@@ -44,22 +35,6 @@ namespace SW2026RibbonAddin.Commands
         public bool SeparateByMaterialExact { get; set; } = true;
         public bool OutputOneDwgPerMaterial { get; set; } = true;
         public bool KeepOnlyCurrentMaterialInSourcePreview { get; set; } = true;
-
-
-        // Optional optimization: if enabled, the nester will try to detect
-        // mirrored part pairs that together fill a rectangle, and treat them
-        // as a single “paired rectangle” (common-line) item during nesting.
-        // This can dramatically improve Fast(Rectangles) mode for L/triangle shapes.
-        public MirrorPairingMode MirrorPairing { get; set; } = MirrorPairingMode.Off;
-
-        // Backward compatible alias (older code used a boolean).
-        // Setting this to true enables CommonLine mode.
-        public bool PairMirroredPartsToRectangles
-        {
-            get => MirrorPairing != MirrorPairingMode.Off;
-            set => MirrorPairing = value ? MirrorPairingMode.CommonLine : MirrorPairingMode.Off;
-        }
-
         // Mode
         public NestingMode Mode { get; set; } = NestingMode.ContourLevel1;
 

@@ -40,9 +40,6 @@ namespace SW2026RibbonAddin.Commands
 
         private readonly NumericUpDown _chord;
         private readonly NumericUpDown _snap;
-
-
-        private readonly ComboBox _cbMirrorPairMode;
         private readonly Button _ok;
         private readonly Button _cancel;
 
@@ -326,25 +323,6 @@ namespace SW2026RibbonAddin.Commands
                 Value = 0.05M
             };
             grp.Controls.Add(_snap);
-
-
-            grp.Controls.Add(new Label { Left = 540, Top = 96, Width = 90, Text = "Mirror pairs:" });
-            _cbMirrorPairMode = new ComboBox
-            {
-                Left = 630,
-                Top = 92,
-                Width = 300,
-                DropDownStyle = ComboBoxStyle.DropDownList
-            };
-            _cbMirrorPairMode.Items.AddRange(new object[]
-            {
-                "Off",
-                "Touching rectangle (common-line)",
-                "Rectangle with gap (use auto gap)"
-            });
-            _cbMirrorPairMode.SelectedIndex = 0;
-            grp.Controls.Add(_cbMirrorPairMode);
-
             var note = new Label
             {
                 Left = 12,
@@ -983,9 +961,7 @@ namespace SW2026RibbonAddin.Commands
                 ContourChordMm = (double)_chord.Value,
                 ContourSnapMm = (double)_snap.Value,
 
-                DefaultSheet = selected[0].Sheet,
-
-                MirrorPairing = _cbMirrorPairMode.SelectedIndex == 1 ? MirrorPairingMode.CommonLine : _cbMirrorPairMode.SelectedIndex == 2 ? MirrorPairingMode.WithGap : MirrorPairingMode.Off
+                DefaultSheet = selected[0].Sheet
             };
 
             Settings = settings;
@@ -1037,8 +1013,6 @@ namespace SW2026RibbonAddin.Commands
             _rbContour2.Enabled = false;
             _chord.Enabled = false;
             _snap.Enabled = false;
-            _cbMirrorPairMode.Enabled = false;
-
             _ok.Enabled = false;
             _cancel.Enabled = true;
             _cancel.Text = "Cancel";
